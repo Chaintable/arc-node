@@ -23,8 +23,8 @@ Open items, listed by priority/phase. Subagents append here during execution; us
 - [x] Task 13 — Port `trace_block.rs` (remove `is_aa`/revert-fee-log paths)
 - [x] Task 14 — Register `trace_debankBlock` in `ArcAddOns::launch_add_ons`
 - [x] Task 15 — `cargo build --workspace` Phase 2 sanity + unit tests
-- [ ] Task 16 — Commit Phase 2
-- [ ] Task 17 — Push branch + open PR to `debank`
+- [x] Task 16 — Commit Phase 2
+- [x] Task 17 — Push branch + open PR to `debank` (PR #1, https://github.com/Chaintable/arc-node/pull/1)
 
 ## Follow-ups (out of plan scope)
 
