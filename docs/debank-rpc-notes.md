@@ -87,11 +87,21 @@ Tempo's `trace_block.rs` says "No empty block shortcut: Tempo has a system tx in
 
 (Subagents fill these in as they encounter ambiguity. Each entry: short question, current understanding, what would resolve it.)
 
-### Q1. Final list of `DebankTraceBlock` trait bounds against `ArcEthApi` [open]
+### Q1. Final list of `DebankTraceBlock` trait bounds against `ArcEthApi` [resolved for Phase 1; Phase 2 still open]
 
 Tempo's `DebankTraceBlock<Eth>` requires `Eth: EthApiTypes + LoadReceipt + LoadBlock + LoadState + TraceExt + EthTransactions + EthBlocks + SpawnBlocking`. Need to confirm Arc's `ArcEthApiBuilder::EthApi` satisfies all of these on reth v1.11.3.
 
-**Resolution:** discovered during Task 14 `cargo check`. Document any missing trait + how it was sourced (e.g., from a deeper helpers module).
+**Phase 1 resolution (Task 8):** Arc's `ArcEthApiBuilder::EthApi = EthApiFor<N, NetworkT>` — the
+standard reth `EthApiFor` type alias (default `NetworkT = Ethereum`). It satisfies:
+- `PreApi<Eth>` bounds: `EthApiTypes + EthTransactions + TraceExt + 'static` — OK
+- `DebankEthExt<Eth>` bounds: `EthApiTypes + EthCall + 'static`, plus
+  `RpcTxReq<Eth::NetworkTypes>: AsRef<TransactionRequest>` — OK because for the standard
+  `Ethereum` network type `RpcTxReq` resolves to `alloy_rpc_types_eth::TransactionRequest`
+  which has the blanket `AsRef<Self>` impl.
+
+`cargo check --workspace` after Task 8 wiring passed cleanly with no trait-bound diagnostics, confirming this.
+
+**Phase 2:** the wider `DebankTraceBlock` bound list (`LoadReceipt + LoadBlock + LoadState + EthBlocks + SpawnBlocking`) is still to be confirmed during Task 14; expected to pass since `EthApiFor` is the same reth-standard type used by Tempo (where the bounds are known to hold).
 
 ### Q2. AccessList field on `DebankTransaction` for Arc [open]
 
@@ -99,3 +109,125 @@ Tempo `DebankTransaction` has `pub access_list: ...` shared between AA tx and EI
 
 **Resolution:** Task 12.
 
+---
+
+## 2026-05-14 — Task 2 (crate scaffold)
+
+### D9. `reth-rpc-convert` added to workspace.dependencies [decided]
+
+`reth-rpc-convert` was referenced in `debank-rpc/Cargo.toml` as `workspace = true` but was absent from the root `[workspace.dependencies]`. It was already present in `Cargo.lock` at v1.11.3 (pulled transitively), so no new resolution was needed — only the explicit declaration. Added with the same `git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3"` pattern as all other reth-prefixed workspace deps. No `default-features = false` because none of the other single-purpose reth RPC crates (`reth-rpc`, `reth-rpc-api`, etc.) set it.
+
+---
+
+## 2026-05-14 — Task 3 (types.rs port)
+
+### D10. Crate-level `#![cfg_attr(test, allow(clippy::unwrap_used))]` [decided]
+
+Arc workspace declares `unwrap_used = "deny"` (clippy lint) and CI runs
+`cargo clippy --all-targets -- -D warnings`. Tempo's `types.rs` test code uses
+9 `unwrap()` calls; `erc20_handle.rs` and `pre.rs` will have more.
+
+Instead of replacing each `unwrap()` with `expect("…")` per-file (the
+original plan), apply a single crate-root attribute:
+
+```rust
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+```
+
+This allows `unwrap()` in test code across the entire `debank-rpc` crate.
+Rationale: test code is allowed to panic on unexpected results; `unwrap()`'s
+panic location is informative enough for test debugging; per-file `expect()`
+rewrites add noise without improving test quality. Matches Rust community
+convention.
+
+**Plan amendment:** Task 4's "Step 2: Replace `unwrap()` in test code with
+`expect()`" is now obsolete — the crate-level attribute handles it.
+Task 6 (pre.rs) similarly no longer needs unwrap replacements.
+
+## 2026-05-14 — Task 5 (multi_call.rs port)
+
+### D11. Production-code `unwrap()` removal [decided]
+
+`multi_call.rs:72` had `result_response.last().unwrap()` in production. Workspace
+`clippy::unwrap_used = "deny"` applies to production code (D10's
+`cfg_attr(test, allow(...))` only covers tests). The Tempo source has this
+pattern because Tempo doesn't deny `unwrap_used` at workspace level.
+
+Replaced with `result_response.last().is_some_and(|r| r.code != Success)` — drops
+the now-redundant `!is_empty()` guard.
+
+**Pattern to watch:** subsequent ports (pre.rs, debank_trace.rs, trace_block.rs)
+may have similar production-code `unwrap()` calls inherited from Tempo. Each
+needs case-by-case rewrite (typically `is_some_and` / `map_or` / `?` with proper
+error type).
+
+## 2026-05-14 — Task 6 (pre.rs port)
+
+### D12. `alloy-consensus` workspace caret pin resolves to 1.7.3 [decided, note]
+
+Arc declares `alloy-consensus = "1.6.3"` (with caret semver) in
+`[workspace.dependencies]`. `Cargo.lock` resolves to **1.7.3**. Tempo
+locks to **2.0.4** (a major version up).
+
+`TransactionInfo` gained a `block_timestamp: Option<u64>` field in
+alloy-consensus 2.0.4. In 1.7.3 it has only 5 fields:
+`hash, index, block_hash, block_number, base_fee`.
+
+Tempo's `pre.rs` constructs `TransactionInfo { ..., block_timestamp: Some(...) }`.
+On Arc, removed the field assignment; the `block_timestamp: u64` parameter
+is still computed and passed to `Log { block_timestamp: Some(...), .. }`
+(present in alloy-rpc-types-eth 1.6.3+).
+
+**Watch:** if Arc later bumps to alloy-consensus 2.x, this adaptation
+needs to be reverted. Recommend documenting in a comment near the
+construction site as well.
+
+### D13. Crate-level `#![allow(clippy::too_many_arguments)]` [decided]
+
+The jsonrpsee `#[rpc(server, namespace = "eth")]` macro on
+`DebankEthExtApi::multi_call` generates a server function with 8 parameters
+(`&self` + 7 RPC params), tripping clippy's `too_many_arguments` lint
+(default threshold = 7).
+
+The lint is on generated code, so we can't add a targeted `#[allow(...)]`
+on the macro output. Tempo handles this with a prose comment; Arc adds the
+explicit crate-level `#![allow(clippy::too_many_arguments)]` in `lib.rs`
+with a comment naming the trigger.
+
+The crate-wide scope is acceptable because `debank-rpc` is a single-purpose
+crate; no other functions hit the threshold (`trace_many` has 5 args).
+
+## 2026-05-14 — Task 8 (RPC registration)
+
+### D14. Append-only registration in `ArcAddOns::launch_add_ons_with` closure [decided]
+
+Followed Karpathy "Surgical Changes": Arc's existing closure accesses
+`container.modules` directly (not destructuring `container`). Instead of refactoring
+to mirror Tempo's destructured form (`let RpcModuleContainer { modules, registry, .. } = container;`),
+appended `let eth_api = container.registry.eth_api().clone();` after the existing
+`arc_rpc.enabled` block and used the longhand `container.modules.*` for the merge calls.
+Diff is +9 lines (registration block) + 1 line (import) + 1 line (Cargo.toml dep), no
+restructuring of existing code.
+
+**Verification:** `cargo check --workspace` clean. Pre-existing unused-import errors
+in `arc-consensus-types` (from initial open-source commit `3e2f9f4`) surface under
+`cargo clippy ... -D warnings`, but they are unrelated to this task.
+
+### D15. `debank-rpc` declared as workspace-level dep [decided]
+
+Initially added in Task 8 as a direct path dep in `evm-node/Cargo.toml`:
+```toml
+debank-rpc = { path = "../debank-rpc" }
+```
+
+Code-quality review pointed out Arc's convention: production crate
+cross-deps are declared in root `[workspace.dependencies]` and consumers
+reference via `workspace = true`. Test/e2e crates may use raw path style,
+but production crates follow the workspace pattern.
+
+Refactored:
+- Added `debank-rpc = { version = "0.0.1", path = "crates/debank-rpc" }` to
+  root `Cargo.toml` workspace deps
+- Changed `evm-node/Cargo.toml` line 31 to `debank-rpc.workspace = true`
+
+This matches `arc-evm-node`, `arc-eth-engine`, etc.

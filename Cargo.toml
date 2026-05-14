@@ -99,6 +99,7 @@ config             = { version = "0.14", features = ["toml"], default-features =
 #
 # See: https://github.com/eira-fransham/crunchy/issues/13
 crunchy = "=0.2.2"
+debank-rpc = { version = "0.0.1", path = "crates/debank-rpc" }
 deranged = "0.5.5"
 directories        = "5.0.1"
 
@@ -189,6 +190,7 @@ reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3
 reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }

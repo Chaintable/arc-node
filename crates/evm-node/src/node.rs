@@ -25,6 +25,7 @@ use alloy_network::Ethereum;
 use alloy_rpc_types_engine::ExecutionData;
 use arc_evm::{ArcEvmConfig, ArcEvmFactory};
 use arc_execution_validation::ArcConsensus;
+use debank_rpc::{DebankEthExt, DebankEthExtApiServer, DebankPreApiServer, PreApi};
 use reth_chainspec::{EthereumHardforks, Hardforks};
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_primitives::EngineTypes;
@@ -411,6 +412,15 @@ where
                         container.modules.merge_configured(arc_module)?;
                     }
                 }
+
+                // DeBank custom RPCs
+                let eth_api = container.registry.eth_api().clone();
+                let pre_api = PreApi::new(eth_api.clone());
+                container.modules.merge_configured(pre_api.into_rpc())?;
+                let debank_eth_ext = DebankEthExt::new(eth_api);
+                container
+                    .modules
+                    .merge_if_module_configured(RethRpcModule::Eth, debank_eth_ext.into_rpc())?;
 
                 Ok(())
             })
