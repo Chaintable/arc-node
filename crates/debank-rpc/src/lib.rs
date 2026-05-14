@@ -4,17 +4,21 @@
 #![allow(clippy::too_many_arguments)]
 //! DeBank custom RPC extensions for Arc.
 //!
-//! Provides `pre_traceMany` and `eth_multiCall` (Phase 1).
-//! `trace_debankBlock` is added in Phase 2.
+//! Provides `pre_traceMany`, `eth_multiCall`, and `trace_debankBlock`.
 
+pub mod debank_trace;
 pub mod erc20_handle;
 pub mod multi_call;
 pub mod pre;
+pub mod state_diff_db;
+pub mod trace_block;
 pub mod types;
 
 // Re-export key types for registration
+pub use debank_trace::DebankOutPut;
 pub use multi_call::DebankEthExt;
 pub use pre::PreApi;
+pub use trace_block::DebankTraceBlock;
 pub use types::{MultiCallResp, PreResult};
 
 use alloy_eips::BlockId;
@@ -50,4 +54,12 @@ pub trait DebankEthExtApi<TxReq> {
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<MultiCallResp>;
+}
+
+/// RPC trait for `trace` namespace — `debankBlock`.
+#[jsonrpsee::proc_macros::rpc(server, namespace = "trace")]
+pub trait DebankTraceApi {
+    /// Returns DeBank trace/event/state-diff output for the given block.
+    #[method(name = "debankBlock")]
+    async fn trace_debank_block(&self, block_id: BlockId) -> RpcResult<DebankOutPut>;
 }

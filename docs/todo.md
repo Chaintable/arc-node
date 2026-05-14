@@ -17,12 +17,12 @@ Open items, listed by priority/phase. Subagents append here during execution; us
 - [x] Task 7 — Run Phase 1 unit tests
 - [x] Task 8 — Register `PreApi` + `DebankEthExt` in `ArcAddOns::launch_add_ons`
 - [x] Task 9 — `cargo build --workspace` Phase 1 sanity
-- [ ] Task 10 — Commit Phase 1
-- [ ] Task 11 — Port `state_diff_db.rs`
-- [ ] Task 12 — Port `debank_trace.rs` (schema-preserving Tempo strip)
-- [ ] Task 13 — Port `trace_block.rs` (remove `is_aa`/revert-fee-log paths)
-- [ ] Task 14 — Register `trace_debankBlock` in `ArcAddOns::launch_add_ons`
-- [ ] Task 15 — `cargo build --workspace` Phase 2 sanity + unit tests
+- [x] Task 10 — Commit Phase 1
+- [x] Task 11 — Port `state_diff_db.rs`
+- [x] Task 12 — Port `debank_trace.rs` (schema-preserving Tempo strip)
+- [x] Task 13 — Port `trace_block.rs` (remove `is_aa`/revert-fee-log paths)
+- [x] Task 14 — Register `trace_debankBlock` in `ArcAddOns::launch_add_ons`
+- [x] Task 15 — `cargo build --workspace` Phase 2 sanity + unit tests
 - [ ] Task 16 — Commit Phase 2
 - [ ] Task 17 — Push branch + open PR to `debank`
 

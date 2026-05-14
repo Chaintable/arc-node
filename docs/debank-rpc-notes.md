@@ -87,7 +87,7 @@ Tempo's `trace_block.rs` says "No empty block shortcut: Tempo has a system tx in
 
 (Subagents fill these in as they encounter ambiguity. Each entry: short question, current understanding, what would resolve it.)
 
-### Q1. Final list of `DebankTraceBlock` trait bounds against `ArcEthApi` [resolved for Phase 1; Phase 2 still open]
+### Q1. Final list of `DebankTraceBlock` trait bounds against `ArcEthApi` [resolved]
 
 Tempo's `DebankTraceBlock<Eth>` requires `Eth: EthApiTypes + LoadReceipt + LoadBlock + LoadState + TraceExt + EthTransactions + EthBlocks + SpawnBlocking`. Need to confirm Arc's `ArcEthApiBuilder::EthApi` satisfies all of these on reth v1.11.3.
 
@@ -101,7 +101,7 @@ standard reth `EthApiFor` type alias (default `NetworkT = Ethereum`). It satisfi
 
 `cargo check --workspace` after Task 8 wiring passed cleanly with no trait-bound diagnostics, confirming this.
 
-**Phase 2:** the wider `DebankTraceBlock` bound list (`LoadReceipt + LoadBlock + LoadState + EthBlocks + SpawnBlocking`) is still to be confirmed during Task 14; expected to pass since `EthApiFor` is the same reth-standard type used by Tempo (where the bounds are known to hold).
+**Phase 2 resolution (Task 14):** `DebankTraceBlock<Eth>`'s wider bound set (`EthApiTypes + LoadReceipt + LoadBlock + LoadState + TraceExt + EthTransactions + EthBlocks + SpawnBlocking + 'static`) is also satisfied by `EthApiFor<NodeAdapter<N>, Ethereum>`. `cargo check --workspace` + `cargo build --workspace` after wiring `DebankTraceBlock::new(eth_api)` in `ArcAddOns::launch_add_ons_with` passed cleanly with no trait-bound diagnostics. The standard reth `EthApiFor` already implements every helper trait in the list (it is the same type Tempo uses).
 
 ### Q2. AccessList field on `DebankTransaction` for Arc [open]
 
@@ -231,3 +231,96 @@ Refactored:
 - Changed `evm-node/Cargo.toml` line 31 to `debank-rpc.workspace = true`
 
 This matches `arc-evm-node`, `arc-eth-engine`, etc.
+
+## 2026-05-14 — Task 11 (state_diff_db.rs port)
+
+### D16. revm 34 vs revm 36 `DatabaseCommit::commit` signature divergence [decided]
+
+The Task 11 plan claimed `state_diff_db.rs` would compile cleanly on revm 34
+because `revm::DatabaseRef`, `revm::CacheDB`, `revm::Database`, `revm::DatabaseCommit`
+are "stable across revm 27/34/36". This is **not true** for `DatabaseCommit::commit`.
+
+| revm version | `commit` signature | Hasher |
+|---|---|---|
+| revm 36 (Tempo, `revm-database-interface 11.0.1`) | `fn commit(&mut self, changes: AddressMap<Account>)` | `FbBuildHasher<20>` |
+| revm 34 (Arc, `revm-database-interface 9.0.0`) | `fn commit(&mut self, changes: HashMap<Address, Account>)` | `DefaultHashBuilder` |
+
+`AddressMap<V>` is an `alloy-primitives` type alias = `HashMap<Address, V, FbBuildHasher<20>>`,
+which is **not** the same type as the default `HashMap<Address, V, DefaultHashBuilder>`. revm 36
+also changed `revm-state::EvmState` from `HashMap<Address, Account>` to `AddressMap<Account>` to
+match.
+
+**Adaptation on Arc:** replaced the import `map::AddressMap` with `map::HashMap` and changed
+the impl signature to `fn commit(&mut self, changes: HashMap<Address, Account>)`. Added a
+`// revm 34 vs revm 36 divergence: ...` comment near the signature explaining the divergence
+and that the source Tempo version uses `AddressMap<Account>`.
+
+`cargo check -p debank-rpc` and `cargo clippy -p debank-rpc --all-targets -- -D warnings`
+both clean after the change.
+
+**Watch:** if Arc later bumps to revm 36+, this change needs reverting. Same applies to any
+other ported file that takes `EvmState` / `AddressMap<Account>` as a parameter — likely
+candidates: anything else touching `DatabaseCommit` impls (none in Phase 1).
+
+## 2026-05-14 — Task 13 (trace_block.rs port)
+
+### D17. `alloy_consensus::Header` field set divergence — Tempo extensions absent on Arc [decided]
+
+Tempo (alloy-consensus 2.0.4) adds two fields to `alloy_consensus::Header`:
+- `block_access_list_hash: Option<B256>` (likely EIP-7928 prep)
+- `slot_number: Option<u64>` (Tempo's beacon-aware block index)
+
+Arc pins `alloy-consensus 1.7.3` (per D12; resolved from workspace caret `1.6.3`).
+Header on 1.7.3 stops at `requests_hash` (EIP-7685) — no `block_access_list_hash`,
+no `slot_number`. There is also no `BlockHeader` trait method for either.
+
+**Adaptation on Arc:** dropped both fields from the `alloy_consensus::Header { ... }`
+literal in `trace_debank_block`'s `debank_header` construction. The remaining 19 fields
+match Arc's `Header` struct exactly. No struct fields need defaulting because
+`alloy_consensus::Header` requires a literal initializer — no `..Default::default()`
+shortcut exists here.
+
+**Watch:** if Arc bumps to alloy-consensus 2.x (matching Tempo), add both fields back
+to the literal. The trait methods would then be `block.block_access_list_hash()` and
+`block.slot_number()` (same names Tempo uses).
+
+### D18. AA root-trace classification fix removed [decided]
+
+Tempo's classification loop had a 3-branch structure for successful txs:
+1. Root in `traces` → keep per-node classification (try/catch internal reverts in error lists).
+2. Root in `error_traces` (`root_misclassified`) → AA tx — `CallTraceArena.success` flags
+   are unreliable for the handler wrapper subtree; merge all error_traces/events into success.
+3. Receipt-status false → all to error.
+
+Per D5, Arc has no AA wrapper traces. The `root_misclassified` branch never fires on Arc
+because `build_debank_traces` correctly classifies every standard tx's root trace based on
+`CallTraceArena.success` (which is reliable without the AA handler wrapper).
+
+**Adaptation:** collapsed the if/else inside the success branch to a single block that takes
+the "normal" path (path 1). Comment in the classification loop simplified to 2 bullet points.
+
+### D19. Fee-log re-attachment block fully removed [decided]
+
+Tempo's `trace_debank_block` had a ~110-line block (per Tempo source lines ~348-453) that
+post-processed each tx's logs to attach handler-emitted fee logs to the root trace, with
+two source paths:
+- **Successful tx**: `exec_logs[evm_event_count..]` — logs from `ExecutionResult::Success` past
+  the inspector-captured count are treated as handler-emitted.
+- **Reverted tx**: receipt logs (extracted via serde round-trip earlier in the function) —
+  on revert, EVM logs are reverted; all receipt logs must be handler-emitted fees.
+
+Per D5, Arc has no handler-emitted fee logs (stock EIP-1559 fee path). Neither source path
+ever yields entries on Arc. Removed the entire block plus its prerequisites:
+- The receipt-logs-per-tx serde-extraction block (Tempo source ~lines 230-263).
+- The `tx_statuses_clone` move-in capture (no longer needed without the revert check).
+- The 5th element of `PerTxResult` (`receipt_log_count: usize`); the type alias is now a
+  4-tuple.
+- The `let exec_logs = exec_result.into_logs();` line; the destructured `result` field is
+  now bound to `_exec_result` and discarded.
+
+Two production `unwrap()` calls inside the removed block (`all_results.last().unwrap()`,
+`all_results.last_mut().unwrap().2.push(...)`) are gone as a side effect — no D11 rewrites
+needed.
+
+`cargo check -p debank-rpc` + `cargo clippy -p debank-rpc --all-targets -- -D warnings` +
+`cargo test -p debank-rpc` all clean. File line count dropped from Tempo's 573 to Arc's 357.
