@@ -12,7 +12,7 @@ on:
 env:
   AWS_REGION: ap-northeast-1
   REGISTRY: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com
-  IMAGE: blockchain-arc-x-execution
+  IMAGE: blockchain/arc-x
   BAKE_TARGET: arc-execution
 
 jobs:
