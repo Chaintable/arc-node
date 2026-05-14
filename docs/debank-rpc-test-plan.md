@@ -84,7 +84,7 @@ OFF=https://rpc.testnet.arc.network
 4. **USDC 作 native**：`eth_getBalance` 返回 18-dec native USDC。`block_file.txs[*].value` 单位是 native wei（18-dec），消费方按 USDC 解读。
 5. **`Header` 字段集**：Arc 用 alloy-consensus 1.7.3，无 `block_access_list_hash` / `slot_number`（Tempo 2.0.4 才有），section 9 不要列这两项。
 6. **AA tx 不存在**：`DebankTransaction.calls` / `fee_token` / `fee_payer_signature` 在 JSON 中始终为 `null`（保留 schema 兼容 background-tracer Go 消费方，D3）。section 3 不测 AA 路径。
-7. **EIP-1559 标准 fee**：Arc 没有 Tempo 的 handler-level fee 收取，trace tx 时无 fee Transfer log。`events + error_events = receipt.logs` 严格成立（无 revert+fee 修正项）。
+7. **NCA precompile emit log（D20）**：Arc 的 `NATIVE_COIN_AUTHORITY` (`0x1800...0000`) 在每笔 native USDC 操作时直接 emit log 到 receipt，绕过 EVM call frame。inspector 抓不到，需要从 `ExecutionResult::Success.logs[N..]` 或 receipt 补回——与 Tempo handler-level fee log 同机制。所以 events 公式与 Tempo 完全一致：`events + sum(revert_tx_receipt_logs) == total_receipt_logs`（revert tx 的 receipt 只剩 NCA log，inspector 抓的 revert 前 logs 进 error_events 但 receipt 中被回滚）。
 8. **Arc base fee 写在 parent extraData**：与 RPC 输出无关，不在 debankBlock 中暴露。
 9. **5 个自定义 precompile `0x1800...0000-0004`**：调用它们的 trace 显示 to_addr = precompile 地址；per-trace `self_storage_change=false`（与 Tempo TIP-20 同因——precompile 不走 SSTORE opcode），block 级 `storage_contracts` 不受影响。section 7.3-7.4 验证。
 
@@ -234,7 +234,7 @@ OFF=https://rpc.testnet.arc.network
 
 | # | 测试项 | 验证内容 | 状态 |
 |---|---|---|---|
-| 5.2.1 | `events + error_events == sum(receipt.logs.length)` | 严格相等。Arc 无 handler-emitted fee log，无 Tempo 的修正项 | pending |
+| 5.2.1 | `events + sum(revert_tx.receipt.logs.length) == total_receipt_logs` | Tempo 公式（D20 修正 6.6 表述）：成功 tx 的 events 含 NCA log；revert tx 的 receipt 只有 NCA log，inspector 抓的 revert 前 EVM logs 进 error_events 但 receipt 中被回滚 | **PASS** (97==97 on 0x2813738; 101/101 on 100-block sample) |
 | 5.2.2 | 无重复 idx | events + error_events 排序后 unique == 总数 | pending |
 | 5.2.3 | idx 连续 | 排序后等于 `[0, 1, ..., N-1]` | pending |
 | 5.2.4 | 多 tx 跨 tx 连续 | tx0 idx=[0..a], tx1 idx=[a+1..b]，无间隔无重叠 | pending |
@@ -250,7 +250,7 @@ OFF=https://rpc.testnet.arc.network
 | 6.3 | error_traces 字段完整 | 与 traces[0] 同 18 个字段 | pending |
 | 6.4 | error_events 字段完整 | 与 events[0] 同 8 个字段 | pending |
 | 6.5 | traces + error_traces = trace_transaction 总数 | per-tx 验证 | pending |
-| 6.6 | events + error_events = receipt logs 总数（无修正项） | per-block 验证，Arc 严格成立 | pending |
+| 6.6 | events + sum(revert_tx.receipt.logs) = receipt logs 总数 | per-block 验证（Tempo 同公式，含 D20 NCA log 补回） | **PASS** (100/100 sample) |
 | 6.7 | error 字段非空 | error_traces 中 error 字段 == "Reverted" 或类似非空字符串 | pending |
 | 6.8 | revert tx with EVM events 行为 | revert 前 emit 的 EVM events → 全部出现在 error_events（inspector 捕获）。receipt 中这些 log 被回滚不存在。Arc：`error_events == inspector_captured_events`（无 fee log 修正） | pending |
 | 6.9 | 内部 revert（try/catch） | 成功 tx 中失败的子调用 traces 进 error_traces，其余进 traces；与 reth-x 行为一致 | pending |
@@ -405,7 +405,7 @@ OFF=https://rpc.testnet.arc.network
 | 13.2 | block hash 一致 | 200 blocks | pending |
 | 13.3 | event idx 全局递增无重复 | 200 blocks | pending |
 | 13.4 | trace 数量一致（per-tx vs trace_transaction） | 200 blocks, 估 ~500 txs | pending |
-| 13.5 | events + error_events == receipt.logs（严格） | 200 blocks | pending |
+| 13.5 | events + sum(revert_tx_receipt_logs) == total_receipt_logs | 200 blocks | **PASS** (100/100 sample after D20 fix) |
 
 ---
 
