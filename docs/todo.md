@@ -28,7 +28,7 @@ Open items, listed by priority/phase. Subagents append here during execution; us
 
 ## Follow-ups (out of plan scope)
 
-- [ ] On-node verification against `chaindev-misc-g1` — deploy new image, run RPC test suite from `task_tempo/docs/test-plan-generic-node.md` adapted to Arc (chain id `5042002`)
+- [ ] On-node verification against `chaindev-misc-g1` — deploy PR #1 image, execute `docs/debank-rpc-test-plan.md` (141 tests across 15 sections + 200-block batch regression)
 - [ ] `background-tracer` sidecar integration for Arc: configure Kafka topics + S3 bucket layout (per `~/code/task_tempo/docs/generic-node.md` deployment section)
 - [ ] `leafage-evm` pipeline ingestion config for Arc
 - [ ] Performance benchmarks (target Tempo's 12ms / call baseline)
