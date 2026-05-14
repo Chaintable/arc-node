@@ -299,11 +299,11 @@ because `build_debank_traces` correctly classifies every standard tx's root trac
 **Adaptation:** collapsed the if/else inside the success branch to a single block that takes
 the "normal" path (path 1). Comment in the classification loop simplified to 2 bullet points.
 
-### D19. Fee-log re-attachment block fully removed [decided]
+### D19. Fee-log re-attachment block fully removed [reverted 2026-05-15]
 
-Tempo's `trace_debank_block` had a ~110-line block (per Tempo source lines ~348-453) that
-post-processed each tx's logs to attach handler-emitted fee logs to the root trace, with
-two source paths:
+**Original decision (Task 13):** Tempo's `trace_debank_block` had a ~110-line block (per Tempo
+source lines ~348-453) that post-processed each tx's logs to attach handler-emitted fee logs
+to the root trace, with two source paths:
 - **Successful tx**: `exec_logs[evm_event_count..]` — logs from `ExecutionResult::Success` past
   the inspector-captured count are treated as handler-emitted.
 - **Reverted tx**: receipt logs (extracted via serde round-trip earlier in the function) —
@@ -324,3 +324,34 @@ needed.
 
 `cargo check -p debank-rpc` + `cargo clippy -p debank-rpc --all-targets -- -D warnings` +
 `cargo test -p debank-rpc` all clean. File line count dropped from Tempo's 573 to Arc's 357.
+
+**Reverted 2026-05-15:** real-world test on `chaindev-misc-g1` block 0x2813738 (chain id
+5042002, 22 txs, 97 receipt.logs) showed `events + error_events = 77`, missing 20 logs.
+All 9 affected txs have their first missing log from
+`0x1800000000000000000000000000000000000000` (`NATIVE_COIN_AUTHORITY`) — Arc's NCA
+precompile directly emits logs (e.g., for native USDC operations) that bypass EVM call
+frames, so the inspector cannot capture them. This is the same symptom class as Tempo's
+`TempoEvmHandler` fee logs, and the receipt-replay fallback is required. Restored verbatim
+under D20.
+
+### D20. NCA precompile emits logs outside EVM trace [decided 2026-05-15]
+
+Real test on `chaindev-misc-g1` block 0x2813738 (22 txs, 97 receipt.logs)
+showed `events + error_events = 77`, missing 20 logs. All affected txs
+have their first missing log from `0x1800000000000000000000000000000000000000`
+(NATIVE_COIN_AUTHORITY) — a custom precompile that directly emits logs to
+the receipt, bypassing EVM call frames.
+
+This is functionally identical to Tempo's `TempoEvmHandler` fee logs:
+inspector cannot capture them. D19 was wrong to delete the receipt-replay
+fallback; restored.
+
+The Tempo strategy applies verbatim:
+- success tx: append `exec_logs[evm_event_count..]` (logs that
+  `ExecutionResult::Success.logs` includes but inspector missed)
+- revert tx: use entire `receipt.logs` (revm 34 Revert has no logs field)
+- attach extras to root trace with computed pos/id, then re-sequence
+  block-global event idx
+
+Other Arc precompiles (`SYSTEM_ACCOUNTING`, `CALL_FROM`) may behave the
+same; the fallback handles all symmetrically.

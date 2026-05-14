@@ -167,6 +167,43 @@ where
         // Per-tx receipt status drives the failed-tx classification below.
         let tx_statuses: Vec<bool> = receipts.iter().map(|r| r.status()).collect();
 
+        // Per-tx receipt logs — needed for the precompile-emitted log
+        // reconciliation below (D20). `ReceiptResponse` trait does not expose
+        // logs(); serde-deserialize each receipt's logs into `alloy_rpc_types_eth::Log`
+        // (a stable type) and convert to `DebankEvent` placeholders. Final
+        // contract_id / selector / topics / data are reused as-is; `idx` is
+        // re-assigned at the attach site so it lines up with block-global order.
+        let receipt_logs_per_tx: Vec<Vec<DebankEvent>> = receipts
+            .iter()
+            .map(|receipt| {
+                let logs: Vec<alloy_rpc_types_eth::Log> = serde_json::to_value(receipt)
+                    .ok()
+                    .and_then(|v| v.get("logs").cloned())
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                logs.iter()
+                    .enumerate()
+                    .map(|(log_idx, log)| {
+                        let selector = log
+                            .topics()
+                            .first()
+                            .map(|h| h.to_string())
+                            .unwrap_or_default();
+                        let topics: Vec<String> =
+                            log.topics().iter().skip(1).map(|h| h.to_string()).collect();
+                        DebankEvent {
+                            contract_id: log.address(),
+                            selector,
+                            topics,
+                            data: log.data().data.clone(),
+                            idx: log_idx,
+                            ..Default::default()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
         let parent_hash = block.parent_hash();
         let parent_block = self.eth_api.recovered_block(parent_hash.into()).await?;
         let Some(parent_block) = parent_block else {
@@ -192,6 +229,7 @@ where
         let (evm_env, _) = self.eth_api.evm_env_at(block_id).await?;
 
         let parent_block_id = BlockId::hash(parent_hash);
+        let tx_statuses_clone = tx_statuses.clone();
 
         let (traces_result, state_diff, change_addresses) = self
             .eth_api
@@ -240,20 +278,131 @@ where
                     let tx_env = eth_api.evm_config().tx_env(tx);
 
                     let revm::context::result::ResultAndState {
-                        result: _exec_result,
+                        result: exec_result,
                         state,
                     } = eth_api.inspect(&mut diff_db, evm_env.clone(), tx_env, &mut inspector)?;
                     diff_db.commit(state);
+
+                    // `ExecutionResult::into_logs()` returns `Vec<Log>` for
+                    // `Success`, empty for `Revert`/`Halt` (revm 34). Used below
+                    // to recover precompile-emitted logs the inspector missed.
+                    let exec_logs = exec_result.into_logs();
 
                     let arena = inspector.into_traces();
                     let (traces, error_traces, events, error_events) =
                         build_debank_traces(tx_hash, arena, &log_index);
 
-                    // D19: Arc has no handler-emitted fee logs (stock EIP-1559 fee
-                    // path); the inspector-captured traces/events are complete.
-                    // No post-processing needed — Tempo's fee-log re-attachment
-                    // branch is intentionally absent here.
+                    // D19 (reverted; restored as D20): reconcile against receipt logs
+                    // to recover Arc NCA precompile-emitted logs that bypass EVM call
+                    // frames (same problem class as Tempo's TempoEvmHandler fee logs —
+                    // the inspector cannot capture them).
+                    //
+                    // For successful txs: `exec_logs` (from `ExecutionResult::Success`)
+                    // contains all logs including precompile-emitted ones. Extra logs
+                    // beyond what the inspector captured are the precompile entries.
+                    //
+                    // For reverted txs: `ExecutionResult::Revert` has NO logs
+                    // (`exec_logs` is empty). ALL receipt logs are precompile-emitted
+                    // (EVM logs would have been reverted and never enter the receipt).
+                    // Use receipt logs directly — do NOT compare with
+                    // `evm_event_count`, since the inspector may have captured N
+                    // error_events from pre-revert emits, and receipt_log_count
+                    // (precompile only) < N would cause log loss.
+                    let evm_event_count = events.len() + error_events.len();
+                    let tx_reverted = !tx_statuses_clone.get(idx).copied().unwrap_or(true);
+                    let receipt_logs = receipt_logs_per_tx.get(idx).cloned().unwrap_or_default();
+
                     all_results.push((traces, error_traces, events, error_events));
+
+                    // Determine extra-log source: exec_logs for success, receipt
+                    // for revert. Use block-global log_index for idx (not tx-local).
+                    let extra_log_source: Vec<DebankEvent> = if tx_reverted {
+                        // Revert path: all receipt logs are precompile-emitted
+                        receipt_logs
+                            .iter()
+                            .map(|rl| {
+                                let current_idx = *log_index.borrow();
+                                *log_index.borrow_mut() += 1;
+                                DebankEvent {
+                                    contract_id: rl.contract_id,
+                                    selector: rl.selector.clone(),
+                                    topics: rl.topics.clone(),
+                                    data: rl.data.clone(),
+                                    idx: current_idx,
+                                    ..Default::default()
+                                }
+                            })
+                            .collect()
+                    } else if exec_logs.len() > evm_event_count {
+                        // Success path: use exec_logs beyond inspector-captured events
+                        exec_logs[evm_event_count..]
+                            .iter()
+                            .map(|log| {
+                                let selector = log
+                                    .topics()
+                                    .first()
+                                    .map(|h| h.to_string())
+                                    .unwrap_or_default();
+                                let topics = if log.topics().len() > 1 {
+                                    log.topics()[1..].iter().map(|h| h.to_string()).collect()
+                                } else {
+                                    vec![]
+                                };
+                                let current_idx = *log_index.borrow();
+                                *log_index.borrow_mut() += 1;
+                                DebankEvent {
+                                    contract_id: log.address,
+                                    selector,
+                                    topics,
+                                    data: log.data.data.clone(),
+                                    idx: current_idx,
+                                    ..Default::default()
+                                }
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+
+                    if !extra_log_source.is_empty() {
+                        // Safe: just pushed to `all_results` above, so it's non-empty.
+                        let last = all_results
+                            .last()
+                            .expect("all_results pushed in the line above");
+                        let root_trace_id = last
+                            .0
+                            .first()
+                            .or(last.1.first())
+                            .map(|t| t.id.clone())
+                            .unwrap_or_default();
+                        // Compute base pos from root trace's subtraces + all events
+                        // already attached to it, to avoid pos collision with EVM events.
+                        let root_subtraces = last
+                            .0
+                            .first()
+                            .or(last.1.first())
+                            .map(|t| t.subtraces)
+                            .unwrap_or(0);
+                        let existing_events_on_root = last
+                            .2
+                            .iter()
+                            .chain(last.3.iter())
+                            .filter(|e| e.parent_trace_id == root_trace_id)
+                            .count();
+                        let mut extra_pos = root_subtraces + existing_events_on_root;
+
+                        for mut extra_event in extra_log_source {
+                            extra_event.parent_trace_id = root_trace_id.clone();
+                            extra_event.pos_in_parent_trace = extra_pos;
+                            extra_event.id = extra_event.debank_id();
+                            all_results
+                                .last_mut()
+                                .expect("all_results pushed earlier in this iteration")
+                                .2
+                                .push(extra_event);
+                            extra_pos += 1;
+                        }
+                    }
                 }
 
                 let change_addresses = get_storage_contracts_from_cache(&diff_db.diff.cache);
@@ -264,19 +413,36 @@ where
 
         // Assemble block file.
         // D18: Classification uses per-node success from build_debank_traces, with
-        // receipt status as override. The AA root-trace merge-back (Tempo) is
-        // intentionally absent — Arc has no AA wrapper traces.
+        // receipt status as override. The `root_misclassified` AA merge branch is
+        // kept structurally identical to Tempo so the two ports stay diff-friendly,
+        // even though Arc has no AA wrapper traces and the branch never fires.
         //
-        // - Successful tx: keep per-node classification — internal revert
-        //   sub-calls (try/catch) stay in error lists. Matches reth-x behavior.
-        // - Failed tx: all traces/events go to error lists.
-        for (idx, (trace, mut error_trace, event, mut error_event)) in
+        // 1. Successful tx, root trace correctly classified (in traces):
+        //    Keep per-node classification. Internal revert sub-calls
+        //    (try/catch) stay in error lists. Matches reth-x behavior.
+        //
+        // 2. Successful tx, root trace misclassified (in error_traces):
+        //    AA-only path (dead on Arc) — `CallTraceArena` marks the handler
+        //    wrapper and its children as success=false even though the tx
+        //    succeeds. The arena's success flags are unreliable for the
+        //    entire tree, so merge all error_traces/events into success lists.
+        //
+        // 3. Failed tx: all traces/events go to error lists.
+        for (idx, (mut trace, mut error_trace, mut event, mut error_event)) in
             traces_result.into_iter().enumerate()
         {
             let tx_success = tx_statuses.get(idx).copied().unwrap_or(true);
             if tx_success {
-                block_file.error_traces.extend(error_trace);
-                block_file.error_events.extend(error_event);
+                let root_misclassified = error_trace.iter().any(|t| t.trace_address.is_empty());
+                if root_misclassified {
+                    // AA tx: arena success flags unreliable, merge all
+                    trace.extend(error_trace);
+                    event.extend(error_event);
+                } else {
+                    // Normal tx: keep per-node classification (try/catch)
+                    block_file.error_traces.extend(error_trace);
+                    block_file.error_events.extend(error_event);
+                }
                 block_file.traces.extend(trace);
                 block_file.events.extend(event);
             } else {

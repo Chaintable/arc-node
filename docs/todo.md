@@ -26,6 +26,10 @@ Open items, listed by priority/phase. Subagents append here during execution; us
 - [x] Task 16 — Commit Phase 2
 - [x] Task 17 — Push branch + open PR to `debank` (PR #1, https://github.com/Chaintable/arc-node/pull/1)
 
+## Bug fixes (post-deployment)
+
+- [x] D19 → D20: restored Tempo's receipt-log fallback in trace_block.rs (NCA precompile log capture)
+
 ## Follow-ups (out of plan scope)
 
 - [ ] On-node verification against `chaindev-misc-g1` — deploy PR #1 image, execute `docs/debank-rpc-test-plan.md` (141 tests across 15 sections + 200-block batch regression)
