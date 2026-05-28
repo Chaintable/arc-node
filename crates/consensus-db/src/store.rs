@@ -99,6 +99,140 @@ impl StoreError {
     }
 }
 
+/// Per-table deletion counts from a rollback operation.
+#[derive(Debug, Default)]
+pub struct RollbackReport {
+    pub certificates: usize,
+    pub decided_blocks: usize,
+    pub invalid_payloads: usize,
+    pub misbehavior_evidence: usize,
+    pub proposal_monitor_data: usize,
+    pub undecided_blocks: usize,
+    pub pending_proposal_parts: usize,
+}
+
+/// Default number of heights deleted per write transaction during rollback.
+pub const ROLLBACK_BATCH_SIZE: u64 = 1000;
+
+/// Roll back all consensus tables to `target_height`, removing entries above it.
+///
+/// When `dry_run` is true, entries are counted but the transaction is aborted
+/// so the database remains unchanged.
+///
+/// Deletions are batched in chunks of `batch_size` heights. Each batch is a
+/// single write transaction across all 7 tables, so a crash mid-rollback leaves
+/// the database consistent at some intermediate height.
+///
+/// Operates directly on a `redb::Database` so CLI commands can call it without
+/// constructing a full `Store`.
+pub fn rollback_to_height(
+    db: &redb::Database,
+    target_height: Height,
+    batch_size: u64,
+    dry_run: bool,
+) -> Result<RollbackReport, StoreError> {
+    assert!(batch_size > 0, "batch_size must be > 0");
+
+    let mut report = RollbackReport::default();
+
+    let current_height = {
+        let tx = db.begin_read()?;
+        let table = tx.open_table(CERTIFICATES_TABLE)?;
+        match table.last()? {
+            Some((k, _)) => k.value(),
+            None => return Ok(report),
+        }
+    };
+
+    if current_height <= target_height {
+        return Ok(report);
+    }
+
+    // Work from the tip downward so a crash leaves a contiguous prefix, not a gap.
+
+    // Redb retain_in expects a range exclusive of the upper bound, so we increment
+    let stop = target_height.increment();
+    let mut range_high = current_height.increment();
+    loop {
+        if range_high == stop {
+            break;
+        }
+        let range_low = range_high.saturating_sub(batch_size).max(stop);
+
+        // Round::Nil serializes to -1 and BlockHash::ZERO is all zeros, so these
+        // are the minimum (round, hash) values — the composite range captures all
+        // entries within the height range regardless of round or block hash.
+        let composite_start = (range_low, Round::Nil, BlockHash::ZERO);
+        let composite_end = (range_high, Round::Nil, BlockHash::ZERO);
+
+        info!(
+            batch_start = %range_low,
+            batch_end = %range_high,
+            "Rolling back height batch"
+        );
+
+        let tx = db.begin_write()?;
+        {
+            let mut t = tx.open_table(CERTIFICATES_TABLE)?;
+            t.retain_in(range_low..range_high, |_, _| {
+                report.certificates = report.certificates.saturating_add(1);
+                dry_run
+            })?;
+
+            let mut t = tx.open_table(DECIDED_BLOCKS_TABLE)?;
+            t.retain_in(range_low..range_high, |_, _| {
+                report.decided_blocks = report.decided_blocks.saturating_add(1);
+                dry_run
+            })?;
+
+            let mut t = tx.open_table(INVALID_PAYLOADS_TABLE)?;
+            t.retain_in(range_low..range_high, |_, _| {
+                report.invalid_payloads = report.invalid_payloads.saturating_add(1);
+                dry_run
+            })?;
+
+            let mut t = tx.open_table(MISBEHAVIOR_EVIDENCE_TABLE)?;
+            t.retain_in(range_low..range_high, |_, _| {
+                report.misbehavior_evidence = report.misbehavior_evidence.saturating_add(1);
+                dry_run
+            })?;
+
+            let mut t = tx.open_table(PROPOSAL_MONITOR_DATA_TABLE)?;
+            t.retain_in(range_low..range_high, |_, _| {
+                report.proposal_monitor_data = report.proposal_monitor_data.saturating_add(1);
+                dry_run
+            })?;
+
+            let mut t = tx.open_table(UNDECIDED_BLOCKS_TABLE)?;
+            t.retain_in(composite_start..composite_end, |_, _| {
+                report.undecided_blocks = report.undecided_blocks.saturating_add(1);
+                dry_run
+            })?;
+
+            let mut t = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
+            t.retain_in(composite_start..composite_end, |_, _| {
+                report.pending_proposal_parts = report.pending_proposal_parts.saturating_add(1);
+                dry_run
+            })?;
+        }
+
+        if dry_run {
+            tx.abort()?;
+        } else {
+            tx.commit()?;
+        }
+
+        info!(
+            updated_head = range_low.as_u64().saturating_sub(1),
+            dry_run = dry_run,
+            "Batch committed"
+        );
+        range_high = range_low;
+    }
+
+    Ok(report)
+}
+
 pub const CERTIFICATES_TABLE: redb::TableDefinition<HeightKey, Vec<u8>> =
     redb::TableDefinition::new("certificates");
 
@@ -164,8 +298,10 @@ impl Db {
         let path = path.as_ref().to_owned();
         let db_exists = path.exists();
 
+        #[allow(clippy::cast_possible_truncation)] // 32-bit targets won't have multi-GB caches
+        let cache_size_bytes = cache_size.as_u64() as usize;
         let mut db = redb::Database::builder()
-            .set_cache_size(cache_size.as_u64() as usize)
+            .set_cache_size(cache_size_bytes)
             .set_repair_callback(|session| {
                 let status = session.progress() * 100.0;
                 info!("Database repair in progress: {status:.2}%");
@@ -216,6 +352,7 @@ impl Db {
         ))
     }
 
+    // Metric byte counters accumulate bounded DB record sizes — overflow is not reachable.
     fn get_payload(&self, height: Height) -> Result<Option<ExecutionPayloadV3>, StoreError> {
         let start = Instant::now();
         let mut read_bytes = 0;
@@ -227,7 +364,10 @@ impl Db {
         let payload = payload
             .map(|value| {
                 let bytes = value.value();
-                read_bytes += bytes.len();
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
                 decode_execution_payload(&bytes)
             })
             .transpose()
@@ -257,7 +397,10 @@ impl Db {
         };
 
         let result = bytes.and_then(|bytes| {
-            read_bytes += bytes.len();
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                read_bytes += bytes.len();
+            }
             decode_certificate(&bytes).ok()
         });
 
@@ -278,7 +421,10 @@ impl Db {
             let payload = table.get(&height)?.map(|value| value.value());
             payload
                 .map(|bytes| {
-                    read_bytes += bytes.len();
+                    #[allow(clippy::arithmetic_side_effects)]
+                    {
+                        read_bytes += bytes.len();
+                    }
                     decode_execution_payload(&bytes)
                 })
                 .transpose()
@@ -290,7 +436,10 @@ impl Db {
             let value = table.get(&height)?;
             value.and_then(|value| {
                 let bytes = value.value();
-                read_bytes += bytes.len();
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
                 decode_certificate(&bytes).ok()
             })
         };
@@ -319,7 +468,10 @@ impl Db {
         {
             let mut blocks = tx.open_table(DECIDED_BLOCKS_TABLE)?;
             let block_bytes = encode_execution_payload(&decided_block.execution_payload);
-            write_bytes += block_bytes.len();
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                write_bytes += block_bytes.len();
+            }
             blocks.insert(height, block_bytes)?;
         }
 
@@ -502,7 +654,10 @@ impl Db {
 
         let data = bytes
             .map(|bytes| {
-                read_bytes += bytes.len();
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
                 decode_proposal_monitor_data(&bytes)
             })
             .transpose()
@@ -541,7 +696,10 @@ impl Db {
 
         let evidence = bytes
             .map(|bytes| {
-                read_bytes += bytes.len();
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
                 decode_misbehavior_evidence(&bytes)
             })
             .transpose()
@@ -584,7 +742,10 @@ impl Db {
 
         let payloads = bytes
             .map(|bytes| {
-                read_bytes += bytes.len();
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
                 decode_invalid_payloads(&bytes)
             })
             .transpose()
@@ -649,7 +810,10 @@ impl Db {
 
         let value = if let Ok(Some(value)) = table.get(&(height, round, block_hash)) {
             let bytes = value.value();
-            read_bytes += bytes.len();
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                read_bytes += bytes.len();
+            }
 
             let block = decode_block(&bytes)?;
             Some(block)
@@ -685,7 +849,10 @@ impl Db {
 
             if key_height == height && key_block_hash == block_hash {
                 let bytes = value.value();
-                read_bytes += bytes.len();
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
 
                 let block = decode_block(&bytes)?;
 
@@ -724,6 +891,7 @@ impl Db {
 
         // Iterate through all entries that start with (height, round, *)
         let range_start = (height, round, BlockHash::new([0; 32]));
+        #[allow(clippy::arithmetic_side_effects)] // round + 1 for range upper bound
         let range_end = (
             height,
             Round::from(round.as_i64() + 1),
@@ -737,18 +905,19 @@ impl Db {
             // Only include entries that match exactly height and round
             if key_tuple.0 == height && key_tuple.1 == round {
                 let bytes = value.value();
-                read_bytes += bytes.len();
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
 
                 let proposal = decode_block(&bytes)?;
                 blocks.push(proposal);
             }
         }
 
-        self.update_read_metrics(
-            read_bytes,
-            size_of::<(Height, Round, BlockHash)>() * blocks.len(),
-            start.elapsed(),
-        );
+        #[allow(clippy::arithmetic_side_effects)]
+        let key_bytes = size_of::<(Height, Round, BlockHash)>() * blocks.len();
+        self.update_read_metrics(read_bytes, key_bytes, start.elapsed());
 
         Ok(blocks)
     }
@@ -827,18 +996,19 @@ impl Db {
 
             if h == height && r == round {
                 let bytes = value.value();
-                read_bytes += bytes.len();
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    read_bytes += bytes.len();
+                }
 
                 let parts = decode_proposal_parts(&bytes)?;
                 proposals.push(parts);
             }
         }
 
-        self.update_read_metrics(
-            read_bytes,
-            size_of::<(Height, Round, BlockHash)>() * proposals.len(),
-            start.elapsed(),
-        );
+        #[allow(clippy::arithmetic_side_effects)]
+        let key_bytes = size_of::<(Height, Round, BlockHash)>() * proposals.len();
+        self.update_read_metrics(read_bytes, key_bytes, start.elapsed());
 
         Ok(proposals)
     }
@@ -849,6 +1019,8 @@ impl Db {
         let tx = self.db.begin_read()?;
         let table = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
 
+        // redb returns u64; table won't exceed usize on any supported target
+        #[allow(clippy::cast_possible_truncation)]
         let count = table.len()? as usize;
 
         self.update_read_metrics(0, 0, start.elapsed());
@@ -874,19 +1046,17 @@ impl Db {
             let (height, _, _) = key.value();
 
             let bytes = value.value();
-            read_bytes += bytes.len();
-
-            let count = counts.entry(height).or_insert(0);
-            *count += 1;
-
-            total_keys += 1;
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                read_bytes += bytes.len();
+                *counts.entry(height).or_insert(0) += 1;
+                total_keys += 1;
+            }
         }
 
-        self.update_read_metrics(
-            read_bytes,
-            size_of::<(Height, Round, BlockHash)>() * total_keys,
-            start.elapsed(),
-        );
+        #[allow(clippy::arithmetic_side_effects)]
+        let key_bytes = size_of::<(Height, Round, BlockHash)>() * total_keys;
+        self.update_read_metrics(read_bytes, key_bytes, start.elapsed());
 
         Ok(counts.into_iter().collect())
     }
@@ -901,7 +1071,11 @@ impl Db {
 
         // Calculate max allowed height (inclusive).
         // For current_height=10 and max_pending_parts=4, we allow heights 10, 11, 12, 13.
-        let max_allowed_height = current_height.increment_by(max_pending_parts as u64 - 1);
+        let max_allowed_height = current_height.increment_by(
+            max_pending_parts
+                .checked_sub(1)
+                .expect("max_pending_parts must be > 0") as u64,
+        );
 
         // Do not insert if proposal is outside the allowed range (too far in the future)
         if parts.height() > max_allowed_height {
@@ -918,6 +1092,7 @@ impl Db {
         {
             let mut table = tx.open_table(PENDING_PROPOSAL_PARTS_TABLE)?;
 
+            #[allow(clippy::cast_possible_truncation)]
             let count = table.len()? as usize;
 
             if count < max_pending_parts {
@@ -949,7 +1124,11 @@ impl Db {
 
             // Calculate max allowed height (inclusive).
             // For current_height=10 and max_pending_parts=4, we allow heights 10, 11, 12, 13.
-            let max_allowed_height = current_height.increment_by(max_pending_proposals as u64 - 1);
+            let max_allowed_height = current_height.increment_by(
+                max_pending_proposals
+                    .checked_sub(1)
+                    .expect("max_pending_proposals must be > 0") as u64,
+            );
 
             // Collect all keys, categorize as: stale, within_range, or too_far
             // Keys are sorted by (height, round, hash) ascending
@@ -1880,6 +2059,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
     async fn test_pending_proposal_parts_counts() {
         // no proposal parts
         let store = create_store().await;
@@ -2560,6 +2740,7 @@ mod tests {
         .await;
     }
 
+    #[allow(clippy::arithmetic_side_effects)]
     async fn test_enforce_pending_limit_on_startup(
         initial_proposals: Vec<(u64, u32)>,
         current_height: u64,

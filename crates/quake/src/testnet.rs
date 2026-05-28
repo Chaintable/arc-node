@@ -14,15 +14,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use color_eyre::eyre::{self, bail, eyre, Context, Result};
-use indexmap::IndexMap;
-use itertools::Itertools;
-use rand::Rng;
-use spammer::{self, Spammer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
+
+use color_eyre::eyre::{self, bail, eyre, Context, Result};
+use indexmap::IndexMap;
+use itertools::Itertools;
+use rand::Rng;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -38,8 +38,10 @@ use crate::rpc::RpcClient;
 use crate::rpc::{ControllerInfo, Controllers};
 use crate::valset::ValidatorPowerUpdate;
 use crate::wait::{check_ws_connectable, wait_for_nodes, wait_for_nodes_sync, wait_for_rounds};
-use crate::{build, genesis, info as info_mod, latency, monitor, setup, shell};
-use crate::{InfoSubcommand, RemoteSubcommand, SSMSubcommand};
+use crate::{build, clean, info as info_mod, latency, monitor, setup, shell};
+use crate::{
+    DownloadSubcommand, InfoSubcommand, MonitoringSubcommand, RemoteSubcommand, SSMSubcommand,
+};
 
 pub(crate) const QUAKE_DIR: &str = ".quake";
 pub(crate) const LAST_MANIFEST_FILENAME: &str = ".last_manifest";
@@ -53,14 +55,6 @@ pub(crate) const LAST_MANIFEST_FILENAME: &str = ".last_manifest";
 ///
 /// Will be deleted after the testnet is torn down with 'quake clean'.
 const UPGRADED_CONTAINERS_FILENAME: &str = ".upgraded_containers";
-
-const BLOCKSCOUT_CONTAINERS: [&str; 5] = [
-    "blockscout-db-init",
-    "blockscout-db",
-    "blockscout-backend",
-    "blockscout-proxy",
-    "blockscout-frontend",
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum TestnetError {
@@ -184,6 +178,12 @@ impl Testnet {
                 )
             }
             InfraType::Remote => {
+                let owner_id = if infra_data.control_center.is_some() {
+                    infra::ssm::ensure_owner_id(&dir)
+                        .wrap_err("Failed to initialize local SSM owner ID")?
+                } else {
+                    String::new()
+                };
                 let terraform = Terraform::new(
                     &repo_root_dir.join("crates").join("quake").join("terraform"),
                     &relative_dir,
@@ -192,8 +192,9 @@ impl Testnet {
                     node_names,
                     manifest.build_network_topology(),
                 )?;
-                let ssm_tunnels = infra::ssm::Ssm::new(infra_data.control_center.as_ref())
-                    .wrap_err("Failed to initialize SSM tunnels")?;
+                let ssm_tunnels =
+                    infra::ssm::Ssm::new(owner_id, infra_data.control_center.as_ref())
+                        .wrap_err("Failed to initialize SSM tunnels")?;
                 Arc::new(
                     RemoteInfra::new(
                         &repo_root_dir,
@@ -241,7 +242,14 @@ impl Testnet {
     }
 
     /// Set up testnet files locally
-    pub async fn setup(&mut self, force: bool, rpc: bool, num_extra_accounts: usize) -> Result<()> {
+    pub async fn setup(
+        &mut self,
+        force: bool,
+        rpc: bool,
+        num_extra_accounts: usize,
+        extra_account_balance_usdc: Option<u64>,
+        block_gas_limit: Option<u64>,
+    ) -> Result<()> {
         debug!(dir=%self.dir.display(), "⚙️ Setting up testnet files");
         debug!(
             "Using {} for the Engine API connection between Consensus Layer (CL) and Execution Layer (EL)",
@@ -279,16 +287,21 @@ impl Testnet {
         }
 
         let voting_powers = self.manifest.validator_voting_powers();
-        setup::generate_genesis_file(
-            &self.repo_root_dir,
-            &genesis_file_path,
+        let effective_balance =
+            extra_account_balance_usdc.or(self.manifest.extra_account_balance_usdc);
+        let effective_gas_limit = block_gas_limit.or(self.manifest.block_gas_limit);
+        setup::generate_genesis_file(setup::GenesisParams {
+            repo_root_dir: &self.repo_root_dir,
+            genesis_file: &genesis_file_path,
             num_extra_accounts,
-            &self.manifest.public_key_overrides(),
-            &validator_names,
-            voting_powers.as_deref(),
+            public_keys_overrides: &self.manifest.public_key_overrides(),
+            validator_names: &validator_names,
+            validator_voting_powers: voting_powers.as_deref(),
             force,
-            self.manifest.el_init_hardfork.as_deref(),
-        )?;
+            el_init_hardfork: self.manifest.el_init_hardfork.as_deref(),
+            extra_account_balance_usdc: effective_balance,
+            block_gas_limit: effective_gas_limit,
+        })?;
 
         // We want access to files outside of the testnet directory.
         let deployments_dir = self.repo_root_dir.join("deployments");
@@ -336,6 +349,10 @@ impl Testnet {
                     latency_emulation: self.manifest.latency_emulation,
                     monitoring_bind_host: self.manifest.monitoring_bind_host.clone(),
                     trusted_peers,
+                    el_cpu_limit: self.manifest.el_cpu_limit,
+                    el_memory_limit_gb: self.manifest.el_memory_limit_gb,
+                    cl_cpu_limit: self.manifest.cl_cpu_limit,
+                    cl_memory_limit_gb: self.manifest.cl_memory_limit_gb,
                 };
                 // Compose file for building Docker images
                 setup::generate_compose_file(
@@ -368,8 +385,8 @@ impl Testnet {
                 setup::generate_prometheus_config(&path, self.nodes_metadata.values())?;
             }
             InfraType::Remote => {
-                // Get consensus container IPs for all nodes (needed for persistent peers)
-                let consensus_addresses_map = self.nodes_metadata.consensus_ip_addresses_map();
+                infra::ssm::ensure_owner_id(&self.dir)
+                    .wrap_err("Failed to create local SSM owner ID")?;
 
                 // Generate a compose file per node with node-specific EL and CL
                 // configuration
@@ -387,17 +404,11 @@ impl Testnet {
                     );
 
                     let peers_ips: Vec<String> = if let Some(peers) = &node.cl_persistent_peers {
-                        NodesMetadata::peer_consensus_ips(
-                            node_name,
-                            peers,
-                            &consensus_addresses_map,
-                        )?
+                        self.nodes_metadata
+                            .resolve_cl_persistent_peers_list_ips(node_name, peers)?
                     } else {
-                        consensus_addresses_map
-                            .iter()
-                            .filter(|&(peer_name, _)| peer_name != node_name)
-                            .flat_map(|(_, private_ips)| private_ips.clone())
-                            .collect()
+                        self.nodes_metadata
+                            .default_cl_persistent_peers_list_ips(node_name)
                     };
 
                     // Resolve follow endpoints to container-accessible EL RPC URLs.
@@ -425,25 +436,31 @@ impl Testnet {
                         .collect();
 
                     // Generate CL CLI flags including persistent peers
-                    let cl_cli_flags = setup::generate_node_cli_flags(
+                    let cl_cli_flags = setup::generate_consensus_cli_flags(
                         node_name,
                         Some(node),
                         "0.0.0.0", // Remote nodes listen on all interfaces
                         &peers_ips,
                         Some(self.images.cl.as_str()),
                         &follow_endpoint_urls,
-                    );
+                    )?;
 
                     let compose_data = setup::ComposeTemplateDataRemote {
                         compose_project_name: COMPOSE_PROJECT_NAME.to_string(),
                         cl_container_name: remote::CONTAINER_NAME_CONSENSUS.to_string(),
                         el_container_name: remote::CONTAINER_NAME_EXECUTION.to_string(),
+                        node_name: node_name.to_string(),
+                        latency_emulation: self.manifest.latency_emulation,
                         rpc,
                         remote_home_dir: format!("/home/{}", remote::USER_NAME),
                         images: self.images.clone(),
                         cl_cli_flags,
                         el_cli_flags,
                         trusted_peers: trusted_peers.get(node_name).cloned().unwrap_or_default(),
+                        el_cpu_limit: self.manifest.el_cpu_limit,
+                        el_memory_limit_gb: self.manifest.el_memory_limit_gb,
+                        cl_cpu_limit: self.manifest.cl_cpu_limit,
+                        cl_memory_limit_gb: self.manifest.cl_memory_limit_gb,
                     };
                     // Create node directory for compose file
                     let node_dir = self.dir.join(node_name);
@@ -533,7 +550,7 @@ impl Testnet {
     }
 
     /// Start testnet containers using Docker Compose
-    pub async fn start(&self, names: Vec<NodeOrContainerName>) -> Result<()> {
+    pub async fn start(&self, names: Vec<NodeOrContainerName>, monitoring: bool) -> Result<()> {
         // In remote mode, open long-lived SSM tunnels to the Control Center
         // server ports (required for RPC proxy and monitoring services)
         if let Ok(remote_infra) = self.remote_infra() {
@@ -549,17 +566,27 @@ impl Testnet {
             self.infra.start(&containers)?;
         } else {
             // Start the testnet following the starting heights in the manifest
-            self.start_from_manifest().await?;
+            self.start_from_manifest(monitoring).await?;
+        }
+
+        // In local mode, monitoring services are started only with the first group of nodes
+        if monitoring && self.is_remote() {
+            if let Err(err) = self.infra.start_monitoring() {
+                warn!("⚠️ Failed to start monitoring services: {err:#}");
+            } else {
+                info!("✅ Monitoring services started on CC");
+            }
         }
 
         info!(dir=%self.dir.display(), "✅ Testnet started");
-        println!("📁 Testnet files: {}", self.dir.display());
-        self.print_monitoring_info();
+        if monitoring && names.is_empty() {
+            self.print_monitoring_info();
+        }
         Ok(())
     }
 
     /// Start nodes in the testnet following their starting heights in the manifest
-    async fn start_from_manifest(&self) -> Result<()> {
+    async fn start_from_manifest(&self, monitoring: bool) -> Result<()> {
         // Group nodes by starting height, then sort groups by height
         let nodes_by_height = self
             .manifest
@@ -600,18 +627,13 @@ impl Testnet {
             let names_str = node_names.as_slice().join(", ");
             info!(nodes=%names_str, "Starting nodes at height {height}");
 
-            // Start containers associated with the node group
-            let mut containers: Vec<_> = nodes.iter().flat_map(|n| n.container_names()).collect();
             // In local mode, start monitoring services with the first group of nodes
-            if let Ok(local_infra) = self.local_infra() {
-                if started_nodes.is_empty() {
-                    containers.extend(BLOCKSCOUT_CONTAINERS.map(String::from));
-
-                    let monitoring = local_infra.monitoring.clone();
-                    tokio::task::spawn_blocking(move || monitoring.start()).await??;
-                }
+            if monitoring && self.is_local() && started_nodes.is_empty() {
+                self.infra.start_monitoring()?;
             }
 
+            // Start containers associated with the node group
+            let containers: Vec<_> = nodes.iter().flat_map(|n| n.container_names()).collect();
             debug!(containers=%containers.join(", "), "Starting containers");
             self.infra.start(&containers)?;
 
@@ -888,6 +910,7 @@ impl Testnet {
                 mesh_only,
                 peers,
                 peers_full,
+                duplicates,
             }) => {
                 let metrics_urls = self.nodes_metadata.all_consensus_metrics_urls();
                 let raw_metrics = crate::mesh::fetch_all_metrics(&metrics_urls).await;
@@ -902,6 +925,7 @@ impl Testnet {
                         show_mesh: true,
                         show_peers: peers || peers_full,
                         show_peers_full: peers_full,
+                        show_duplicates: duplicates,
                     };
                     print!("{}", crate::mesh::format_report(&analysis, &options));
                 }
@@ -909,25 +933,68 @@ impl Testnet {
             Some(InfoSubcommand::Perf {
                 latency_only,
                 throughput_only,
+                interval,
+                warmup_seconds,
+                observation_seconds,
             }) => {
                 let metrics_urls = self.nodes_metadata.all_consensus_metrics_urls();
-                let raw_metrics = arc_checks::fetch_all_metrics(&metrics_urls).await;
-                let mut nodes = arc_checks::parse_perf_metrics(&raw_metrics);
+                let options = arc_checks::PerfDisplayOptions {
+                    show_latency: !throughput_only,
+                    show_throughput: !latency_only,
+                    show_summary: !latency_only && !throughput_only,
+                };
 
-                crate::util::assign_node_groups(
-                    nodes.iter_mut().map(|n| (n.name.as_str(), &mut n.group)),
-                    &self.manifest.nodes,
-                );
+                if interval {
+                    if warmup_seconds > 0 {
+                        println!("Warming up ({warmup_seconds}s) before first scrape...");
+                        tokio::time::sleep(std::time::Duration::from_secs(warmup_seconds)).await;
+                    }
+                    let raw_before = arc_checks::fetch_all_metrics(&metrics_urls).await;
+                    println!("Observing ({observation_seconds}s) before second scrape...");
+                    tokio::time::sleep(std::time::Duration::from_secs(observation_seconds)).await;
+                    let raw_after = arc_checks::fetch_all_metrics(&metrics_urls).await;
 
-                if nodes.is_empty() {
-                    println!("No nodes responded to metrics requests. Is the testnet running?");
+                    let nodes = crate::util::parse_perf_metrics_delta_with_groups(
+                        &raw_before,
+                        &raw_after,
+                        &self.manifest.nodes,
+                    );
+
+                    if nodes.is_empty() {
+                        println!(
+                            "No interval perf data (no nodes with metrics in both scrapes). Is the testnet running?"
+                        );
+                    } else {
+                        print!(
+                            "{}",
+                            arc_checks::format_perf_report(
+                                &nodes,
+                                &options,
+                                arc_checks::PerfReportKind::Interval {
+                                    observation_secs: observation_seconds,
+                                },
+                            )
+                        );
+                    }
                 } else {
-                    let options = arc_checks::PerfDisplayOptions {
-                        show_latency: !throughput_only,
-                        show_throughput: !latency_only,
-                        show_summary: !latency_only && !throughput_only,
-                    };
-                    print!("{}", arc_checks::format_perf_report(&nodes, &options));
+                    let raw_metrics = arc_checks::fetch_all_metrics(&metrics_urls).await;
+                    let nodes = crate::util::parse_perf_metrics_with_groups(
+                        &raw_metrics,
+                        &self.manifest.nodes,
+                    );
+
+                    if nodes.is_empty() {
+                        println!("No nodes responded to metrics requests. Is the testnet running?");
+                    } else {
+                        print!(
+                            "{}",
+                            arc_checks::format_perf_report(
+                                &nodes,
+                                &options,
+                                arc_checks::PerfReportKind::CumulativeSinceStart,
+                            )
+                        );
+                    }
                 }
             }
             Some(InfoSubcommand::Store { nodes }) => {
@@ -971,65 +1038,12 @@ impl Testnet {
         Ok(())
     }
 
-    /// Clean up testnet-related files, directories, infrastructure, and running processes
-    pub async fn clean(&self, all: bool) -> Result<()> {
-        // Take down the testnet infrastructure
-        match self.infra_data.infra_type {
-            InfraType::Local => {
-                if let Err(err) = self.infra.down(&[]) {
-                    warn!(%err, "⚠️ Failed to stop and remove containers");
-                } else {
-                    debug!("✅ Testnet is down");
-                }
-            }
-            InfraType::Remote => {
-                let remote_infra = self.remote_infra()?;
-                if let Err(err) = remote_infra.ssm_tunnels.stop().await {
-                    warn!(%err, "⚠️ Failed to terminate SSM sessions");
-                }
-
-                if remote_infra.terraform.has_state() {
-                    debug!("⬇️ Destroying remote infrastructure...");
-                    if let Err(err) = remote_infra.terraform.destroy(true) {
-                        warn!(%err, "⚠️ Failed to destroy remote infrastructure");
-                    } else {
-                        info!("✅ Remote infrastructure destroyed");
-                    }
-                } else {
-                    info!("No Terraform state found; skipping infrastructure destroy");
-                }
-            }
-        }
-
-        // Remove testnet local data
-        if self.dir.exists() {
-            debug!(dir=%self.dir.display(), "🗑️  Removing testnet data");
-            if let Err(err) = fs::remove_dir_all(&self.dir) {
-                warn!(dir=%self.dir.display(), "Failed to remove testnet data: {err}");
-            } else {
-                debug!(dir=%self.dir.display(), "✅ Testnet data removed");
-            }
-        }
-
-        // Take down local monitoring services and remove their data, if requested
-        if let Ok(local_infra) = self.local_infra() {
-            if all {
-                if local_infra.monitoring.stop().is_ok() {
-                    debug!("✅ Monitoring services stopped");
-                }
-                if local_infra.monitoring.clean().is_ok() {
-                    debug!(dir=%local_infra.monitoring.dir.display(), "✅ Monitoring data removed");
-                }
-            } else {
-                warn!(
-                    "Monitoring services are still running; run `quake clean --all` to stop and clean them"
-                );
-            }
-        }
+    /// Clean up testnet-related files, directories, infrastructure, and running processes.
+    pub async fn clean(&self, scope: clean::Scope) -> Result<()> {
+        clean::clean(self, scope).await;
 
         let _ = fs::remove_file(self.quake_dir.join(UPGRADED_CONTAINERS_FILENAME));
 
-        info!("✅ Testnet cleaned");
         Ok(())
     }
 
@@ -1042,12 +1056,38 @@ impl Testnet {
                 dry_run,
                 yes,
                 infra_args,
-            } => infra.terraform.create(
-                dry_run,
-                yes,
-                infra_args.node_size.as_deref(),
-                infra_args.cc_size.as_deref(),
-            ),
+            } => {
+                let node_size = infra_args
+                    .node_size
+                    .as_deref()
+                    .or(self.manifest.node_size.as_deref());
+                let cc_size = infra_args
+                    .cc_size
+                    .as_deref()
+                    .or(self.manifest.cc_size.as_deref());
+                let node_disk_gb = infra_args.node_disk_gb.or(self.manifest.node_disk_gb);
+                let cc_disk_gb = infra_args.cc_disk_gb.or(self.manifest.cc_disk_gb);
+                let node_volume_type = infra_args
+                    .node_volume_type
+                    .as_deref()
+                    .or(self.manifest.node_volume_type.as_deref());
+                let node_volume_iops = infra_args
+                    .node_volume_iops
+                    .or(self.manifest.node_volume_iops);
+                // CLI overrides can mix freely with manifest fields, so re-validate
+                // the merged pair before reaching Terraform.
+                crate::manifest::validate_node_volume(node_volume_type, node_volume_iops)?;
+                infra.terraform.create(
+                    dry_run,
+                    yes,
+                    node_size,
+                    cc_size,
+                    node_disk_gb,
+                    cc_disk_gb,
+                    node_volume_type,
+                    node_volume_iops,
+                )
+            }
             RemoteSubcommand::Status => {
                 info_mod::print_remote_infra_data(&self.infra_data);
                 Ok(())
@@ -1074,7 +1114,12 @@ impl Testnet {
                 SSMSubcommand::Stop => infra.ssm_tunnels.stop().await,
                 SSMSubcommand::List => infra.ssm_tunnels.list().await,
             },
-            RemoteSubcommand::Destroy { yes } => infra.terraform.destroy(yes),
+            RemoteSubcommand::Destroy { yes } => {
+                if let Err(err) = infra.ssm_tunnels.stop().await {
+                    warn!(%err, "⚠️ Failed to terminate SSM sessions before destroy");
+                }
+                infra.terraform.destroy(yes)
+            }
             RemoteSubcommand::Ssh {
                 node_or_cc,
                 command,
@@ -1086,25 +1131,13 @@ impl Testnet {
                 }
             }
             RemoteSubcommand::Load { args } => {
-                // Run `spammer` from the Control Center server (backpressure mode, the default)
-                let cmd = ["./spammer.sh", "nodes", "--nodes-path", "nodes.json"];
-                let mut cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-                cmd.extend(args);
-
+                eprintln!("Warning: `remote load` is deprecated. Use `quake load` directly — it now works for both local and remote testnets.");
+                let cmd = crate::load::build_remote_spammer_cmd(&self.manifest, &args, false)?;
                 infra.ssh_cc(&cmd.join(" "), false)
             }
             RemoteSubcommand::Spam { args } => {
-                // Run `spammer` from the Control Center server (fire-and-forget mode)
-                let cmd = [
-                    "./spammer.sh",
-                    "nodes",
-                    "--nodes-path",
-                    "nodes.json",
-                    "--fire-and-forget",
-                ];
-                let mut cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-                cmd.extend(args);
-
+                eprintln!("Warning: `remote spam` is deprecated. Use `quake spam` directly — it now works for both local and remote testnets.");
+                let cmd = crate::load::build_remote_spammer_cmd(&self.manifest, &args, true)?;
                 infra.ssh_cc(&cmd.join(" "), false)
             }
             RemoteSubcommand::Export {
@@ -1123,46 +1156,58 @@ impl Testnet {
             }
             // File import handled in main(); start SSM tunnels so quake commands work immediately
             RemoteSubcommand::Import { .. } => infra.ssm_tunnels.start().await,
+            RemoteSubcommand::Download { command } => {
+                let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                let resolve = |output: Option<PathBuf>, prefix: &str| -> PathBuf {
+                    let default = PathBuf::from(format!("{prefix}-{ts}.tar.gz"));
+                    match output {
+                        None => default,
+                        Some(p) if p.is_dir() => p.join(default),
+                        Some(p) => p,
+                    }
+                };
+                match command {
+                    DownloadSubcommand::Metrics {
+                        from,
+                        to,
+                        step,
+                        metric_names,
+                        output,
+                    } => {
+                        let dest = resolve(output, "quake-metrics");
+                        infra.download_metrics(
+                            &metric_names,
+                            from.map(|dt| dt.unix_secs()),
+                            to.map(|dt| dt.unix_secs()),
+                            step.as_deref(),
+                            &dest,
+                        )
+                    }
+                    DownloadSubcommand::Db {
+                        nodes,
+                        execution_only,
+                        consensus_only,
+                        output,
+                    } => {
+                        let dest = resolve(output, "quake-db");
+                        infra.download_node_db(&nodes, execution_only, consensus_only, &dest)
+                    }
+                }
+            }
         }
     }
 
-    /// Generate and send transaction load to a node
-    pub async fn load(&self, target_nodes: Vec<NodeName>, config: &spammer::Config) -> Result<()> {
-        // Validate arguments
-        self.manifest.contain_nodes(&target_nodes)?;
-
-        let mut target_nodes = self.nodes_metadata.expand_to_nodes_list(&target_nodes)?;
-
-        // If no target nodes are provided, use all nodes
-        if target_nodes.is_empty() {
-            target_nodes = self.nodes_metadata.node_names();
+    /// Manage monitoring services
+    pub async fn monitoring(&self, command: MonitoringSubcommand) -> Result<()> {
+        match command {
+            MonitoringSubcommand::Start => self.infra.start_monitoring(),
+            MonitoringSubcommand::Stop => self.infra.stop_monitoring(),
+            MonitoringSubcommand::Clean => {
+                self.infra.stop_monitoring()?;
+                self.infra.clean_monitoring_data()?;
+                Ok(())
+            }
         }
-
-        // Build EL WebSocket URLs of target nodes
-        let target_ws_urls = self.nodes_metadata.to_execution_ws_urls(&target_nodes);
-
-        // Calculate from genesis the number of extra prefunded accounts and update the config
-        let num_extra_accounts = genesis::num_prefunded_accounts(
-            &self.dir.join("assets").join("genesis.json"),
-            self.manifest.num_validators(),
-        )?;
-
-        // Store latency CSV under .quake/results/<testnet-name>/
-        let testnet_name = self
-            .dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| eyre::eyre!("cannot derive testnet name from dir"))?;
-        let csv_dir = Path::new(QUAKE_DIR).join("results").join(testnet_name);
-
-        let config = spammer::Config {
-            max_num_accounts: std::cmp::min(num_extra_accounts, config.max_num_accounts),
-            csv_dir: Some(csv_dir),
-            ..*config
-        };
-
-        let spammer = Spammer::new(target_ws_urls, &config).await?;
-        spammer.run().await
     }
 
     pub(crate) async fn valset_update(&self, targets: Vec<ValidatorPowerUpdate>) -> Result<()> {
@@ -1225,7 +1270,7 @@ impl Testnet {
         }
     }
 
-    fn local_infra(&self) -> Result<Arc<LocalInfra>> {
+    pub(crate) fn local_infra(&self) -> Result<Arc<LocalInfra>> {
         if self.is_local() {
             Ok(Arc::downcast::<LocalInfra>(self.infra.clone()).unwrap())
         } else {
@@ -1235,21 +1280,17 @@ impl Testnet {
 
     /// Generate CLI flags for each node based on their configuration
     fn generate_cli_flags_for_nodes(&mut self) -> Result<()> {
-        let consensus_ip_address_map = self.nodes_metadata.consensus_ip_addresses_map();
-
-        for (name, node_metadata) in self.nodes_metadata.nodes.iter_mut() {
-            let node_config = self.manifest.nodes.get(name);
+        let node_names = self.nodes_metadata.node_names();
+        for name in node_names {
+            let node_config = self.manifest.nodes.get(&name);
 
             let peers_ips: Vec<String> =
                 if let Some(peers) = node_config.and_then(|c| c.cl_persistent_peers.as_ref()) {
-                    NodesMetadata::peer_consensus_ips(name, peers, &consensus_ip_address_map)?
+                    self.nodes_metadata
+                        .resolve_cl_persistent_peers_list_ips(&name, peers)?
                 } else {
-                    // Use all other nodes as peers
-                    consensus_ip_address_map
-                        .iter()
-                        .filter(|(peer_name, _)| peer_name.as_str() != name)
-                        .flat_map(|(_, private_ips)| private_ips.clone())
-                        .collect()
+                    self.nodes_metadata
+                        .default_cl_persistent_peers_list_ips(&name)
                 };
 
             let listen_ip = "0.0.0.0".to_string();
@@ -1264,27 +1305,37 @@ impl Testnet {
                 })
                 .unwrap_or_default();
 
-            // Generate CLI flags for the consensus layer
-            let cli_flags = setup::generate_node_cli_flags(
-                name,
+            // Local compose defines both the current CL service and the `_u`
+            // upgrade service. Generate flags for each target image because
+            // version compatibility can rewrite the two flag sets differently.
+            let cli_flags = setup::generate_consensus_cli_flags(
+                &name,
                 node_config,
                 &listen_ip,
                 &peers_ips,
                 Some(self.images.cl.as_str()),
                 &follow_endpoint_urls,
-            );
-            node_metadata.consensus.set_cli_flags(cli_flags);
+            )?;
 
-            // Generate CLI flags for the consensus layer after upgrade
-            let cli_flags = setup::generate_node_cli_flags(
-                name,
+            let cli_flags_upgraded = setup::generate_consensus_cli_flags(
+                &name,
                 node_config,
                 &listen_ip,
                 &peers_ips,
                 self.images.cl_upgrade.as_deref(),
                 &follow_endpoint_urls,
-            );
-            node_metadata.consensus.set_cli_flags_upgraded(cli_flags);
+            )?;
+
+            let node_metadata = self
+                .nodes_metadata
+                .nodes
+                .get_mut(&name)
+                .ok_or_else(|| eyre!("metadata for node '{name}' not found"))?;
+
+            node_metadata.consensus.set_cli_flags(cli_flags);
+            node_metadata
+                .consensus
+                .set_cli_flags_upgraded(cli_flags_upgraded);
         }
 
         Ok(())

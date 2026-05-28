@@ -29,21 +29,9 @@ COPY --from=circle-base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-cer
 
 WORKDIR /app
 
-# Copy only the minimal set of files needed to build Spammer and its internal deps
+# Copy the workspace manifests and crates
 COPY Cargo.toml Cargo.lock ./
-COPY crates/spammer/ crates/spammer/
-COPY crates/version/ crates/version/
-
-# Patch Cargo.toml for this minimal build context:
-# 1. Remove [patch.crates-io] — requires git auth, not needed by spammer.
-# 2. Simplify workspace members to just "crates/*" — the full workspace lists
-#    crates/test/* explicitly, but those aren't copied into the image.
-# 3. Remove the exclude line — only needed alongside those explicit members.
-RUN sed -i \
-    -e '/\[patch\.crates-io\]/,/^$/d' \
-    -e 's|members = \[.*\]|members = ["crates/*"]|' \
-    -e '/^\[workspace\]$/,/^\[/{/^exclude/d}' \
-    Cargo.toml
+COPY crates/ crates/
 
 # Ensure we don't reuse old target artifacts built against OpenSSL 1.1.
 RUN cargo clean
@@ -52,6 +40,7 @@ RUN cargo clean
 # the Cargo registry, git dependencies, and the entire build target directory.
 RUN --mount=type=cache,sharing=private,target=/usr/local/cargo/registry \
 	--mount=type=cache,sharing=private,target=/usr/local/cargo/git \
+	--mount=type=cache,sharing=private,target=/app/target \
     # Build the Spammer binary.
     cargo build -p spammer --release && \
     # Copy the built binary to a temporary, non-cached location to make it accessible to the next stage.

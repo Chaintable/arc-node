@@ -4,12 +4,14 @@ COV_FILE := target/lcov.info
 SCRIPTS="./scripts"
 FOUNDRY_VERSION := $(shell cat .foundry-version)
 QUAKE_MANIFEST ?= crates/quake/scenarios/localdev.toml
-NUM_VALIDATORS := $(shell grep -c '^\[nodes\.validator' $(QUAKE_MANIFEST) 2>/dev/null || echo 5)
+# Recursively expanded so smoke targets that override QUAKE_MANIFEST re-evaluate
+# at recipe time. All localdev* scenarios must keep the same validator count
+# (5) so `make smoke` produces a single genesis that matches both sub-targets.
+NUM_VALIDATORS = $(shell grep -c '^\[nodes\.validator' $(QUAKE_MANIFEST) 2>/dev/null || echo 5)
 QUAKE := cargo run --bin quake --
-LOAD_PREDEFINED_ARC_REMOTE_SIGNER_KEYS := true
 DEFAULT_BRANCH ?= $(shell git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
 ifeq ($(DEFAULT_BRANCH),)
-DEFAULT_BRANCH = master
+DEFAULT_BRANCH = main
 endif
 
 ##@ Help
@@ -85,8 +87,11 @@ build-contract: check-foundry ## Build the contracts and bindings
 	npm install
 	$(HARDHAT) compile
 
-genesis: build-contract  ## Generate the genesis file idempotently
+genesis: build-contract  ## Generate the localdev genesis file idempotently
 	$(HARDHAT) genesis --network localdev --num-validators $(NUM_VALIDATORS)
+
+genesis-mainnet: build-contract  ## Generate the mainnet genesis file
+	$(HARDHAT) genesis --network mainnet
 
 .PHONY: mine-denylist-salt
 mine-denylist-salt: check-foundry ## Mine a CREATE2 salt for the Denylist proxy with a 0x360 address prefix (usage: make mine-denylist-salt INIT_CODE_HASH=0x...)
@@ -173,6 +178,7 @@ test-unit-hardhat: ## Run hardhat unit tests
 .PHONY: test-localdev
 test-localdev: ## Run hardhat localdev tests
 	$(HARDHAT) test ./tests/localdev/*.test.ts --network localdev
+	$(MAKE) test-simulation
 
 .PHONY: test-simulation
 test-simulation: ## Run hardhat simulation tests
@@ -190,23 +196,25 @@ smoke: genesis ## Run smoke tests (both reth and malachite)
 	@echo "All smoke tests completed successfully!"
 
 .PHONY: smoke-reth
-smoke-reth: genesis ## Run Reth smoke tests
+smoke-reth: export ARC_SMOKE_SCENARIO := reth
+smoke-reth: genesis ## Run Reth smoke tests (mock CL, single fee recipient)
 	@echo "Running smoke tests on local reth(mock CL)..."
+	cargo build --release --bin arc-node-execution
 	@bash -c '\
 		set -ex; \
 		trap "./scripts/localdev.mjs stop --network=localdev" EXIT; \
-		./scripts/localdev.mjs stop clean daemon --network=localdev $(LAUNCH_ARGS); \
+		./scripts/localdev.mjs stop clean daemon --network=localdev --bin=target/release/arc-node-execution $(LAUNCH_ARGS); \
 		$(MAKE) test-localdev; \
-		$(MAKE) test-simulation; \
 	'
 
 .PHONY: smoke-malachite
-smoke-malachite: testnet ## Run Malachite smoke & Quake tests
-	@echo "Running smoke tests on local reth + malachite using testnet setup..."
+smoke-malachite: export ARC_SMOKE_SCENARIO := malachite
+smoke-malachite: testnet ## Run Malachite smoke tests (real CL, per-validator recipients)
+	@echo "Running smoke tests on local reth + malachite using testnet setup (localdev.toml)..."
 	@bash -c '\
 		set -ex; \
 		trap "$(MAKE) testnet-clean" EXIT; \
-		env LOAD_PREDEFINED_ARC_REMOTE_SIGNER_KEYS=$(LOAD_PREDEFINED_ARC_REMOTE_SIGNER_KEYS) $(MAKE) test-localdev; \
+		$(MAKE) test-localdev; \
 	'
 
 .PHONY: smoke-quake
@@ -218,7 +226,7 @@ smoke-quake: testnet
 .PHONY: testnet
 testnet: genesis build-docker ## Start testnet as defined in QUAKE_MANIFEST file
 	@echo "Setting up and starting Quake testnet..."
-	$(QUAKE) -f $(QUAKE_MANIFEST) start
+	$(QUAKE) -f $(QUAKE_MANIFEST) start $(QUAKE_START_ARGS)
 
 .PHONY: testnet-test
 testnet-test: ## Run tests against running testnet

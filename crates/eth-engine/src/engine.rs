@@ -22,6 +22,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::watch;
 
 use async_trait::async_trait;
 use tracing::debug;
@@ -113,12 +114,30 @@ pub struct Engine(Arc<Inner>);
 impl Engine {
     /// Create a new engine using IPC.
     pub async fn new_ipc(execution_socket: &str, eth_socket: &str) -> eyre::Result<Self> {
-        let api = Box::new(EngineIPC::new(execution_socket).await?);
-        let eth = Box::new(EthereumIPC::new(eth_socket).await?);
+        let api = EngineIPC::new(execution_socket).await?;
+        let eth = EthereumIPC::new(eth_socket).await?;
+
+        let api_disconnect = api.on_disconnect();
+        let eth_disconnect = eth.on_disconnect();
+
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = api_disconnect => {},
+                _ = eth_disconnect => {},
+            }
+            disconnect_tx.send(true).ok();
+        });
+
         let sub_endpoint = SubscriptionEndpoint::Ipc {
             socket_path: eth_socket.to_owned(),
         };
-        Ok(Self(Arc::new(Inner::new(api, eth, Some(sub_endpoint)))))
+        Ok(Self(Arc::new(Inner::new(
+            Box::new(api),
+            Box::new(eth),
+            Some(sub_endpoint),
+            Some(disconnect_rx),
+        ))))
     }
 
     /// Create a new engine using RPC.
@@ -141,12 +160,26 @@ impl Engine {
         eth.check_connectivity().await?;
 
         let sub_endpoint = ws_endpoint.map(|url| SubscriptionEndpoint::Ws { url });
-        Ok(Self(Arc::new(Inner::new(api, eth, sub_endpoint))))
+        Ok(Self(Arc::new(Inner::new(api, eth, sub_endpoint, None))))
     }
 
     /// Create a new engine with custom API implementations.
     pub fn new(api: Box<dyn EngineAPI>, eth: Box<dyn EthereumAPI>) -> Self {
-        Self(Arc::new(Inner::new(api, eth, None)))
+        Self(Arc::new(Inner::new(api, eth, None, None)))
+    }
+
+    /// Resolves when either IPC connection to the EL closes.
+    ///
+    /// Stays pending forever for non-IPC engines (RPC, mock), so calling code can
+    /// unconditionally `select!` on this without special-casing the transport.
+    pub async fn wait_for_disconnect(&self) {
+        match &self.disconnect_rx {
+            // wait_for checks the current value first, so late subscribers see a prior disconnect.
+            Some(rx) => {
+                rx.clone().wait_for(|&v| v).await.ok();
+            }
+            None => std::future::pending().await,
+        }
     }
 
     /// Set the function that determines whether Osaka is active at a given timestamp.
@@ -155,7 +188,7 @@ impl Engine {
     /// The provided function should use the same chainspec as the EL so that
     /// the V4/V5 decision always aligns.
     pub fn set_is_osaka_active(&self, f: IsOsakaActiveFn) {
-        if self.0.is_osaka_active.set(f).is_err() {
+        if self.is_osaka_active.set(f).is_err() {
             tracing::warn!("Osaka activation function already set; ignoring duplicate call");
         }
     }
@@ -191,21 +224,15 @@ impl Engine {
     ///
     /// This is the fallback when `--genesis` is not provided.
     pub fn set_osaka_from_chain_id(&self, chain_id: u64) {
-        use arc_execution_config::chain_ids::*;
-        use arc_execution_config::chainspec::{DEVNET, LOCAL_DEV, TESTNET};
+        use arc_execution_config::chainspec::bundled_chainspec_for_chain_id;
         use reth_chainspec::EthereumHardforks;
 
-        let chainspec = match chain_id {
-            LOCALDEV_CHAIN_ID => LOCAL_DEV.clone(),
-            DEVNET_CHAIN_ID => DEVNET.clone(),
-            TESTNET_CHAIN_ID => TESTNET.clone(),
-            _ => {
-                tracing::warn!(
-                    chain_id,
-                    "Unknown chain ID for Osaka activation; defaulting to V4 (Osaka disabled)"
-                );
-                return;
-            }
+        let Some(chainspec) = bundled_chainspec_for_chain_id(chain_id) else {
+            tracing::warn!(
+                chain_id,
+                "Unknown chain ID for Osaka activation; defaulting to V4 (Osaka disabled)"
+            );
+            return;
         };
 
         tracing::info!(
@@ -229,7 +256,7 @@ impl Engine {
     /// if one was configured. `None` for test/mock engines or RPC without
     /// `--execution-ws-endpoint`.
     pub fn subscription_endpoint(&self) -> Option<&SubscriptionEndpoint> {
-        self.0.subscription_endpoint.as_ref()
+        self.subscription_endpoint.as_ref()
     }
 }
 
@@ -252,6 +279,8 @@ pub struct Inner {
     /// Set after construction via [`Engine::set_is_osaka_active`].
     /// When `None`, defaults to `false` (use V4).
     is_osaka_active: OnceLock<IsOsakaActiveFn>,
+    /// Set to `true` when either IPC connection to the EL drops. `None` for non-IPC engines.
+    disconnect_rx: Option<watch::Receiver<bool>>,
 }
 
 impl Inner {
@@ -259,12 +288,14 @@ impl Inner {
         api: Box<dyn EngineAPI>,
         eth: Box<dyn EthereumAPI>,
         subscription_endpoint: Option<SubscriptionEndpoint>,
+        disconnect_rx: Option<watch::Receiver<bool>>,
     ) -> Self {
         Self {
             api,
             eth,
             subscription_endpoint,
             is_osaka_active: OnceLock::new(),
+            disconnect_rx,
         }
     }
 
@@ -604,8 +635,11 @@ impl EthereumAPI for Box<dyn EthereumAPI> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use arc_execution_config::chain_ids::*;
     use rstest::rstest;
+    use tokio::time::timeout;
 
     use super::*;
 
@@ -614,6 +648,32 @@ mod tests {
             Box::new(MockEngineAPI::new()),
             Box::new(MockEthereumAPI::new()),
         )
+    }
+
+    fn engine_with_watch() -> (Engine, watch::Sender<bool>) {
+        let (tx, rx) = watch::channel(false);
+        let engine = Engine(Arc::new(Inner::new(
+            Box::new(MockEngineAPI::new()),
+            Box::new(MockEthereumAPI::new()),
+            None,
+            Some(rx),
+        )));
+        (engine, tx)
+    }
+
+    /// Bind a silent IPC server at `path`. Accepts one connection and holds it open
+    /// until the returned sender is dropped (or sends), then drops the stream.
+    async fn start_silent_ipc_server(path: &str) -> tokio::sync::oneshot::Sender<()> {
+        use tokio::net::UnixListener;
+        let listener = UnixListener::bind(path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = rx.await;
+                drop(stream);
+            }
+        });
+        tx
     }
 
     #[test]
@@ -692,5 +752,124 @@ mod tests {
             osaka_at_zero,
             "use_v5(0) for chain_id {chain_id}"
         );
+    }
+
+    #[test]
+    fn test_set_osaka_from_chain_id_mainnet() {
+        use arc_execution_config::chainspec::bundled_chainspec_for_chain_id;
+
+        let engine = mock_engine();
+        engine.set_osaka_from_chain_id(MAINNET_CHAIN_ID);
+
+        let expected = bundled_chainspec_for_chain_id(MAINNET_CHAIN_ID).is_some();
+        assert_eq!(
+            engine.use_v5(0),
+            expected,
+            "mainnet use_v5(0) must agree with bundle status"
+        );
+    }
+
+    /// Second call to `set_is_osaka_active` are silently ignored.
+    #[test]
+    fn test_set_is_osaka_active_subsequent_calls_are_ignored() {
+        let engine = mock_engine();
+        engine.set_is_osaka_active(Arc::new(|_| true));
+        engine.set_is_osaka_active(Arc::new(|_| false));
+        assert!(
+            engine.use_v5(0),
+            "subsequent calls to set_is_osaka_active must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_subscription_endpoint_none_for_mock() {
+        let engine = mock_engine();
+        assert!(engine.subscription_endpoint().is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_disconnect_never_resolves_for_mock_engine() {
+        let engine = mock_engine();
+        let result = timeout(Duration::from_millis(10), engine.wait_for_disconnect()).await;
+        assert!(result.is_err(), "mock engine should never disconnect");
+    }
+
+    #[tokio::test]
+    async fn wait_for_disconnect_resolves_when_signalled() {
+        let (engine, tx) = engine_with_watch();
+        tx.send(true).unwrap();
+        timeout(Duration::from_millis(100), engine.wait_for_disconnect())
+            .await
+            .expect("should resolve after send(true)");
+    }
+
+    #[tokio::test]
+    async fn wait_for_disconnect_resolves_when_sender_dropped() {
+        let (engine, tx) = engine_with_watch();
+        drop(tx); // sender dropped without sending true — Err(RecvError) path
+        timeout(Duration::from_millis(10), engine.wait_for_disconnect())
+            .await
+            .expect("should resolve when sender is dropped");
+    }
+
+    #[tokio::test]
+    async fn wait_for_disconnect_resolves_if_already_disconnected() {
+        let (engine, tx) = engine_with_watch();
+        // Signal disconnect before anyone calls wait_for_disconnect.
+        tx.send(true).unwrap();
+        drop(tx);
+        // Late subscriber must see the already-set state immediately.
+        timeout(Duration::from_millis(10), engine.wait_for_disconnect())
+            .await
+            .expect("late subscriber should see already-disconnected state");
+    }
+
+    #[tokio::test]
+    async fn new_ipc_disconnect_fires_when_connection_closes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine_sock = tmp
+            .path()
+            .join("engine.sock")
+            .to_string_lossy()
+            .into_owned();
+        let eth_sock = tmp.path().join("eth.sock").to_string_lossy().into_owned();
+
+        let close_engine = start_silent_ipc_server(&engine_sock).await;
+        let _close_eth = start_silent_ipc_server(&eth_sock).await;
+
+        let engine = Engine::new_ipc(&engine_sock, &eth_sock)
+            .await
+            .expect("should connect to mock IPC servers");
+
+        // Drop closes the sender → receiver Err → stream dropped → client sees EOF
+        drop(close_engine);
+
+        timeout(Duration::from_millis(500), engine.wait_for_disconnect())
+            .await
+            .expect("disconnect should fire when engine IPC connection closes");
+    }
+
+    #[tokio::test]
+    async fn new_ipc_disconnect_fires_for_eth_socket() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine_sock = tmp
+            .path()
+            .join("engine2.sock")
+            .to_string_lossy()
+            .into_owned();
+        let eth_sock = tmp.path().join("eth2.sock").to_string_lossy().into_owned();
+
+        let _close_engine = start_silent_ipc_server(&engine_sock).await;
+        let close_eth = start_silent_ipc_server(&eth_sock).await;
+
+        let engine = Engine::new_ipc(&engine_sock, &eth_sock)
+            .await
+            .expect("should connect to mock IPC servers");
+
+        drop(close_eth);
+
+        timeout(Duration::from_millis(500), engine.wait_for_disconnect())
+            .await
+            .expect("disconnect should fire when eth IPC connection closes");
     }
 }

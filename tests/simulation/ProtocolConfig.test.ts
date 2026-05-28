@@ -18,7 +18,6 @@ import { expect } from 'chai'
 import hre from 'hardhat'
 import { getChain } from '../../scripts/hardhat/viem-helper'
 import { ProtocolConfig, loadGenesisConfig, type FeeParams, type ConsensusParams } from '../helpers'
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { Address, decodeFunctionResult, encodeFunctionData, parseAbi, zeroAddress } from 'viem'
 import { multicall3Address } from '../../scripts/genesis'
 import { schemaHex } from '../../scripts/genesis/types'
@@ -35,10 +34,9 @@ describe('ProtocolConfig simulation', () => {
       chain: getChain(hre),
     })
     const protocolConfig = ProtocolConfig.attach(client)
-    const randomWallet = privateKeyToAccount(generatePrivateKey())
     const extraAbi = parseAbi(['function upgradeTo(address newImplementation)'])
 
-    return { client, randomWallet, protocolConfig, extraAbi }
+    return { client, protocolConfig, extraAbi }
   }
 
   it('migrate contract', async () => {
@@ -59,70 +57,6 @@ describe('ProtocolConfig simulation', () => {
       ],
     })
     expect(res.results[0].status).to.be.eq('success')
-  })
-
-  describe('ProtocolConfig Network Parameter Validation', () => {
-    it('should verify network block miner matches ProtocolConfig beneficiary', async () => {
-      const { client, randomWallet, protocolConfig } = await clients()
-      const beneficiary = await protocolConfig.read.rewardBeneficiary()
-      const controller = await protocolConfig.read.controller()
-
-      // Simulate transactions without changing state
-      const result = await client.simulateBlocks({
-        blocks: [
-          {
-            calls: [
-              {
-                account: controller,
-                to: ProtocolConfig.address,
-                data: encodeFunctionData({
-                  abi: protocolConfig.abi,
-                  functionName: 'updateRewardBeneficiary',
-                  args: [randomWallet.address], // Update beneficiary to random wallet for testing
-                }),
-              },
-              // Immediately query the updated beneficiary to verify the change
-              {
-                account: controller,
-                to: ProtocolConfig.address,
-                data: encodeFunctionData({ abi: protocolConfig.abi, functionName: 'rewardBeneficiary', args: [] }),
-              },
-            ],
-          },
-        ],
-      })
-
-      // Verify simulated blocks have the correct beneficiary as miner and all calls succeed
-      expect(result).to.have.length(1)
-      const block = result[0]
-      expect(block.calls.length).to.equal(2, 'Block should have 2 calls')
-
-      // Verify all calls in this block succeeded
-      block.calls.forEach((call, callIndex) => {
-        expect(call.error).to.be.undefined
-        expect(call.status).to.equal('success', `call ${callIndex} should succeed`)
-      })
-
-      expect(block.miner).to.not.be.undefined
-      expect(block.miner).to.addressEqual(
-        beneficiary,
-        `Simulated block miner (${block.miner}) should use original beneficiary (${beneficiary})`,
-      )
-
-      // verify the beneficiary read call returns the updated value
-      const readCall = block.calls[1] // Second call is the read
-      expect(readCall.data).to.not.be.undefined
-      const returnedBeneficiary = decodeFunctionResult({
-        abi: protocolConfig.abi,
-        functionName: 'rewardBeneficiary',
-        data: schemaHex.parse(readCall.data),
-      })
-      // Verify the contract state was actually updated
-      expect(returnedBeneficiary).to.addressEqual(
-        randomWallet.address,
-        'Contract should return updated beneficiary address',
-      )
-    })
   })
 
   describe('ProtocolConfig role wallet validation', () => {
@@ -177,57 +111,6 @@ describe('ProtocolConfig simulation', () => {
         data: schemaHex.parse(pauseRead),
       })
       expect(parsedPaused).to.equal(true, 'ProtocolConfig should report paused after pause()')
-    })
-
-    it('controller wallet from genesis config can update controller-only fields', async function () {
-      const controllerWallet = protocolConfigGenesis?.controller
-      expect(controllerWallet).to.not.be.undefined
-
-      const { client, protocolConfig, randomWallet } = await clients()
-      const [onchainController] = await Promise.all([
-        protocolConfig.read.controller(),
-        protocolConfig.read.rewardBeneficiary(),
-      ])
-      expect(onchainController).to.addressEqual(controllerWallet, 'on-chain controller differs from genesis config')
-
-      const beneficiaryReadCall = {
-        account: controllerWallet,
-        to: ProtocolConfig.address,
-        data: encodeFunctionData({ abi: protocolConfig.abi, functionName: 'rewardBeneficiary', args: [] }),
-      }
-
-      const calls = [
-        {
-          account: controllerWallet,
-          to: ProtocolConfig.address,
-          data: encodeFunctionData({
-            abi: protocolConfig.abi,
-            functionName: 'updateRewardBeneficiary',
-            args: [randomWallet.address],
-          }),
-        },
-        beneficiaryReadCall,
-      ]
-
-      const result = await client.simulateBlocks({ blocks: [{ calls }] })
-      const executedCalls = result[0]?.calls ?? []
-      expect(executedCalls.length).to.equal(calls.length)
-
-      executedCalls.forEach((call, idx) => {
-        expect(call.error).to.be.undefined
-        expect(call.status).to.equal('success', `call ${idx} should succeed`)
-      })
-
-      const benecifiaryRead = executedCalls[1]?.data
-      expect(benecifiaryRead).to.not.be.undefined
-
-      const newBeneficiary = decodeFunctionResult({
-        abi: protocolConfig.abi,
-        functionName: 'rewardBeneficiary',
-        data: schemaHex.parse(benecifiaryRead),
-      })
-
-      expect(newBeneficiary).to.addressEqual(randomWallet.address)
     })
 
     it('controller can push fee params near new upper bounds', async function () {

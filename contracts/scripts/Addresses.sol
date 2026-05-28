@@ -36,8 +36,8 @@ library Addresses {
     // ============ Predeployed Contracts ============
     address internal constant DETERMINISTIC_DEPLOYER_PROXY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     address internal constant MULTICALL3 = 0xcA11bde05977b3631167028862bE2a173976CA11;
-    address internal constant MULTICALL3_FROM = 0xEb7cc06E3D3b5F9F9a5fA2B31B477ff72bB9c8b6;
-    address internal constant MEMO = 0x9702466268ccF55eAB64cdf484d272Ac08d3b75b;
+    address internal constant MULTICALL3_FROM = 0x522fAf9A91c41c443c66765030741e4AaCe147D0;
+    address internal constant MEMO = 0x5294E9927c3306DcBaDb03fe70b92e01cCede505;
 
     // ============ Helpers ============
 

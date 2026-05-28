@@ -32,9 +32,6 @@ import {Addresses} from "./Addresses.sol";
  * Print consensus params:
  *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "printConsensusParams()"
  *
- * Print reward beneficiary:
- *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "printRewardBeneficiary()"
- *
  * Print all params:
  *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "printAllParams()"
  *
@@ -72,10 +69,6 @@ import {Addresses} from "./Addresses.sol";
  *
  * Update all consensus params:
  *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "updateAllConsensusParams(uint16,uint16,uint16,uint16,uint16,uint16,uint16,uint16)" <propose> <proposeDelta> <prevote> <prevoteDelta> <precommit> <precommitDelta> <rebroadcast> <targetBlockTime> --broadcast
- *
- * ============ Update Reward Beneficiary (controller only, requires CONTROLLER_KEY env var) ============
- * Update reward beneficiary:
- *   forge script scripts/ProtocolConfigManagement.s.sol --rpc-url <network> --sig "updateRewardBeneficiary(address)" <newBeneficiary> --broadcast
  */
 contract ProtocolConfigManagement is Script {
     // ============ Constants ============
@@ -110,11 +103,10 @@ contract ProtocolConfigManagement is Script {
         console.log("targetBlockTimeMs:", params.targetBlockTimeMs);
     }
 
-    function printRewardBeneficiary() public view returns (address beneficiary) {
-        beneficiary = PROTOCOL_CONFIG.rewardBeneficiary();
-
-        console.log("ProtocolConfig RewardBeneficiary:");
-        console.log("beneficiary:", beneficiary);
+    function printPauseState() public view {
+        console.log("ProtocolConfig PauseState:");
+        console.log("pauser:", PROTOCOL_CONFIG.pauser());
+        console.log("paused:", PROTOCOL_CONFIG.paused());
     }
 
     function printAllParams() public view {
@@ -122,7 +114,7 @@ contract ProtocolConfigManagement is Script {
         console.log("");
         printConsensusParams();
         console.log("");
-        printRewardBeneficiary();
+        printPauseState();
     }
 
     // ============ Internal Helpers ============
@@ -379,19 +371,33 @@ contract ProtocolConfigManagement is Script {
         _broadcastConsensusParamsUpdate(params);
     }
 
-    /**
-     * @notice Updates the reward beneficiary address
-     * @dev Requires CONTROLLER_KEY env var and controller role on ProtocolConfig
-     */
-    function updateRewardBeneficiary(address newBeneficiary) public {
-        require(newBeneficiary != address(0), "beneficiary cannot be zero address");
-
-        uint256 controllerKey = _getControllerKey();
-
-        vm.startBroadcast(controllerKey);
-        PROTOCOL_CONFIG.updateRewardBeneficiary(newBeneficiary);
-        vm.stopBroadcast();
-    }
 }
 
-
+/// @title ProtocolConfigState
+/// @notice Preserved-state hash helper used by upgrade/rollback scripts under
+///         `contracts/deployments/<date>-protocol-config-*/scripts/`.
+///
+///         Aggregates every field an upgrade/rollback must preserve byte-for-byte and returns a
+///         single hash. Pre-boundary and post-boundary calls should produce equal hashes; any
+///         divergence indicates a storage-slot collision, accidental overwrite, or layout drift
+///         between old and new implementations.
+///
+///         Validity condition: valid only when the struct definitions returned by the getters
+///         (`FeeParams`, `ConsensusParams`) are unchanged between old and new impl. A struct
+///         layout change would make `abi.encode` produce different bytes for the same logical
+///         state — when that happens, replace this helper with field-by-field comparison on
+///         the surviving fields.
+///
+///         `pauser` / `paused` are intentionally excluded. Their ERC-7201 slot may move across
+///         a given upgrade, and during the upgrade window the value can be read from different
+///         slots pre-vs-post boundary. Those fields belong in explicit specific-value
+///         assertions at the call sites, not in this hash.
+library ProtocolConfigState {
+    function hash(address proxy) internal view returns (bytes32) {
+        IProtocolConfig.FeeParams memory fee = ProtocolConfig(proxy).feeParams();
+        IProtocolConfig.ConsensusParams memory cons = ProtocolConfig(proxy).consensusParams();
+        return keccak256(
+            abi.encode(fee, cons, ProtocolConfig(proxy).owner(), ProtocolConfig(proxy).controller())
+        );
+    }
+}

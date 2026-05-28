@@ -68,6 +68,10 @@ node_modules/
 **/*.rs.bk
 *.pdb
 
+# Python-specific
+__pycache__/
+*.pyc
+
 # Test artifacts
 /test-results/
 /coverage/
@@ -113,10 +117,6 @@ terraform.tfvars*
 .claude/memory/
 .claude/worktrees/
 .claude/todo.md
-.claude/skills/**
-!.claude/skills/
-!.claude/skills/*/
-!.claude/skills/*/**
 .planning
 
 deployments/certs/*

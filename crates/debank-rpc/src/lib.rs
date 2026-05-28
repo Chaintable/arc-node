@@ -2,6 +2,14 @@
 // jsonrpsee #[rpc(server)] macro generates an 8-arg server fn for `multi_call`
 // (see DebankEthExtApi); cannot scope this allow narrower.
 #![allow(clippy::too_many_arguments)]
+// D21: upstream v0.7.1 enabled `arithmetic_side_effects = "deny"` workspace-wide
+// (bd637da fix for payload builder gas accounting). debank-rpc has many
+// index/counter increments (log_index, pos_in_parent_trace, idx, gas_used
+// accumulation) that are statistically safe — wrapping would only happen on
+// blocks with > 2^64 events/gas, which is physically impossible. Allow at
+// crate level; if a future change needs checked arithmetic for a specific
+// codepath, scope a narrower #[allow] there.
+#![allow(clippy::arithmetic_side_effects)]
 //! DeBank custom RPC extensions for Arc.
 //!
 //! Provides `pre_traceMany`, `eth_multiCall`, and `trace_debankBlock`.

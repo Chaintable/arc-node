@@ -28,6 +28,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::error;
 
 use arc_consensus_types::{
+    commit_http::HttpCommitSignature,
     evidence::{DoubleProposal, DoubleVote, StoredMisbehaviorEvidence, ValidatorEvidence},
     signing::PublicKey,
     Address, ArcContext, BlockHash, Height, Validator, ValidatorSet, Value, ValueId,
@@ -41,10 +42,11 @@ use malachitebft_app_channel::ConsensusRequest;
 use malachitebft_app_channel::ConsensusRequestError;
 use malachitebft_app_channel::NetworkRequest;
 use malachitebft_core_state_machine::state::{RoundValue, State as MState};
-use malachitebft_core_types::{CommitSignature, NilOrVal, VoteType};
+use malachitebft_core_types::{NilOrVal, VoteType};
 use malachitebft_network::PersistentPeerError;
 
 use crate::request::{AppRequestError, CommitCertificateInfo, Status, TxAppReq};
+use crate::utils::sync_state::SyncState;
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 
 use arc_consensus_db::invalid_payloads::{InvalidPayload, StoredInvalidPayloads};
@@ -224,6 +226,8 @@ pub(crate) struct RpcNwValidatorInfo {
 }
 
 pub(crate) fn build_network_validator_set(vs: &[(String, u64)]) -> RpcNwValidatorSet {
+    // Voting powers are small protocol values; sum fits in u64
+    #[allow(clippy::arithmetic_side_effects)]
     let total_voting_power: u64 = vs.iter().map(|(_, vp)| *vp).sum();
     let validators = vs
         .iter()
@@ -273,6 +277,7 @@ impl From<ProposalMonitor> for RpcProposalMonitorData {
             data.proposal_receive_time.map(Into::into);
 
         // It can be negative
+        #[allow(clippy::cast_possible_truncation, clippy::arithmetic_side_effects)]
         let proposal_delay_ms = data.proposal_receive_time.map(|receive| {
             let start_ms = data
                 .start_time
@@ -304,6 +309,7 @@ pub(crate) struct RpcAppStatus {
     height: u64,
     round: i64,
     address: Address,
+    public_key: String,
     proposer: Address,
     height_start_time: DateTime<Utc>,
     prev_payload_hash: Option<BlockHash>,
@@ -312,6 +318,7 @@ pub(crate) struct RpcAppStatus {
     undecided_blocks_count: usize,
     pending_proposal_parts: Vec<RpcPendingProposalParts>,
     validator_set: RpcValidatorSet,
+    sync_state: SyncState,
 }
 
 impl From<Status> for RpcAppStatus {
@@ -320,6 +327,7 @@ impl From<Status> for RpcAppStatus {
             height: status.height.as_u64(),
             round: status.round.as_i64(),
             address: status.address,
+            public_key: format!("0x{}", hex::encode(status.public_key.as_bytes())),
             proposer: status.proposer.unwrap_or_else(|| Address::repeat_byte(0)),
             height_start_time: status.height_start_time.into(),
             prev_payload_hash: status.prev_payload_hash,
@@ -335,6 +343,7 @@ impl From<Status> for RpcAppStatus {
                     count,
                 })
                 .collect(),
+            sync_state: status.sync_state,
         }
     }
 }
@@ -345,29 +354,12 @@ struct RpcPendingProposalParts {
     count: usize,
 }
 
-#[serde_as]
-#[derive(Serialize)]
-struct RpcCommitSignature {
-    address: Address,
-    #[serde_as(as = "Base64")]
-    signature: Vec<u8>,
-}
-
-impl From<CommitSignature<ArcContext>> for RpcCommitSignature {
-    fn from(sig: CommitSignature<ArcContext>) -> Self {
-        RpcCommitSignature {
-            address: sig.address,
-            signature: sig.signature.to_bytes().to_vec(),
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub(crate) struct RpcCommitCertificate {
     height: u64,
     round: i64,
     block_hash: ValueId,
-    signatures: Vec<RpcCommitSignature>,
+    signatures: Vec<HttpCommitSignature>,
     proposer: Address,
     extended: bool,
 }
@@ -411,6 +403,7 @@ struct RpcValidator {
     address: Address,
     voting_power: u64,
     public_key: PublicKey,
+    public_key_hex: String,
 }
 
 #[derive(Serialize)]
@@ -484,6 +477,7 @@ struct VotesDetails {
 }
 
 impl VotesDetails {
+    #[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
     fn new(val_set: &ValidatorSet, voted: &[RpcVote]) -> Self {
         const X_GROUP: usize = 5;
 
@@ -583,6 +577,7 @@ impl From<&Validator> for RpcValidator {
         RpcValidator {
             address: v.address,
             voting_power: v.voting_power,
+            public_key_hex: format!("0x{}", hex::encode(v.public_key.as_bytes())),
             public_key: v.public_key,
         }
     }

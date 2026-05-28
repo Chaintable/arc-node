@@ -18,10 +18,7 @@ extern crate alloc;
 
 use crate::assembler::ArcBlockAssembler;
 use crate::executor::ArcBlockExecutor;
-use crate::frame_result::{
-    create_blocklisted_frame_result, create_frame_result, create_oog_frame_result,
-    BeforeFrameInitResult, BLOCKLISTED_GAS_PENALTY,
-};
+use crate::frame_result::{create_frame_result, create_oog_frame_result, BeforeFrameInitResult};
 use crate::log::{create_eip7708_transfer_log, create_native_transfer_log};
 use alloc::sync::Arc;
 use alloy_evm::eth::EthEvmContext;
@@ -37,7 +34,8 @@ use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
 };
 use arc_precompiles::helpers::{
-    ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS, PRECOMPILE_SLOAD_GAS_COST,
+    ERR_BLOCKED_ADDRESS, ERR_SELFDESTRUCTED_BALANCE_INCREASED, ERR_ZERO_ADDRESS,
+    PRECOMPILE_SLOAD_GAS_COST,
 };
 use arc_precompiles::NATIVE_COIN_CONTROL_ADDRESS;
 use core::fmt::Debug;
@@ -64,11 +62,13 @@ use reth_evm::execute::BlockBuilder;
 use reth_evm::{ConfigureEngineEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor};
 use reth_primitives_traits::NodePrimitives;
 use revm::bytecode::opcode::SELFDESTRUCT;
+use revm::bytecode::Bytecode;
 use revm::context_interface::result::ResultAndState;
 use revm::handler::evm::{ContextDbError, FrameInitResult};
 use revm::handler::instructions::InstructionProvider;
 use revm::handler::{EvmTr, FrameInitOrResult, FrameResult, FrameTr, Handler, ItemOrResult};
 use revm::inspector::{InspectorEvmTr, InspectorHandler, JournalExt};
+use revm::state::AccountInfo;
 use revm::Database as RevmDatabase;
 use revm::ExecuteEvm;
 use revm::{
@@ -81,8 +81,8 @@ use revm::{
     state::EvmState,
     InspectEvm, SystemCallEvm,
 };
-use revm_context_interface::FrameStack;
-use revm_context_interface::Transaction;
+use revm_context_interface::journaled_state::{JournalCheckpoint, JournalLoadError};
+use revm_context_interface::{FrameStack, Transaction};
 use revm_interpreter::interpreter_action::FrameInit;
 use revm_interpreter::{CallScheme, CreateScheme, FrameInput, Instruction};
 use revm_primitives::{Address, Bytes};
@@ -92,17 +92,15 @@ use crate::handler::ArcEvmHandler;
 use crate::opcode::{arc_network_selfdestruct, arc_network_selfdestruct_zero4};
 use crate::subcall::{SubcallContinuation, SubcallRegistry};
 use arc_execution_config::chainspec::{ArcChainSpec, BlockGasLimitProvider};
-use arc_execution_config::protocol_config::{
-    expected_gas_limit, retrieve_fee_params, retrieve_reward_beneficiary,
-};
+use arc_execution_config::protocol_config::{expected_gas_limit, retrieve_fee_params};
 use arc_precompiles::call_from::{CallFromPrecompile, CALL_FROM_ADDRESS};
 use arc_precompiles::precompile_provider::ArcPrecompileProvider;
 use arc_precompiles::subcall::SubcallPrecompile;
 use revm::interpreter::interpreter_action::CallInputs;
 
 /// Flat gas cost charged for rejected subcall dispatches (unauthorized caller, wrong scheme,
-/// static context, value attached, init_subcall errors). Charged by `init_subcall_revert` calls.
-/// Prevents zero-cost probing of subcall precompile addresses.
+/// value attached, sender spoofing, init_subcall errors). Charged by `init_subcall_revert`
+/// calls. Prevents zero-cost probing of subcall precompile addresses.
 const SUBCALL_DISPATCH_COST: u64 = 100;
 
 /// Construct a revert `FrameResult` for a subcall precompile rejection.
@@ -120,6 +118,61 @@ fn init_subcall_revert(message: &str, call_inputs: &CallInputs) -> FrameResult {
         was_precompile_called: true,
         precompile_call_logs: Default::default(),
     })
+}
+
+/// Construct an OOG `FrameResult` for a subcall that exceeded its gas budget.
+fn subcall_oog(gas: Gas, return_memory_offset: std::ops::Range<usize>) -> FrameResult {
+    FrameResult::Call(CallOutcome {
+        result: InterpreterResult::new(InstructionResult::OutOfGas, Bytes::new(), gas),
+        memory_offset: return_memory_offset,
+        was_precompile_called: true,
+        precompile_call_logs: Default::default(),
+    })
+}
+
+/// Reject a subcall in static context. Mirrors `InstructionResult::CallNotAllowedInsideStatic`
+/// halt semantics and the precompile-helper `check_staticcall` path: consume all caller gas.
+fn init_subcall_static_revert(call_inputs: &CallInputs) -> FrameResult {
+    let revert_bytes = arc_precompiles::helpers::revert_message_to_bytes(
+        "subcall precompiles cannot be invoked in static context",
+    );
+    let mut gas = Gas::new(call_inputs.gas_limit);
+    gas.spend_all();
+    let result = InterpreterResult::new(InstructionResult::Revert, revert_bytes, gas);
+    FrameResult::Call(CallOutcome {
+        result,
+        memory_offset: call_inputs.return_memory_offset.clone(),
+        was_precompile_called: true,
+        precompile_call_logs: Default::default(),
+    })
+}
+
+/// Loads an account with code, recording its EIP-2929 access cost on `gas`.
+/// Skips the DB load when the account is cold and `gas` can't cover it,
+/// preventing warming as a side-effect of an intentional OOG.
+/// Returns `None` on OOG (caller should `spend_all` and return).
+fn load_account_with_code_metered<J: JournalTr>(
+    journal: &mut J,
+    address: Address,
+    gas: &mut Gas,
+) -> Result<Option<AccountInfo>, <J::Database as revm::database_interface::Database>::Error> {
+    let skip_cold_load = gas.remaining() < revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+
+    match journal.load_account_info_skip_cold_load(address, true, skip_cold_load) {
+        Ok(info) => {
+            let cost = if info.is_cold {
+                revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST
+            } else {
+                revm_interpreter::gas::WARM_STORAGE_READ_COST
+            };
+            if !gas.record_cost(cost) {
+                return Ok(None);
+            }
+            Ok(Some(info.account.into_owned()))
+        }
+        Err(JournalLoadError::ColdLoadSkipped) => Ok(None),
+        Err(JournalLoadError::DBError(err)) => Err(err),
+    }
 }
 
 #[derive(Debug)]
@@ -182,25 +235,28 @@ fn extract_call_transfer_params(
     }
 }
 
-/// Deducts a gas cost from a frame's gas limit. Returns `Some(oog_result)` if the
-/// frame has insufficient gas, `None` on success.
-fn deduct_gas_from_frame(frame_input: &mut FrameInit, cost: u64) -> Option<FrameResult> {
-    match &mut frame_input.frame_input {
-        FrameInput::Call(inputs) => {
-            if inputs.gas_limit < cost {
-                return Some(create_oog_frame_result(frame_input));
-            }
-            inputs.gas_limit -= cost;
-        }
-        FrameInput::Create(inputs) => {
-            if inputs.gas_limit() < cost {
-                return Some(create_oog_frame_result(frame_input));
-            }
-            inputs.set_gas_limit(inputs.gas_limit() - cost);
-        }
-        FrameInput::Empty => {}
+fn frame_gas_limit(frame_input: &FrameInit) -> u64 {
+    match &frame_input.frame_input {
+        FrameInput::Call(inputs) => inputs.gas_limit,
+        FrameInput::Create(inputs) => inputs.gas_limit(),
+        FrameInput::Empty => 0,
     }
-    None
+}
+
+/// Creates a revert that charges the actual SLOAD gas cost when metered, or OOGs if the
+/// frame's gas budget is insufficient.
+fn metered_revert(
+    frame_input: &FrameInit,
+    meter_sloads: bool,
+    gas_cost: u64,
+    reason: &str,
+) -> BeforeFrameInitResult {
+    let gas_spent = if meter_sloads { gas_cost } else { 0 };
+    if gas_spent > 0 && frame_gas_limit(frame_input) < gas_spent {
+        BeforeFrameInitResult::Reverted(create_oog_frame_result(frame_input))
+    } else {
+        BeforeFrameInitResult::Reverted(create_frame_result(frame_input, reason, gas_spent))
+    }
 }
 
 /// Defensive revert for when a subcall interception fires on a non-Call frame.
@@ -320,14 +376,14 @@ where
 impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
     /// Checks if an address is blocklisted by reading from the native coin control precompile storage.
     ///
-    /// Returns `(is_blocklisted, is_cold)` where `is_cold` indicates whether the storage slot
-    /// was a cold access (EIP-2929). Callers use `is_cold` to compute the correct SLOAD gas cost:
-    /// cold access costs 2100 gas, warm access costs 100 gas.
+    /// Returns `(is_blocklisted, is_cold)`. The `is_cold` flag, together with the `sload_cost`
+    /// and `metered_revert` plumbing it feeds, is retained as dormant infrastructure: blocklist
+    /// SLOADs are currently unmetered (callers pass `meter_sloads = false` and the cost is
+    /// discarded), but the wiring is kept so re-enabling metering is a single-flag flip rather
+    /// than a re-architecture.
     ///
     /// Note: This calls `journal.sload()` directly, bypassing the interpreter, so revm does not
-    /// automatically meter gas for these reads. Gas is accounted for externally:
-    /// - Depth 0: `validate_initial_tx_gas` includes the SLOAD cost in intrinsic gas (always cold).
-    /// - Depth > 0: `frame_init` deducts the warm/cold-aware SLOAD cost from the child frame's gas limit.
+    /// automatically meter gas for these reads.
     fn is_address_blocklisted(
         &mut self,
         address: Address,
@@ -344,11 +400,28 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
         Ok((is_blocklisted_status(state_load.data), state_load.is_cold))
     }
 
+    fn sload_cost(&self, is_cold: bool) -> u64 {
+        if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
+            if is_cold {
+                revm_interpreter::gas::COLD_SLOAD_COST
+            } else {
+                revm_interpreter::gas::WARM_STORAGE_READ_COST
+            }
+        } else {
+            PRECOMPILE_SLOAD_GAS_COST
+        }
+    }
+
     /// Extracts transfer parameters (from, to, amount) from a Create frame input.
-    /// Returns None if value is zero or scheme is Custom.
-    fn extract_create_transfer_params(
+    ///
+    /// For value-carrying CREATE2 frames, this also normalizes the frame scheme to
+    /// `CreateScheme::Custom { address }` after deriving the address, so revm reuses
+    /// the precomputed address during frame initialization instead of hashing initcode again.
+    ///
+    /// Returns None if value is zero or scheme is already Custom.
+    fn extract_and_normalize_create_transfer_params(
         &mut self,
-        inputs: &revm_interpreter::CreateInputs,
+        inputs: &mut revm_interpreter::CreateInputs,
         depth: usize,
     ) -> Result<Option<(Address, Address, U256)>, ContextDbError<CTX>> {
         if inputs.value().is_zero() {
@@ -377,21 +450,22 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
             }
             CreateScheme::Create2 { salt: _ } => {
                 // Nonce doesn't matter for CREATE2
-                Ok(Some((
-                    inputs.caller(),
-                    inputs.created_address(0),
-                    inputs.value(),
-                )))
+                let created_address = inputs.created_address(0);
+                // Arc needs the created address before revm initializes the create frame
+                // for blocklist checks and transfer logs. Normalize the frame to a custom
+                // create so revm reuses the precomputed address instead of hashing the
+                // initcode a second time. This can be removed after upgrading to a
+                // revm release containing bluealloy/revm#3664.
+                inputs.set_scheme(CreateScheme::Custom {
+                    address: created_address,
+                });
+                Ok(Some((inputs.caller(), created_address, inputs.value())))
             }
             CreateScheme::Custom { address: _ } => Ok(None),
         }
     }
 
     /// Checks blocklist status for transfer participants and returns appropriate result.
-    ///
-    /// Computes the total SLOAD gas cost for the blocklist checks performed. For Zero6+,
-    /// uses EIP-2929 warm/cold pricing via `sload_cost`. For pre-Zero6, uses the fixed
-    /// `PRECOMPILE_SLOAD_GAS_COST` (2100 gas) per SLOAD.
     fn check_blocklist_and_create_log(
         &mut self,
         from: Address,
@@ -399,6 +473,10 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
         amount: U256,
         frame_input: &FrameInit,
     ) -> Result<BeforeFrameInitResult, ContextDbError<CTX>> {
+        // Meter SLOAD gas on revert for nested frames (depth > 0).
+        // Currently SLOAD gas metering is disabled — blocklist checks are unmetered.
+        let meter_sloads = false;
+
         // Zero5: reject CALL/CREATE value transfers involving the zero address.
         // This prevents accidental burn/mint semantics at the EVM execution layer.
         //
@@ -412,48 +490,35 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
             return Ok(BeforeFrameInitResult::Reverted(create_frame_result(
                 frame_input,
                 ERR_ZERO_ADDRESS,
-                BLOCKLISTED_GAS_PENALTY,
+                0,
             )));
         }
 
         let (from_blocklisted, from_is_cold) = self.is_address_blocklisted(from)?;
-
-        // Compute gas cost for the `from` sload
-        let from_sload_cost = if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
-            if from_is_cold {
-                revm_interpreter::gas::COLD_SLOAD_COST
-            } else {
-                revm_interpreter::gas::WARM_STORAGE_READ_COST
-            }
-        } else {
-            PRECOMPILE_SLOAD_GAS_COST
-        };
+        let from_sload_cost = self.sload_cost(from_is_cold);
 
         if from_blocklisted {
-            // Short-circuit: only the `from` sload was performed
-            return Ok(BeforeFrameInitResult::Reverted(
-                create_blocklisted_frame_result(frame_input),
+            return Ok(metered_revert(
+                frame_input,
+                meter_sloads,
+                from_sload_cost,
+                ERR_BLOCKED_ADDRESS,
             ));
         }
 
         let (to_blocklisted, to_is_cold) = self.is_address_blocklisted(to)?;
+        let to_sload_cost = self.sload_cost(to_is_cold);
 
-        // Compute gas cost for the `to` sload
-        let to_sload_cost = if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
-            if to_is_cold {
-                revm_interpreter::gas::COLD_SLOAD_COST
-            } else {
-                revm_interpreter::gas::WARM_STORAGE_READ_COST
-            }
-        } else {
-            PRECOMPILE_SLOAD_GAS_COST
-        };
-
+        // Both are PRECOMPILE_SLOAD_GAS_COST (2,100); sum fits in u64
+        #[allow(clippy::arithmetic_side_effects)]
         let total_sload_cost = from_sload_cost + to_sload_cost;
 
         if to_blocklisted {
-            return Ok(BeforeFrameInitResult::Reverted(
-                create_blocklisted_frame_result(frame_input),
+            return Ok(metered_revert(
+                frame_input,
+                meter_sloads,
+                total_sload_cost,
+                ERR_BLOCKED_ADDRESS,
             ));
         }
         if self.hardfork_flags.is_active(ArcHardfork::Zero5) {
@@ -462,11 +527,12 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
             // execution, so this usually has no practical gas impact even if the first load is cold.
             let target_account = self.inner.journal_mut().load_account(to)?;
             if target_account.is_selfdestructed() {
-                return Ok(BeforeFrameInitResult::Reverted(create_frame_result(
+                return Ok(metered_revert(
                     frame_input,
+                    meter_sloads,
+                    total_sload_cost,
                     ERR_SELFDESTRUCTED_BALANCE_INCREASED,
-                    BLOCKLISTED_GAS_PENALTY,
-                )));
+                ));
             }
         }
 
@@ -490,13 +556,13 @@ impl<CTX: ContextTr, INSP, I, P> ArcEvm<CTX, INSP, I, P> {
 
     pub(crate) fn before_frame_init(
         &mut self,
-        frame_input: &FrameInit,
+        frame_input: &mut FrameInit,
     ) -> Result<BeforeFrameInitResult, ContextDbError<CTX>> {
         // Extract transfer parameters based on frame type
-        let transfer_params = match &frame_input.frame_input {
+        let transfer_params = match &mut frame_input.frame_input {
             FrameInput::Empty => None,
             FrameInput::Create(inputs) => {
-                self.extract_create_transfer_params(inputs, frame_input.depth)?
+                self.extract_and_normalize_create_transfer_params(inputs, frame_input.depth)?
             }
             FrameInput::Call(inputs) => extract_call_transfer_params(inputs),
         };
@@ -552,7 +618,7 @@ where
     #[inline]
     fn frame_init(
         &mut self,
-        frame_input: <EthFrame as FrameTr>::FrameInit,
+        mut frame_input: <EthFrame as FrameTr>::FrameInit,
     ) -> Result<FrameInitResult<'_, Self::Frame>, ContextDbError<CTX>> {
         // Subcall precompiles must be checked first: they reject value transfers, so
         // the parent's `before_frame_init` is a no-op (no transfer to check). Running
@@ -576,7 +642,7 @@ where
                 // Defense-in-depth: run before_frame_init on the parent frame even though
                 // subcall precompiles currently reject value transfers (making this a no-op).
                 // If a future subcall precompile allows value, the log needs to be handled here.
-                match self.before_frame_init(&frame_input)? {
+                match self.before_frame_init(&mut frame_input)? {
                     BeforeFrameInitResult::Reverted(res) => {
                         return Ok(ItemOrResult::Result(res));
                     }
@@ -589,7 +655,7 @@ where
             }
         }
 
-        // Standard path: blocklist checks, SLOAD gas, revm frame init, transfer log.
+        // Standard path: blocklist checks, revm frame init, transfer log.
         match self.checked_frame_init(frame_input)? {
             FrameInitOutcome::Pushed => Ok(ItemOrResult::Item(self.inner.frame_stack.get())),
             FrameInitOutcome::Immediate(result) => Ok(ItemOrResult::Result(result)),
@@ -639,7 +705,7 @@ where
             let continuation_key = finished_depth.checked_sub(1);
             if let Some(key) = continuation_key {
                 if let Some(continuation) = self.subcall_continuations.remove(&key) {
-                    let final_result = Self::complete_subcall(result, continuation)?;
+                    let final_result = self.complete_subcall(result, continuation)?;
                     if stack_empty {
                         // Direct EOA -> precompile: no parent frame to propagate to.
                         return Ok(Some(final_result));
@@ -683,9 +749,8 @@ where
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
-    /// Runs `before_frame_init` (blocklist checks, transfer log), deducts SLOAD gas for
-    /// nested frames with Zero6 active, then initializes the frame via revm's standard
-    /// machinery and emits the transfer log on success.
+    /// Runs `before_frame_init` (blocklist checks, transfer log), then initializes the
+    /// frame via revm's standard machinery and emits the transfer log on success.
     ///
     /// For Zero5+ precompile CALLs, the EIP-7708 Transfer log is pushed before frame init
     /// (wrapped in a journal checkpoint) so it precedes precompile-emitted logs. For all
@@ -697,7 +762,7 @@ where
         &mut self,
         mut frame_input: FrameInit,
     ) -> Result<FrameInitOutcome, ContextDbError<CTX>> {
-        let (maybe_log, sload_gas) = match self.before_frame_init(&frame_input)? {
+        let (maybe_log, _sload_gas) = match self.before_frame_init(&mut frame_input)? {
             BeforeFrameInitResult::Reverted(res) => {
                 return Ok(FrameInitOutcome::Immediate(res));
             }
@@ -705,17 +770,6 @@ where
             BeforeFrameInitResult::Checked(gas) => (None, gas),
             BeforeFrameInitResult::None => (None, 0),
         };
-
-        // Deduct warm/cold-aware SLOAD gas for nested frames (depth > 0) with Zero6 active.
-        // Depth 0 is covered by `validate_initial_tx_gas` which charges fixed cold SLOAD costs.
-        if frame_input.depth > 0
-            && sload_gas > 0
-            && self.hardfork_flags.is_active(ArcHardfork::Zero6)
-        {
-            if let Some(oog) = deduct_gas_from_frame(&mut frame_input, sload_gas) {
-                return Ok(FrameInitOutcome::Immediate(oog));
-            }
-        }
 
         // Log emission strategy for the EIP-7708 Transfer log:
         //
@@ -788,8 +842,7 @@ where
     ///
     /// Decodes the precompile input via [`SubcallPrecompile::init_subcall`], stores a
     /// continuation, and initializes the child frame via [`checked_frame_init`] so that it
-    /// goes through `before_frame_init` hooks (blocklist checks, transfer log, SLOAD gas
-    /// deduction).
+    /// goes through `before_frame_init` hooks (blocklist checks, transfer log).
     fn init_subcall(
         &mut self,
         mut frame_input: <EthFrame as FrameTr>::FrameInit,
@@ -813,9 +866,10 @@ where
 
         // Reject static context — even when the scheme is CALL, `is_static` can be true
         // if this call is nested inside a STATICCALL frame higher in the call stack.
+        // Consume all gas to match upstream `CallNotAllowedInsideStatic` halt semantics
+        // and the standard precompile-helper `check_staticcall` path.
         if call_inputs.is_static {
-            return Ok(ItemOrResult::Result(init_subcall_revert(
-                "subcall precompiles cannot be invoked in static context",
+            return Ok(ItemOrResult::Result(init_subcall_static_revert(
                 call_inputs,
             )));
         }
@@ -851,33 +905,18 @@ where
             }
         };
 
+        // Prevent sender spoofing by contracts: if the precompile changes the caller
+        // (e.g. callFrom), the new caller must be tx.origin (the signing EOA).
+        if init_result.child_inputs.caller != call_inputs.caller
+            && init_result.child_inputs.caller != self.inner.ctx.tx().caller()
+        {
+            return Ok(ItemOrResult::Result(init_subcall_revert(
+                "sender spoofing requires tx.origin as sender",
+                call_inputs,
+            )));
+        }
+
         let return_memory_offset = call_inputs.return_memory_offset.clone();
-
-        // Store continuation keyed by the precompile call's depth.
-        //
-        // No journal checkpoint is taken here. The child frame's own checkpoint
-        // (created by `make_call_frame`) handles commit/revert based on the child's
-        // success or failure. This avoids an extra `journal.depth` increment that
-        // would create a depth gap visible to tracing inspectors, causing
-        // `push_trace` to panic with "Disconnected trace".
-        //
-        // Note: if `complete_subcall` returns `success: false` or `Err` when the
-        // child succeeded, the child's committed state will NOT be reverted.
-        // See the `SubcallPrecompile` trait docs.
-        let depth = frame_input.depth;
-        self.subcall_continuations.insert(
-            depth,
-            SubcallContinuation {
-                precompile,
-                gas_limit: call_inputs.gas_limit,
-                init_subcall_gas_overhead: init_result.gas_overhead,
-                return_memory_offset,
-                continuation_data: init_result.continuation_data,
-            },
-        );
-
-        // Construct child frame input
-        let child_inputs = &init_result.child_inputs;
 
         // Pre-load the child's caller and target accounts into the journal. The normal EVM
         // execution path has these already loaded (caller is the executing frame, target was
@@ -885,51 +924,132 @@ where
         // with a potentially-unseen spoofed sender and arbitrary target.
         //
         // Both must be present in the journal state map before `make_call_frame` calls
-        // `transfer_loaded`, which panics on missing accounts. `load_account` (without code)
-        // is sufficient here — `make_call_frame` will call `load_account_with_code` for the
-        // target's bytecode separately (since `known_bytecode` is None).
+        // `transfer_loaded`, which panics on missing accounts. The target is loaded with
+        // code to support EIP-7702 delegation resolution below.
         //
-        // Side effect: these `load_account` calls create `AccountWarmed` journal entries
-        // outside the child frame's checkpoint scope. If the child reverts, the child's
-        // journal entries are rolled back but these pre-loads persist — the addresses stay
-        // warm for the rest of the transaction. For CallFrom this is bounded by the
-        // allowlist and the addresses are typically already warm. Future subcall precompiles
-        // with `AllowedCallers::Unrestricted` targeting user-supplied addresses should
-        // account for this.
+        // These loads happen BEFORE the checkpoint so that warmups persist regardless of
+        // outcome (OOG, child revert, or parent rejection). This matches normal EVM CALL
+        // semantics where target warming is a side-effect of the CALL opcode, not the
+        // called code.
+        //
+        // Note: when caller==target, `load_account(caller)` warms the address first, so
+        // `target_load.is_cold` is false and only the warm cost (100) is charged.
+        let mut child_inputs = init_result.child_inputs;
         self.inner
             .ctx
             .journal_mut()
             .load_account(child_inputs.caller)?;
-        self.inner
-            .ctx
-            .journal_mut()
-            .load_account(child_inputs.target_address)?;
+
+        // Track gas for the subcall overhead: ABI decode + target access + delegation.
+        // Access costs are charged explicitly because our pre-loads warm the accounts,
+        // so revm's internal CALL handler won't charge them.
+        let mut gas = Gas::new(call_inputs.gas_limit);
+        if !gas.record_cost(init_result.gas_overhead) {
+            gas.spend_all();
+            return Ok(ItemOrResult::Result(subcall_oog(
+                gas,
+                call_inputs.return_memory_offset.clone(),
+            )));
+        }
+
+        let Some(target) = load_account_with_code_metered(
+            self.inner.ctx.journal_mut(),
+            child_inputs.target_address,
+            &mut gas,
+        )?
+        else {
+            gas.spend_all();
+            return Ok(ItemOrResult::Result(subcall_oog(
+                gas,
+                call_inputs.return_memory_offset.clone(),
+            )));
+        };
+
+        // Resolve EIP-7702 delegation: if the target has a delegation designator,
+        // load the delegate's code so the child frame executes correct bytecode.
+        if let Some(Bytecode::Eip7702(delegation)) = &target.code {
+            let delegate_address = delegation.address();
+
+            let Some(delegate) = load_account_with_code_metered(
+                self.inner.ctx.journal_mut(),
+                delegate_address,
+                &mut gas,
+            )?
+            else {
+                gas.spend_all();
+                return Ok(ItemOrResult::Result(subcall_oog(
+                    gas,
+                    call_inputs.return_memory_offset.clone(),
+                )));
+            };
+
+            if let Some(code) = delegate.code {
+                child_inputs.known_bytecode = Some((delegate.code_hash, code));
+            }
+        }
+
+        // Take a journal checkpoint AFTER account loading so warmups always persist,
+        // but BEFORE child dispatch so we can revert the child's committed state if
+        // `complete_subcall` rejects a successful child.
+        //
+        // `checkpoint()` increments journal depth, which would create a depth gap visible
+        // to tracing inspectors (causing `push_trace` to panic with "Disconnected trace").
+        // We immediately call `checkpoint_commit()` to restore depth. The checkpoint value
+        // remains valid for a later revert — see `complete_subcall` for the revert protocol.
+        let checkpoint = self.inner.ctx.journal_mut().checkpoint();
+        self.inner.ctx.journal_mut().checkpoint_commit();
+
+        let depth = frame_input.depth;
+        let gas_limit = call_inputs.gas_limit;
+
+        // Recalculate child gas with EIP-150 (63/64ths) applied to the gas remaining
+        // after total overhead. This overwrites the gas_limit set by the trait's
+        // `init_subcall`, which only accounted for the ABI decode overhead.
+        // gas.remaining() / 64 <= gas.remaining(), so the subtraction cannot underflow.
+        #[allow(clippy::arithmetic_side_effects)]
+        let child_gas_limit = gas.remaining() - (gas.remaining() / 64);
+        child_inputs.gas_limit = child_gas_limit;
 
         let child_frame_input = FrameInit {
+            // Call depth is bounded by the EVM stack limit (1024)
+            #[allow(clippy::arithmetic_side_effects)]
             depth: depth + 1,
             memory: frame_input.memory,
-            frame_input: FrameInput::Call(init_result.child_inputs),
+            frame_input: FrameInput::Call(child_inputs),
         };
 
         // Initialize the child frame through checked_frame_init so that
-        // before_frame_init hooks (blocklist, transfer log, SLOAD gas) run on the
+        // before_frame_init hooks (blocklist, transfer log) run on the
         // child. This returns owned FrameInitOutcome, releasing &mut self.
         match self.checked_frame_init(child_frame_input)? {
-            // Child frame needs execution — return a reference so the execution loop
-            // drives it. complete_subcall will run in frame_return_result.
-            FrameInitOutcome::Pushed => Ok(ItemOrResult::Item(self.inner.frame_stack.get())),
+            // Child frame needs execution — store the continuation so
+            // frame_return_result can finalize it when the child completes.
+            FrameInitOutcome::Pushed => {
+                self.subcall_continuations.insert(
+                    depth,
+                    SubcallContinuation {
+                        precompile,
+                        gas_limit,
+                        init_subcall_gas_overhead: gas.spent(),
+                        return_memory_offset,
+                        continuation_data: init_result.continuation_data,
+                        checkpoint,
+                    },
+                );
+                Ok(ItemOrResult::Item(self.inner.frame_stack.get()))
+            }
             // Child completed immediately (e.g. rejected by allowlist, empty bytecode).
             // complete_subcall must run now since frame_return_result won't see this child.
             FrameInitOutcome::Immediate(child_result) => {
-                let Some(continuation) = self.subcall_continuations.remove(&depth) else {
-                    // Defensive: the continuation was inserted a few lines above. If somehow
-                    // missing, revert — do not panic in production.
-                    return Ok(ItemOrResult::Result(init_subcall_revert(
-                        "internal error: missing subcall continuation",
-                        call_inputs,
-                    )));
+                let continuation = SubcallContinuation {
+                    precompile,
+                    gas_limit,
+                    init_subcall_gas_overhead: gas.spent(),
+                    return_memory_offset,
+                    continuation_data: init_result.continuation_data,
+                    checkpoint,
                 };
-                let final_result = Self::complete_subcall(child_result, continuation)?;
+                let final_result = self.complete_subcall(child_result, continuation)?;
                 Ok(ItemOrResult::Result(final_result))
             }
         }
@@ -940,7 +1060,11 @@ where
     ///
     /// Computes the final `FrameResult` from the child outcome and continuation state.
     /// The caller is responsible for propagating or returning this result.
+    ///
+    /// If the child succeeded but `complete_subcall` signals failure, the child's committed
+    /// state is reverted using the checkpoint stored in the continuation.
     fn complete_subcall(
+        &mut self,
         child_result: FrameResult,
         continuation: SubcallContinuation,
     ) -> Result<FrameResult, ContextDbError<CTX>> {
@@ -969,34 +1093,50 @@ where
             .precompile
             .complete_subcall(continuation.continuation_data, &child_result);
 
-        // Total gas consumed by the precompile.
-        //
-        // Normal case: init_subcall overhead + child execution cost. The remainder
-        // (gas_limit - gas_used) includes the retained 1/64th implicitly, since it
-        // was never forwarded to the child.
-        //
-        // Child halted (OOG, StackUnderflow, etc.): the entire gas_limit is consumed,
-        // matching EVM CALL semantics where a halted child burns the full allocation
-        // including the retained 1/64th.
-        let gas_used = if child_halted {
-            continuation.gas_limit
-        } else {
-            continuation
-                .init_subcall_gas_overhead
-                .saturating_add(child_gas.spent())
+        // Extract completion gas before consuming the result in the match below.
+        let completion_gas = match &completion_result {
+            Ok(result) => result.gas_overhead,
+            Err(_) => 0, // Error case already consumes all gas
         };
 
-        // No journal checkpoint to commit/revert here. The child frame's own checkpoint
-        // (taken by `make_call_frame`, resolved in `process_next_action`) already
-        // committed or reverted based on the child's success/failure. We rely on
-        // `complete_subcall` not rejecting a successful child — see
-        // `SubcallPrecompile` trait docs.
+        // Total gas consumed by the precompile.
+        //
+        // Normal case: init_subcall overhead + child execution cost + completion overhead.
+        // The remainder (gas_limit - gas_used) includes the retained 1/64th implicitly,
+        // since it was never forwarded to the child.
+        //
+        // Child halted (OOG, StackUnderflow, etc.): standard CALL semantics burn the full
+        // allocation including the retained 1/64th. Still compute the metered cost with
+        // completion overhead; if completion cannot fit in the retained gas, the subcall
+        // becomes OOG below instead of silently discarding that cost.
+        let metered_gas_used = continuation
+            .init_subcall_gas_overhead
+            .checked_add(child_gas.spent())
+            .expect("gas overflow: init_subcall_overhead + child_gas.spent()")
+            .checked_add(completion_gas)
+            .expect("gas overflow: metered_gas_used + completion_gas");
+        let gas_used = if child_halted {
+            continuation.gas_limit.max(metered_gas_used)
+        } else {
+            metered_gas_used
+        };
+
+        let mut gas = Gas::new(continuation.gas_limit);
+        if !gas.record_cost(gas_used) {
+            gas.spend_all();
+
+            // If the child succeeded, its state was committed before completion
+            // accounting discovered the OOG. Roll it back through the same checkpoint
+            // protocol used for explicit completion failures.
+            if child_succeeded {
+                self.revert_subcall_checkpoint(continuation.checkpoint);
+            }
+
+            return Ok(subcall_oog(gas, continuation.return_memory_offset));
+        }
+
         match completion_result {
             Ok(result) if result.success => {
-                let mut gas = Gas::new(continuation.gas_limit);
-                if !gas.record_cost(gas_used) {
-                    gas.spend_all();
-                }
                 // Only forward SSTORE refunds when the child frame itself succeeded.
                 // A reverted child's refunds are invalid — they correspond to state
                 // changes that were rolled back.
@@ -1011,37 +1151,49 @@ where
                     precompile_call_logs: Default::default(),
                 }))
             }
-            Ok(result) => {
-                // Precompile signaled failure — no refund. Note: if the child succeeded,
-                // its committed state is NOT reverted (see SubcallPrecompile trait docs).
+            completion_failure => {
+                let output = match completion_failure {
+                    Ok(result) => result.output,
+                    Err(_) => {
+                        gas.spend_all();
+                        Bytes::new()
+                    }
+                };
 
-                let mut gas = Gas::new(continuation.gas_limit);
-                if !gas.record_cost(gas_used) {
-                    gas.spend_all();
+                // If the child succeeded, revert its committed state using the
+                // checkpoint taken before child dispatch.
+                if child_succeeded {
+                    self.revert_subcall_checkpoint(continuation.checkpoint);
                 }
-                // No record_refund — precompile signaled failure
 
                 Ok(FrameResult::Call(CallOutcome {
-                    result: InterpreterResult::new(InstructionResult::Revert, result.output, gas),
-                    memory_offset: continuation.return_memory_offset,
-                    was_precompile_called: true,
-                    precompile_call_logs: Default::default(),
-                }))
-            }
-            Err(_) => {
-                // complete_subcall error — all gas consumed
-                Ok(FrameResult::Call(CallOutcome {
-                    result: InterpreterResult::new(
-                        InstructionResult::Revert,
-                        Bytes::new(),
-                        Gas::new_spent(continuation.gas_limit),
-                    ),
+                    result: InterpreterResult::new(InstructionResult::Revert, output, gas),
                     memory_offset: continuation.return_memory_offset,
                     was_precompile_called: true,
                     precompile_call_logs: Default::default(),
                 }))
             }
         }
+    }
+
+    /// Revert journal state to a checkpoint that was taken without a depth increment.
+    ///
+    /// The checkpoint was originally taken via `checkpoint()` + immediate `checkpoint_commit()`
+    /// (to neutralize the depth side-effect for tracing compatibility). To revert:
+    /// 1. Call `checkpoint()` to increment depth (so `checkpoint_revert` can decrement it back)
+    /// 2. Call `checkpoint_revert(saved_cp)` which decrements depth and rolls back state
+    ///
+    /// Net depth change: 0. The dummy checkpoint from step 1 is discarded — we revert to
+    /// the saved position which predates the child's execution.
+    fn revert_subcall_checkpoint(&mut self, saved_cp: JournalCheckpoint) {
+        let depth_before = self.inner.ctx.journal_mut().depth();
+        let _dummy = self.inner.ctx.journal_mut().checkpoint();
+        self.inner.ctx.journal_mut().checkpoint_revert(saved_cp);
+        debug_assert_eq!(
+            self.inner.ctx.journal_mut().depth(),
+            depth_before,
+            "revert_subcall_checkpoint must not change journal depth"
+        );
     }
 }
 
@@ -1364,6 +1516,22 @@ where
         contract: Address,
         data: Bytes,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
+        debug_assert!(
+            self.subcall_continuations.is_empty(),
+            "system calls bypass ArcEvm::frame_init and must not start with active Arc subcall continuations"
+        );
+        debug_assert!(
+            self.subcall_registry.get(&contract).is_none(),
+            "system-call target {contract:?} is an Arc subcall precompile; explicitly decide whether bypassing ArcEvm::frame_init is correct"
+        );
+
+        // Intentionally delegate to revm's system-call path. Current Arc system calls are
+        // zero-value calls, and upstream EIP system calls are expected to follow revm's
+        // semantics. Arc frame_init hooks (blocklist checks, transfer logs, SLOAD gas
+        // deduction, subcall interception) are therefore intentionally not applied here.
+        // If a future Arc system call depends on those hooks, treat that as an explicit
+        // execution-semantics design change instead of silently routing through
+        // ArcEvmHandler.
         self.inner.system_call_with_caller(caller, contract, data)
     }
 
@@ -1413,13 +1581,17 @@ impl ArcEvmFactory {
     }
 
     fn get_hardfork_flags(&self, block_env: &BlockEnv) -> ArcHardforkFlags {
-        // The block height in header is u64, convert should succeed.
-        self.chain_spec.get_hardfork_flags(
-            block_env
-                .number
-                .try_into()
-                .expect("Failed to convert block number to u64"),
-        )
+        // `BlockEnv` carries `number`/`timestamp` as U256, but Arc consensus pins both
+        // to u64 ranges, so these conversions can only fail on malformed inputs.
+        let number: u64 = block_env
+            .number
+            .try_into()
+            .expect("Failed to convert block number to u64");
+        let timestamp: u64 = block_env
+            .timestamp
+            .try_into()
+            .expect("Failed to convert block timestamp to u64");
+        self.chain_spec.get_hardfork_flags(number, timestamp)
     }
 
     /// Builds the subcall registry for the given hardfork flags.
@@ -1434,7 +1606,7 @@ impl ArcEvmFactory {
 
         let mut registry = SubcallRegistry::new();
 
-        if hardfork_flags.is_active(ArcHardfork::Zero6) {
+        if hardfork_flags.is_active(ArcHardfork::Zero7) {
             registry.register(
                 CALL_FROM_ADDRESS,
                 Arc::new(CallFromPrecompile),
@@ -1468,7 +1640,7 @@ impl EvmFactory for ArcEvmFactory {
         let ctx = Self::Context::new(db, spec)
             .with_cfg(input.cfg_env)
             .with_block(input.block_env);
-        let mut instruction = EthInstructions::default();
+        let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         let inspector = NoOpInspector {};
         let subcall_registry = self.build_subcall_registry(hardfork_flags);
@@ -1508,7 +1680,7 @@ impl EvmFactory for ArcEvmFactory {
         let ctx = Self::Context::new(db, spec)
             .with_cfg(input.cfg_env)
             .with_block(input.block_env);
-        let mut instruction = EthInstructions::default();
+        let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         let subcall_registry = self.build_subcall_registry(hardfork_flags);
 
@@ -1629,14 +1801,6 @@ impl ConfigureEvm for ArcEvmConfig {
                 })?,
         );
 
-        // Override the suggested fee recipient with the reward beneficiary from the ProtocolConfig contract.
-        attributes.suggested_fee_recipient = retrieve_reward_beneficiary(&mut system_evm)
-            .unwrap_or_else(|err| {
-                tracing::warn!(error = ?err, "Failed to get reward beneficiary from ProtocolConfig");
-                // fallback - the coinbase address from the parent block
-                parent.beneficiary
-            });
-
         // Override the gas limit with the gas limit from the ProtocolConfig contract.
         // ADR-0003: use chainspec bounds; fall back to chainspec default when ProtocolConfig
         // is unavailable or returns an out-of-bounds value.
@@ -1644,7 +1808,7 @@ impl ConfigureEvm for ArcEvmConfig {
         let fee_params = retrieve_fee_params(&mut system_evm).inspect_err(|err| {
                 tracing::warn!(error = ?err, "Failed to get fee params from ProtocolConfig, using default gas limit");
             }).ok();
-        let next_block_height = parent.number + 1;
+        let next_block_height = parent.number.checked_add(1).expect("block number overflow");
 
         let gas_limit_config = chain_spec.block_gas_limit_config(next_block_height);
         attributes.gas_limit = expected_gas_limit(fee_params.as_ref(), &gas_limit_config);
@@ -1707,7 +1871,7 @@ impl ConfigureEngineEvm<ExecutionData> for ArcEvmConfig {
 mod tests {
     use super::*;
     use crate::frame_result::BeforeFrameInitResult;
-    use crate::frame_result::BLOCKLISTED_GAS_PENALTY;
+
     use crate::log::NativeCoinTransferred;
     use alloy_consensus::Block;
     use alloy_primitives::{address, Bytes, B256, U256};
@@ -1718,7 +1882,7 @@ mod tests {
     use arc_precompiles::{
         native_coin_control, NATIVE_COIN_AUTHORITY_ADDRESS, NATIVE_COIN_CONTROL_ADDRESS,
     };
-    use reth_chainspec::EthChainSpec;
+    use reth_chainspec::{EthChainSpec, ForkCondition};
     use reth_ethereum::evm::revm::{
         context::CfgEnv,
         db::{CacheDB, EmptyDB},
@@ -1766,7 +1930,7 @@ mod tests {
         PrecompilesMap,
     > {
         let spec = revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
-        let hardfork_flags = chain_spec.get_hardfork_flags(0);
+        let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
         let cfg_env = CfgEnv::new()
             .with_chain_id(chain_spec.chain_id())
             .with_spec_and_mainnet_gas_params(spec);
@@ -1775,7 +1939,7 @@ mod tests {
         let ctx = EthEvmContext::new(db, spec)
             .with_cfg(cfg_env)
             .with_block(block_env);
-        let mut instruction = EthInstructions::default();
+        let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         let inspector = NoOpInspector {};
 
@@ -1803,6 +1967,41 @@ mod tests {
             hardfork_flags,
             subcall_registry,
         )
+    }
+
+    fn evm_env_with_spec(spec: SpecId) -> EvmEnv {
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(LOCAL_DEV.chain_id())
+            .with_spec_and_mainnet_gas_params(spec);
+
+        EvmEnv {
+            block_env: BlockEnv::default(),
+            cfg_env,
+        }
+    }
+
+    #[test]
+    fn factory_uses_input_spec_for_instruction_tables() {
+        let factory = ArcEvmFactory::new(LOCAL_DEV.clone());
+        let evm = factory.create_evm(InMemoryDB::default(), evm_env_with_spec(SpecId::TANGERINE));
+
+        assert_eq!(evm.inner.instruction.spec, SpecId::TANGERINE);
+        assert_eq!(
+            evm.inner.instruction.instruction_table[opcode::DELEGATECALL as usize].static_gas(),
+            700
+        );
+
+        let evm = factory.create_evm_with_inspector(
+            InMemoryDB::default(),
+            evm_env_with_spec(SpecId::TANGERINE),
+            NoOpInspector {},
+        );
+
+        assert_eq!(evm.inner.instruction.spec, SpecId::TANGERINE);
+        assert_eq!(
+            evm.inner.instruction.instruction_table[opcode::DELEGATECALL as usize].static_gas(),
+            700
+        );
     }
 
     fn create_db(accounts: &[(Address, u64)]) -> InMemoryDB {
@@ -1973,7 +2172,7 @@ mod tests {
     > {
         let spec = SpecId::PRAGUE;
         let ctx = Context::new(db, spec);
-        let instruction = EthInstructions::default();
+        let instruction = EthInstructions::new_mainnet_with_spec(spec);
 
         let subcall_registry = Arc::new(SubcallRegistry::default());
         ArcEvm::new(
@@ -1999,41 +2198,79 @@ mod tests {
         );
         let evm_config = ArcEvmConfig::new(inner_config);
         let mut db = State::builder().build();
-
-        // Create a minimal sealed parent header with a known beneficiary
-        let fallback_beneficiary = Address::repeat_byte(0x99);
         let parent_header = Header {
             number: 1,
-            gas_limit: 30_000_000, // Standard gas limit
+            gas_limit: 30_000_000,
             gas_used: 21_000,
             base_fee_per_gas: Some(1_000_000_000), // 1 gwei
             timestamp: 1000,
-            beneficiary: fallback_beneficiary,
             ..Default::default()
         };
         let sealed_parent = SealedHeader::new(parent_header, B256::ZERO);
 
-        // Create next block attributes
         let attributes = NextBlockEnvAttributes {
             timestamp: 1001,
             prev_randao: B256::ZERO,
-            suggested_fee_recipient: Address::ZERO, // Different from parent beneficiary
+            suggested_fee_recipient: Address::repeat_byte(0x42),
             gas_limit: 30_000_000,
             parent_beacon_block_root: None,
             withdrawals: None,
             extra_data: Default::default(),
         };
 
-        // Test builder_for_next_block - should succeed and use fallback beneficiary
         let result = evm_config.builder_for_next_block(&mut db, &sealed_parent, attributes);
         assert!(
             result.is_ok(),
-            "builder_for_next_block should succeed with fallback"
+            "builder_for_next_block should succeed when ProtocolConfig is absent"
         );
+    }
 
-        // The function should have set suggested_fee_recipient to parent.beneficiary
-        // We can't directly inspect the builder's internal state, but we know it succeeded
-        // and the fallback logic was triggered since ProtocolConfig contract doesn't exist
+    #[test]
+    fn test_system_call_delegates_to_revm_system_call_path() {
+        let chain_spec = LOCAL_DEV.clone();
+        let system_contract = Address::repeat_byte(0x21);
+        let return_value = U256::from(42);
+
+        // PUSH1 0x2a PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN
+        let runtime = Bytecode::new_raw(Bytes::from(vec![
+            0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ]));
+
+        let mut db = create_db(&[]);
+        db.insert_account_info(
+            system_contract,
+            revm::state::AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: keccak256(runtime.bytecode()),
+                code: Some(runtime),
+                account_id: None,
+            },
+        );
+        let mut evm = create_arc_evm(chain_spec, db);
+
+        let result = alloy_evm::Evm::transact_system_call(
+            &mut evm,
+            Address::ZERO,
+            system_contract,
+            Bytes::new(),
+        )
+        .expect("system call should execute");
+
+        assert!(result.result.is_success(), "system call should succeed");
+        assert_eq!(
+            result.result.logs().len(),
+            0,
+            "zero-value system call should emit no logs"
+        );
+        assert_eq!(
+            result
+                .result
+                .output()
+                .expect("successful system call should return output")
+                .as_ref(),
+            &return_value.to_be_bytes::<32>()
+        );
     }
 
     /// Under Zero5, Arc self-emits EIP-7708 Transfer logs for CALL/CREATE value transfers.
@@ -2045,9 +2282,9 @@ mod tests {
         use revm_primitives::TxKind;
 
         let chain_spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, 0),
-            (ArcHardfork::Zero4, 0),
-            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
         ]);
         let sender = Address::repeat_byte(0x01);
         let receiver = Address::repeat_byte(0x02);
@@ -2056,7 +2293,7 @@ mod tests {
             caller: sender,
             kind: TxKind::Call(receiver),
             value: amount,
-            gas_limit: 26_000, // Must exceed (21000 + 2*SLOAD) = 25200 for Zero6 blocklist gas
+            gas_limit: 21_000,
             gas_price: 0,
             chain_id: Some(chain_spec.chain_id()),
             ..Default::default()
@@ -2111,9 +2348,9 @@ mod tests {
         use revm_primitives::TxKind;
 
         let chain_spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, 0),
-            (ArcHardfork::Zero4, 0),
-            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
         ]);
         let sender = Address::repeat_byte(0x01);
         let receiver = Address::repeat_byte(0x02);
@@ -2122,7 +2359,7 @@ mod tests {
             caller: sender,
             kind: TxKind::Call(receiver),
             value: amount,
-            gas_limit: 26_000, // Must exceed (21000 + 2*SLOAD) = 25200 for Zero6 blocklist gas
+            gas_limit: 21_000,
             gas_price: 0,
             chain_id: Some(chain_spec.chain_id()),
             ..Default::default()
@@ -2180,7 +2417,7 @@ mod tests {
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)
             .unwrap();
 
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(call_input(
                 CallScheme::Call,
                 U256::ZERO,
@@ -2191,7 +2428,7 @@ mod tests {
             depth: 1,
         };
 
-        let result = evm.before_frame_init(&frame).unwrap();
+        let result = evm.before_frame_init(&mut frame).unwrap();
         assert!(
             matches!(result, BeforeFrameInitResult::None),
             "Zero-value call under Zero5 should return None (no log, no blocklist checks)"
@@ -2278,7 +2515,7 @@ mod tests {
         // Test pre-Zero5 hardforks only — Zero5 enables EIP-7708 which emits different logs.
         for hardfork in [ArcHardfork::Zero3, ArcHardfork::Zero4] {
             for test in &test_cases {
-                let frame = FrameInit {
+                let mut frame = FrameInit {
                     frame_input: test.frame_input.clone(),
                     memory: SharedMemory::default(),
                     depth: 0,
@@ -2293,7 +2530,7 @@ mod tests {
                     .load_account(NATIVE_COIN_CONTROL_ADDRESS)
                     .unwrap();
 
-                let transfer_result = evm.before_frame_init(&frame).unwrap();
+                let transfer_result = evm.before_frame_init(&mut frame).unwrap();
 
                 // No early return should occur for basic tests
                 assert!(
@@ -2340,6 +2577,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_create2_with_value_normalizes_to_custom_address() {
+        let db = CacheDB::new(EmptyDB::default());
+        let mut evm = create_test_evm(db, ArcHardforkFlags::with(&[ArcHardfork::Zero5]));
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        let salt = U256::from(123);
+        let init_code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xF3]);
+        let expected_address = ADDRESS_A.create2(salt.to_be_bytes(), keccak256(&init_code));
+        let mut frame = FrameInit {
+            frame_input: FrameInput::Create(Box::new(CreateInputs::new(
+                ADDRESS_A,
+                CreateScheme::Create2 { salt },
+                U256::from(1),
+                init_code,
+                100_000,
+            ))),
+            memory: SharedMemory::default(),
+            depth: 0,
+        };
+
+        let transfer_result = evm.before_frame_init(&mut frame).unwrap();
+        assert!(
+            matches!(transfer_result, BeforeFrameInitResult::Log(_, _)),
+            "CREATE2 with value should produce a transfer log, got {transfer_result:?}"
+        );
+
+        let FrameInput::Create(inputs) = &frame.frame_input else {
+            panic!("expected CREATE frame");
+        };
+        assert_eq!(
+            inputs.scheme(),
+            CreateScheme::Custom {
+                address: expected_address,
+            },
+            "CREATE2 should be normalized to the precomputed custom address"
+        );
+    }
+
+    #[test]
+    fn test_create2_with_value_rejects_blocklisted_created_address() {
+        let db = CacheDB::new(EmptyDB::default());
+        let mut evm = create_test_evm(db, ArcHardforkFlags::with(&[ArcHardfork::Zero5]));
+        evm.ctx_mut()
+            .journal_mut()
+            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+            .unwrap();
+
+        let salt = U256::from(456);
+        let init_code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xF3]);
+        let expected_address = ADDRESS_A.create2(salt.to_be_bytes(), keccak256(&init_code));
+        let storage_slot =
+            native_coin_control::compute_is_blocklisted_storage_slot(expected_address);
+        evm.ctx_mut()
+            .journal_mut()
+            .sstore(
+                NATIVE_COIN_CONTROL_ADDRESS,
+                storage_slot.into(),
+                U256::from(1),
+            )
+            .unwrap();
+
+        let mut frame = FrameInit {
+            frame_input: FrameInput::Create(Box::new(CreateInputs::new(
+                ADDRESS_A,
+                CreateScheme::Create2 { salt },
+                U256::from(1),
+                init_code,
+                100_000,
+            ))),
+            memory: SharedMemory::default(),
+            depth: 0,
+        };
+
+        let transfer_result = evm.before_frame_init(&mut frame).unwrap();
+        assert!(
+            matches!(transfer_result, BeforeFrameInitResult::Reverted(_)),
+            "CREATE2 to blocklisted created address should revert, got {transfer_result:?}"
+        );
+
+        let FrameInput::Create(inputs) = &frame.frame_input else {
+            panic!("expected CREATE frame");
+        };
+        assert_eq!(
+            inputs.scheme(),
+            CreateScheme::Custom {
+                address: expected_address,
+            },
+            "rejected CREATE2 should still carry the precomputed custom address"
+        );
+    }
+
     struct BlocklistTestCase {
         name: &'static str,
         frame_input: FrameInput,
@@ -2360,7 +2692,7 @@ mod tests {
             test_case.name, hardfork
         );
 
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: test_case.frame_input.clone(),
             memory: SharedMemory::default(),
             depth: 0,
@@ -2376,7 +2708,7 @@ mod tests {
             // Intentionally do NOT load the account into the journal
             // This will cause is_address_blocklisted to fail (sload panics when account is not loaded)
             let transfer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                evm.before_frame_init(&frame)
+                evm.before_frame_init(&mut frame)
             }));
 
             assert!(
@@ -2421,7 +2753,7 @@ mod tests {
                 .unwrap();
         }
 
-        let transfer_result = evm.before_frame_init(&frame).unwrap();
+        let transfer_result = evm.before_frame_init(&mut frame).unwrap();
 
         if test_case.expected_reverted {
             assert!(
@@ -2434,8 +2766,8 @@ mod tests {
             if let BeforeFrameInitResult::Reverted(reverted) = transfer_result {
                 assert_eq!(
                     reverted.gas().spent(),
-                    BLOCKLISTED_GAS_PENALTY,
-                    "{} (hardfork: {:?}): expect reverted gas spent BLOCKLISTED_GAS_PENALTY",
+                    0,
+                    "{} (hardfork: {:?}): depth-0 reverts should have zero gas spent",
                     test_case.name,
                     hardfork
                 );
@@ -2647,246 +2979,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_nested_frame_gas_deduction_zero6() {
-        use arc_precompiles::helpers::PRECOMPILE_SLOAD_GAS_COST;
-        use revm::handler::EvmTr;
-
-        // Test that nested frames (depth > 0) with Zero6 get OOG when gas is insufficient
-        let db = CacheDB::new(EmptyDB::default());
-        let mut evm = create_test_evm(db, ArcHardforkFlags::with(&[ArcHardfork::Zero6]));
-
-        // Load native coin control account (required for blocklist checks)
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        // Create a nested CALL frame (depth=1) with value and insufficient gas
-        // With value transfer: needs 2 cold SLOADs = 2 * 2100 = 4200 gas
-        let insufficient_gas = PRECOMPILE_SLOAD_GAS_COST; // Only 2100, need 4200
-        let frame_with_value = FrameInit {
-            frame_input: FrameInput::Call(Box::new(CallInputs {
-                scheme: CallScheme::Call,
-                target_address: ADDRESS_B,
-                bytecode_address: ADDRESS_B,
-                known_bytecode: None,
-                value: CallValue::Transfer(U256::from(100)),
-                input: CallInput::Bytes(Bytes::new()),
-                gas_limit: insufficient_gas,
-                is_static: false,
-                caller: ADDRESS_A,
-                return_memory_offset: 0..0,
-            })),
-            memory: SharedMemory::default(),
-            depth: 1, // Nested frame
-        };
-
-        let result = evm.frame_init(frame_with_value);
-
-        // Should return OOG because gas_limit (2100) < required (4200)
-        match result {
-            Ok(ItemOrResult::Result(FrameResult::Call(outcome))) => {
-                assert_eq!(
-                    outcome.result.result,
-                    InstructionResult::OutOfGas,
-                    "Expected OutOfGas for nested call with insufficient gas"
-                );
-            }
-            other => panic!(
-                "Expected Ok(Result(Call(OutOfGas))), got {:?}",
-                other.map(|r| format!("{:?}", r))
-            ),
-        }
-    }
-
-    #[test]
-    fn test_blocklist_sload_gas_cold_access() {
-        // Both addresses are fresh (cold), so each sload costs 2100 gas
-        use arc_precompiles::helpers::PRECOMPILE_SLOAD_GAS_COST;
-
-        let db = CacheDB::new(EmptyDB::default());
-        let mut evm = create_test_evm(db, ArcHardforkFlags::with(&[ArcHardfork::Zero6]));
-
-        // Load native coin control account
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        let frame = FrameInit {
-            frame_input: FrameInput::Call(call_input(
-                CallScheme::Call,
-                U256::from(100),
-                ADDRESS_A,
-                ADDRESS_B,
-            )),
-            memory: SharedMemory::default(),
-            depth: 1,
-        };
-
-        let result = evm.before_frame_init(&frame).unwrap();
-        match result {
-            BeforeFrameInitResult::Log(_log, gas) => {
-                assert_eq!(
-                    gas,
-                    2 * PRECOMPILE_SLOAD_GAS_COST,
-                    "Two cold SLOADs should cost 2 * 2100 = 4200"
-                );
-            }
-            other => panic!("Expected Log result, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_blocklist_sload_gas_warm_access() {
-        // Pre-warm the blocklist slots, then call before_frame_init — should get warm pricing
-        let db = CacheDB::new(EmptyDB::default());
-        let mut evm = create_test_evm(db, ArcHardforkFlags::with(&[ArcHardfork::Zero6]));
-
-        // Load native coin control account
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        // Pre-warm the blocklist slots by reading them first
-        let slot_a = compute_is_blocklisted_storage_slot(ADDRESS_A).into();
-        let slot_b = compute_is_blocklisted_storage_slot(ADDRESS_B).into();
-        evm.inner
-            .ctx
-            .journal_mut()
-            .sload(NATIVE_COIN_CONTROL_ADDRESS, slot_a)
-            .unwrap();
-        evm.inner
-            .ctx
-            .journal_mut()
-            .sload(NATIVE_COIN_CONTROL_ADDRESS, slot_b)
-            .unwrap();
-
-        let frame = FrameInit {
-            frame_input: FrameInput::Call(call_input(
-                CallScheme::Call,
-                U256::from(100),
-                ADDRESS_A,
-                ADDRESS_B,
-            )),
-            memory: SharedMemory::default(),
-            depth: 1,
-        };
-
-        let result = evm.before_frame_init(&frame).unwrap();
-        match result {
-            BeforeFrameInitResult::Log(_log, gas) => {
-                // Warm SLOAD costs 100 gas each (EIP-2929)
-                assert_eq!(gas, 200, "Two warm SLOADs should cost 2 * 100 = 200");
-            }
-            other => panic!("Expected Log result, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_blocklist_sload_gas_zero_value_no_charge() {
-        // Zero-value calls should not perform any SLOADs (no blocklist check needed)
-        let db = CacheDB::new(EmptyDB::default());
-        let mut evm = create_test_evm(db, ArcHardforkFlags::with(&[ArcHardfork::Zero6]));
-
-        // Load native coin control account
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        // Zero-value CALL
-        let frame = FrameInit {
-            frame_input: FrameInput::Call(call_input(
-                CallScheme::Call,
-                U256::ZERO,
-                ADDRESS_A,
-                ADDRESS_B,
-            )),
-            memory: SharedMemory::default(),
-            depth: 1,
-        };
-
-        let result = evm.before_frame_init(&frame).unwrap();
-        assert!(
-            matches!(result, BeforeFrameInitResult::None),
-            "Zero-value call should return None (no SLOADs, no gas cost)"
-        );
-
-        // DelegateCall (no value transfer regardless)
-        let frame_delegate = FrameInit {
-            frame_input: FrameInput::Call(call_input(
-                CallScheme::DelegateCall,
-                U256::from(100),
-                ADDRESS_A,
-                ADDRESS_B,
-            )),
-            memory: SharedMemory::default(),
-            depth: 1,
-        };
-
-        let result = evm.before_frame_init(&frame_delegate).unwrap();
-        assert!(
-            matches!(result, BeforeFrameInitResult::None),
-            "DelegateCall should return None (no SLOADs, no gas cost)"
-        );
-    }
-
-    #[test]
-    fn test_blocklist_sload_gas_pre_zero6_always_fixed() {
-        // Pre-Zero6: always uses fixed 2100 per SLOAD regardless of warm/cold
-        use arc_precompiles::helpers::PRECOMPILE_SLOAD_GAS_COST;
-
-        let db = CacheDB::new(EmptyDB::default());
-        let mut evm = create_test_evm(db, ArcHardforkFlags::with(&[ArcHardfork::Zero5]));
-
-        // Load native coin control account
-        evm.ctx_mut()
-            .journal_mut()
-            .load_account(NATIVE_COIN_CONTROL_ADDRESS)
-            .unwrap();
-
-        // Pre-warm the slots
-        let slot_a = compute_is_blocklisted_storage_slot(ADDRESS_A).into();
-        let slot_b = compute_is_blocklisted_storage_slot(ADDRESS_B).into();
-        evm.inner
-            .ctx
-            .journal_mut()
-            .sload(NATIVE_COIN_CONTROL_ADDRESS, slot_a)
-            .unwrap();
-        evm.inner
-            .ctx
-            .journal_mut()
-            .sload(NATIVE_COIN_CONTROL_ADDRESS, slot_b)
-            .unwrap();
-
-        let frame = FrameInit {
-            frame_input: FrameInput::Call(call_input(
-                CallScheme::Call,
-                U256::from(100),
-                ADDRESS_A,
-                ADDRESS_B,
-            )),
-            memory: SharedMemory::default(),
-            depth: 1,
-        };
-
-        let result = evm.before_frame_init(&frame).unwrap();
-        match result {
-            BeforeFrameInitResult::Log(_log, gas) => {
-                // Pre-Zero6: always 2100 per SLOAD even when warm
-                assert_eq!(
-                    gas,
-                    2 * PRECOMPILE_SLOAD_GAS_COST,
-                    "Pre-Zero6 should always charge fixed 2100 per SLOAD"
-                );
-            }
-            other => panic!("Expected Log result, got {:?}", other),
-        }
-    }
-
     /// Guards against the static_gas regression introduced during the revm v29→v32 migration.
     /// revm v32 moved SELFDESTRUCT's 5000 base gas (EIP-150) from the instruction handler to
     /// the instruction table's static_gas field. Since Arc overrides the instruction entry via
@@ -2911,8 +3003,10 @@ mod tests {
         use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
         use revm_primitives::TxKind;
 
-        let chain_spec =
-            localdev_with_hardforks(&[(ArcHardfork::Zero3, 0), (ArcHardfork::Zero4, 0)]);
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+        ]);
         let sender = Address::repeat_byte(0x11);
         let contract = Address::repeat_byte(0xBB);
 
@@ -2975,9 +3069,9 @@ mod tests {
         use revm_primitives::TxKind;
 
         let chain_spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, 0),
-            (ArcHardfork::Zero4, 0),
-            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
         ]);
 
         let sender = Address::repeat_byte(0x11);
@@ -3080,7 +3174,7 @@ mod tests {
             .expect("selfdestruct");
 
         // 2. Prepare frame to transfer balance from ADDRESS_A to ADDRESS_B
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(Box::new(CallInputs {
                 scheme: CallScheme::Call,
                 target_address: ADDRESS_B,
@@ -3098,7 +3192,7 @@ mod tests {
         };
 
         // 3. Should revert on transferring to destructed account
-        let result = evm.before_frame_init(&frame);
+        let result = evm.before_frame_init(&mut frame);
         assert!(
             matches!(result, Ok(BeforeFrameInitResult::Reverted(_))),
             "expect revert on transferring to destructed account"
@@ -3205,28 +3299,29 @@ mod tests {
         }
 
         #[test]
-        fn registry_populated_when_zero6_active() {
-            let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero6]);
+        fn registry_populated_when_zero7_active() {
+            let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero7]);
             let registry = factory().build_subcall_registry(flags);
 
             assert!(
                 registry.get(&CALL_FROM_ADDRESS).is_some(),
-                "CallFrom should be registered when Zero6 is active"
+                "CallFrom should be registered when Zero7 is active"
             );
         }
 
         #[test]
-        fn registry_empty_when_zero6_not_active() {
+        fn registry_empty_when_zero7_not_active() {
             let flags = ArcHardforkFlags::with(&[
                 ArcHardfork::Zero3,
                 ArcHardfork::Zero4,
                 ArcHardfork::Zero5,
+                ArcHardfork::Zero6,
             ]);
             let registry = factory().build_subcall_registry(flags);
 
             assert!(
                 registry.get(&CALL_FROM_ADDRESS).is_none(),
-                "CallFrom should not be registered when Zero6 is inactive"
+                "CallFrom should not be registered when Zero7 is inactive"
             );
         }
 
@@ -3243,7 +3338,7 @@ mod tests {
 
         #[test]
         fn allowed_callers_include_memo_and_multicall3_from() {
-            let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero6]);
+            let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero7]);
             let registry = factory().build_subcall_registry(flags);
 
             let (_precompile, allowed_callers) = registry
@@ -3262,7 +3357,7 @@ mod tests {
 
         #[test]
         fn arbitrary_address_not_allowed() {
-            let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero6]);
+            let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero7]);
             let registry = factory().build_subcall_registry(flags);
 
             let (_precompile, allowed_callers) = registry
@@ -3273,6 +3368,32 @@ mod tests {
             assert!(
                 !allowed_callers.is_allowed(&rando),
                 "arbitrary address should not be an allowed caller"
+            );
+        }
+
+        #[test]
+        fn registry_follows_block_derived_hardfork_flags() {
+            use arc_execution_config::chainspec::localdev_with_hardforks;
+
+            let spec = localdev_with_hardforks(&[
+                (ArcHardfork::Zero3, ForkCondition::Block(0)),
+                (ArcHardfork::Zero4, ForkCondition::Block(0)),
+                (ArcHardfork::Zero5, ForkCondition::Block(0)),
+                (ArcHardfork::Zero6, ForkCondition::Block(0)),
+                (ArcHardfork::Zero7, ForkCondition::Block(10)),
+            ]);
+            let factory = ArcEvmFactory::new(spec.clone());
+
+            let pre = factory.build_subcall_registry(spec.get_hardfork_flags(9, 0));
+            assert!(
+                pre.get(&CALL_FROM_ADDRESS).is_none(),
+                "block 9: Zero7 not yet active"
+            );
+
+            let post = factory.build_subcall_registry(spec.get_hardfork_flags(10, 0));
+            assert!(
+                post.get(&CALL_FROM_ADDRESS).is_some(),
+                "block 10: Zero7 active"
             );
         }
     }
@@ -3333,6 +3454,21 @@ mod tests {
                 PUSH1, 0x00,
                 REVERT,
             ];
+            Bytes::from(code)
+        }
+
+        /// Returns EVM bytecode that always reverts with the given 4-byte payload.
+        fn reverting_with_payload_bytecode(payload: [u8; 4]) -> Bytes {
+            let mut code = vec![PUSH4];
+            code.extend_from_slice(&payload);
+            #[rustfmt::skip]
+            code.extend_from_slice(&[
+                PUSH1, 0x00,
+                MSTORE,
+                PUSH1, 0x04,
+                PUSH1, 0x1c,
+                REVERT,
+            ]);
             Bytes::from(code)
         }
 
@@ -3423,6 +3559,13 @@ mod tests {
 
         // ----- Setup helpers -----
 
+        type NoOpTestEvm = ArcEvm<
+            EthEvmContext<InMemoryDB>,
+            revm::inspector::NoOpInspector,
+            EthInstructions<EthInterpreter, EthEvmContext<InMemoryDB>>,
+            PrecompilesMap,
+        >;
+
         /// Creates an ArcEvm backed by an in-memory DB with accounts and deployed contracts.
         ///
         /// `accounts`: list of `(address, balance)` pairs for EOAs.
@@ -3433,12 +3576,7 @@ mod tests {
             accounts: &[(Address, U256)],
             contracts: &[(Address, Bytes)],
             call_from_allowlist: &[Address],
-        ) -> ArcEvm<
-            EthEvmContext<InMemoryDB>,
-            revm::inspector::NoOpInspector,
-            EthInstructions<EthInterpreter, EthEvmContext<InMemoryDB>>,
-            PrecompilesMap,
-        > {
+        ) -> NoOpTestEvm {
             use crate::subcall::AllowedCallers;
             use crate::subcall_test::{SubcallTestPrecompile, SUBCALL_TEST_ADDRESS};
 
@@ -3473,7 +3611,7 @@ mod tests {
 
             let spec =
                 reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
-            let hardfork_flags = chain_spec.get_hardfork_flags(0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
             let mut cfg_env = revm::context::CfgEnv::new()
                 .with_chain_id(chain_spec.chain_id())
                 .with_spec_and_mainnet_gas_params(spec);
@@ -3483,7 +3621,7 @@ mod tests {
                 .with_cfg(cfg_env)
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
-            let mut instruction = EthInstructions::default();
+            let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
             if hardfork_flags.is_active(ArcHardfork::Zero5) {
                 instruction.insert_instruction(
                     SELFDESTRUCT,
@@ -3516,6 +3654,22 @@ mod tests {
             )
         }
 
+        fn insert_eip7702_account(evm: &mut NoOpTestEvm, address: Address, delegate: Address) {
+            use revm::bytecode::eip7702::Eip7702Bytecode;
+
+            let eip7702_code = Bytecode::Eip7702(Arc::new(Eip7702Bytecode::new(delegate)));
+            evm.inner.ctx.journal_mut().db_mut().insert_account_info(
+                address,
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 1,
+                    code_hash: keccak256(eip7702_code.bytes_slice()),
+                    code: Some(eip7702_code),
+                    account_id: None,
+                },
+            );
+        }
+
         // ----- Test addresses -----
 
         const EOA: Address = address!("e000000000000000000000000000000000000001");
@@ -3524,6 +3678,7 @@ mod tests {
         const REVERT_CONTRACT: Address = address!("c000000000000000000000000000000000000003");
         const CALLER_CONTRACT: Address = address!("c000000000000000000000000000000000000004");
         const WRAPPER_INNER: Address = address!("c000000000000000000000000000000000000005");
+        const SPOOFED_SENDER: Address = address!("a000000000000000000000000000000000000001");
 
         // ----- Integration tests -----
 
@@ -3812,7 +3967,7 @@ mod tests {
 
             let spec =
                 reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
-            let hardfork_flags = chain_spec.get_hardfork_flags(0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
             let mut cfg_env = revm::context::CfgEnv::new()
                 .with_chain_id(chain_spec.chain_id())
                 .with_spec_and_mainnet_gas_params(spec);
@@ -3822,7 +3977,7 @@ mod tests {
                 .with_cfg(cfg_env)
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
-            let mut instruction = EthInstructions::default();
+            let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
             if hardfork_flags.is_active(ArcHardfork::Zero5) {
                 instruction.insert_instruction(
                     SELFDESTRUCT,
@@ -4318,6 +4473,69 @@ mod tests {
                 .map(|a| a.info.balance)
                 .unwrap_or(U256::ZERO);
             assert_eq!(b_balance, U256::ZERO, "contract B should have zero balance");
+        }
+
+        /// STATICCALL → INNER → CALL CallFrom propagates `is_static=true` to the inner
+        /// CALL frame (scheme stays `Call`). The subcall framework must reject it and
+        /// consume all caller gas, matching upstream `CallNotAllowedInsideStatic` halt
+        /// semantics and the standard precompile `check_staticcall` helper.
+        #[test]
+        fn test_call_from_is_static_propagated_consumes_all_gas() {
+            let outer_code = static_call_wrapper_bytecode(WRAPPER_INNER);
+            let inner_code = wrapper_call_bytecode(CALL_FROM_ADDRESS);
+            let echo_code = echo_double_bytecode();
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(10_000_000))],
+                &[
+                    (WRAPPER, outer_code),
+                    (WRAPPER_INNER, inner_code),
+                    (ECHO_CONTRACT, echo_code),
+                ],
+                &[WRAPPER_INNER],
+            );
+
+            let inner_calldata = U256::from(42).to_be_bytes::<32>().to_vec();
+            let call_from_input = encode_call_from_input(EOA, ECHO_CONTRACT, &inner_calldata);
+
+            let gas_limit: u64 = 1_000_000;
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(WRAPPER),
+                value: U256::ZERO,
+                gas_limit,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("transact_one should succeed");
+            let (output, gas_used) = match &result {
+                ExecutionResult::Success {
+                    output, gas_used, ..
+                } => (output, *gas_used),
+                other => panic!("expected Success (wrapper catches revert), got {other:?}"),
+            };
+
+            assert_eq!(
+                decode_revert_reason(output.data()),
+                "subcall precompiles cannot be invoked in static context",
+            );
+
+            // The inner CALL forwards (almost) all remaining gas to CallFrom; the static
+            // rejection consumes all of it. EIP-150 retains 1/64 of the caller's gas at
+            // each CALL/STATICCALL boundary; with two nested boundaries the unavoidable
+            // upper bound on retained gas is 1/64 + (1/64)·(63/64) ≈ 3.1%, so gas_used
+            // must exceed ~96.9% of the limit. The 95% threshold leaves a thin buffer
+            // for wrapper bookkeeping; tightening it on a future cost change is desirable
+            // — a regression to the old flat-100-gas behavior would drop gas_used by an
+            // order of magnitude (to ~5% of the limit).
+            assert!(
+                gas_used > gas_limit * 95 / 100,
+                "expected gas_used > 95% of limit (all gas consumed by static rejection); \
+                 got gas_used={gas_used} of gas_limit={gas_limit}",
+            );
         }
 
         /// Nested callFrom targeting the CallFrom precompile address itself. The child frame
@@ -4975,7 +5193,7 @@ mod tests {
 
             let spec =
                 reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
-            let hardfork_flags = chain_spec.get_hardfork_flags(0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
             let mut cfg_env = revm::context::CfgEnv::new()
                 .with_chain_id(chain_spec.chain_id())
                 .with_spec_and_mainnet_gas_params(spec);
@@ -4984,7 +5202,7 @@ mod tests {
                 .with_cfg(cfg_env)
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
-            let mut instruction = EthInstructions::default();
+            let mut instruction = EthInstructions::new_mainnet_with_spec(spec);
             if hardfork_flags.is_active(ArcHardfork::Zero5) {
                 instruction.insert_instruction(
                     SELFDESTRUCT,
@@ -5475,6 +5693,308 @@ mod tests {
             );
         }
 
+        // ================================================================
+        // EIP-7702 delegation tests
+        // ================================================================
+
+        /// CallFrom targeting an EIP-7702 delegated account executes the delegate's code.
+        /// DELEGATED_EOA has delegation → ECHO_CONTRACT, so calling it runs echo_double.
+        #[test]
+        fn test_call_from_eip7702_delegation() {
+            const DELEGATED_EOA: Address = address!("d000000000000000000000000000000000000001");
+
+            let contract_a_code = wrapper_call_bytecode(CALL_FROM_ADDRESS);
+            let echo_code = echo_double_bytecode();
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(WRAPPER, contract_a_code), (ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            // Insert EIP-7702 delegated account: DELEGATED_EOA delegates to ECHO_CONTRACT
+            insert_eip7702_account(&mut evm, DELEGATED_EOA, ECHO_CONTRACT);
+
+            // EOA → WRAPPER → CallFrom(sender=EOA, target=DELEGATED_EOA, data=abi(42))
+            // DELEGATED_EOA has delegation to ECHO_CONTRACT, so echo_double(42) = 84
+            let inner_calldata = U256::from(42).to_be_bytes::<32>().to_vec();
+            let call_from_input = encode_call_from_input(EOA, DELEGATED_EOA, &inner_calldata);
+
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("transact_one should succeed");
+            match &result {
+                ExecutionResult::Success { output, .. } => {
+                    let (success, return_data) = decode_call_from_output(output.data());
+                    assert!(success, "callFrom should report child success");
+                    let expected = U256::from(84).to_be_bytes::<32>();
+                    assert_eq!(
+                        return_data, expected,
+                        "should get echo_double(42) = 84 via delegation"
+                    );
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+
+        /// SubcallTestPrecompile targeting an EIP-7702 delegated account executes the
+        /// delegate's code. DELEGATED_EOA delegates to ECHO_CONTRACT, so the subcall
+        /// test precompile calling it should run echo_double.
+        #[test]
+        fn test_subcall_eip7702_delegation() {
+            use crate::subcall_test::SUBCALL_TEST_ADDRESS;
+
+            const DELEGATED_EOA: Address = address!("d000000000000000000000000000000000000001");
+
+            let wrapper_code = wrapper_call_bytecode(SUBCALL_TEST_ADDRESS);
+            let echo_code = echo_double_bytecode();
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(WRAPPER, wrapper_code), (ECHO_CONTRACT, echo_code)],
+                &[],
+            );
+
+            // Insert EIP-7702 delegated account: DELEGATED_EOA delegates to ECHO_CONTRACT
+            insert_eip7702_account(&mut evm, DELEGATED_EOA, ECHO_CONTRACT);
+
+            // EOA → WRAPPER → SubcallTest(target=DELEGATED_EOA, data=abi(21))
+            let inner_calldata = U256::from(21).to_be_bytes::<32>().to_vec();
+            let subcall_input = encode_subcall_test_input(DELEGATED_EOA, &inner_calldata);
+
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: subcall_input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("transact_one should succeed");
+            match &result {
+                ExecutionResult::Success { output, .. } => {
+                    let child_output =
+                        <alloy_sol_types::sol_data::Bytes as SolType>::abi_decode(output.data())
+                            .expect("should decode bytes wrapper");
+                    // echo_double(21) → 42
+                    let expected = U256::from(42).to_be_bytes::<32>();
+                    assert_eq!(
+                        child_output.as_ref(),
+                        &expected,
+                        "should get echo_double(21) = 42 via delegation"
+                    );
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+
+        /// CallFrom targeting an EIP-7702 delegated account whose delegate reverts.
+        /// DELEGATED_EOA delegates to REVERT_CONTRACT — the revert should propagate
+        /// correctly through CallFrom's (success=false) return value.
+        #[test]
+        fn test_call_from_eip7702_delegation_to_reverting_contract() {
+            const DELEGATED_EOA: Address = address!("d000000000000000000000000000000000000001");
+            const REVERT_PAYLOAD: [u8; 4] = [0xca, 0xfe, 0xba, 0xbe];
+
+            let contract_a_code = wrapper_call_bytecode(CALL_FROM_ADDRESS);
+            let revert_code = reverting_with_payload_bytecode(REVERT_PAYLOAD);
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(WRAPPER, contract_a_code), (REVERT_CONTRACT, revert_code)],
+                &[WRAPPER],
+            );
+
+            // Insert EIP-7702 delegated account: DELEGATED_EOA delegates to REVERT_CONTRACT
+            insert_eip7702_account(&mut evm, DELEGATED_EOA, REVERT_CONTRACT);
+
+            // EOA → WRAPPER → CallFrom(sender=EOA, target=DELEGATED_EOA, data=<empty>)
+            let call_from_input = encode_call_from_input(EOA, DELEGATED_EOA, &[]);
+
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("transact_one should succeed");
+            match &result {
+                ExecutionResult::Success { output, .. } => {
+                    let (success, return_data) = decode_call_from_output(output.data());
+                    assert!(
+                        !success,
+                        "callFrom should report child failure (delegate reverts)"
+                    );
+                    assert_eq!(
+                        return_data.as_slice(),
+                        REVERT_PAYLOAD.as_slice(),
+                        "callFrom should propagate the delegate's revert payload"
+                    );
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+
+        /// If EIP-7702 target resolution succeeds but the cold delegate load is OOG,
+        /// the delegate must stay cold. Otherwise an attacker could warm the delegate as
+        /// a side-effect of an insufficient-gas subcall.
+        #[test]
+        fn test_call_from_eip7702_delegate_oog_does_not_warm_delegate() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+
+            const DELEGATED_EOA: Address = address!("d000000000000000000000000000000000000001");
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+            insert_eip7702_account(&mut evm, DELEGATED_EOA, ECHO_CONTRACT);
+
+            evm.ctx_mut().journal_mut().clear();
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = Vec::new();
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: DELEGATED_EOA,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let gas_limit = abi_decode_gas(child_data.len())
+                .checked_add(COLD_ACCOUNT_ACCESS_COST)
+                .and_then(|gas| gas.checked_add(COLD_ACCOUNT_ACCESS_COST))
+                .and_then(|gas| gas.checked_sub(1))
+                .expect("test gas calculation should not overflow");
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should return OOG, not DB error");
+
+            match result {
+                ItemOrResult::Result(FrameResult::Call(outcome)) => {
+                    assert_eq!(outcome.result.result, InstructionResult::OutOfGas);
+                    assert_eq!(
+                        outcome.result.gas.spent(),
+                        gas_limit,
+                        "OOG should consume the whole subcall gas budget"
+                    );
+                }
+                other => panic!("expected immediate OOG result, got {other:?}"),
+            }
+            assert!(
+                evm.subcall_continuations.is_empty(),
+                "OOG before child dispatch should not store any continuation"
+            );
+
+            let target_probe = evm
+                .ctx_mut()
+                .journal_mut()
+                .load_account_info_skip_cold_load(DELEGATED_EOA, true, true);
+            assert!(
+                target_probe.is_ok(),
+                "target account should be warm after successful target resolution"
+            );
+
+            let delegate_probe = evm
+                .ctx_mut()
+                .journal_mut()
+                .load_account_info_skip_cold_load(ECHO_CONTRACT, true, true);
+            assert!(
+                matches!(delegate_probe, Err(JournalLoadError::ColdLoadSkipped)),
+                "delegate account should remain cold when delegate resolution is OOG"
+            );
+        }
+
+        // ================================================================
+        // tx.origin sender validation tests
+        // ================================================================
+
+        /// EOA → WRAPPER → callFrom(sender=SPOOFED_SENDER, target=ECHO, data)
+        /// SPOOFED_SENDER is neither tx.origin (EOA) nor the actual caller (WRAPPER),
+        /// so the sender validation rejects it.
+        #[test]
+        fn test_call_from_contract_sender_spoofing_rejected() {
+            let contract_a_code = wrapper_call_bytecode(CALL_FROM_ADDRESS);
+            let contract_b_code = echo_double_bytecode();
+            const CONTRACT_A: Address = WRAPPER;
+            const CONTRACT_B: Address = ECHO_CONTRACT;
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(CONTRACT_A, contract_a_code), (CONTRACT_B, contract_b_code)],
+                &[CONTRACT_A],
+            );
+
+            let inner_calldata = U256::from(42).to_be_bytes::<32>().to_vec();
+            let call_from_input =
+                encode_call_from_input(SPOOFED_SENDER, CONTRACT_B, &inner_calldata);
+
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_A),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("transact_one should succeed");
+            match &result {
+                ExecutionResult::Success { output, .. } => {
+                    let reason = decode_revert_reason(output.data());
+                    assert_eq!(reason, "sender spoofing requires tx.origin as sender");
+                }
+                other => panic!("expected Success (wrapper catches revert), got {other:?}"),
+            }
+        }
+
         /// complete_subcall error should consume all gas allocated to the subcall.
         #[test]
         fn test_complete_subcall_error_consumes_all_gas() {
@@ -5521,7 +6041,7 @@ mod tests {
 
             let spec =
                 reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
-            let hardfork_flags = chain_spec.get_hardfork_flags(0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
             let mut cfg_env = revm::context::CfgEnv::new()
                 .with_chain_id(chain_spec.chain_id())
                 .with_spec_and_mainnet_gas_params(spec);
@@ -5531,7 +6051,7 @@ mod tests {
                 .with_cfg(cfg_env)
                 .with_block(BlockEnv::default());
             let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
-            let instruction = EthInstructions::default();
+            let instruction = EthInstructions::new_mainnet_with_spec(spec);
 
             let mut registry = SubcallRegistry::new();
             registry.register(
@@ -5602,6 +6122,1656 @@ mod tests {
                  normal path ({gas_used_normal}) because all subcall gas is consumed"
             );
         }
+
+        /// Bytecode: SSTORE(slot=0, value=42) then RETURN. Used to verify state revert.
+        fn sstore_42_bytecode() -> Bytes {
+            #[rustfmt::skip]
+            let code = vec![
+                PUSH1, 42,        // value = 42
+                PUSH1, 0x00,      // slot = 0
+                SSTORE,           // SSTORE(0, 42)
+                PUSH1, 0x00,
+                PUSH1, 0x00,
+                RETURN,           // RETURN(0, 0)
+            ];
+            Bytes::from(code)
+        }
+
+        /// Bytecode: SSTORE(slot=0, value=42), burn most remaining gas, then RETURN.
+        ///
+        /// Used to force completion accounting to exceed the caller's retained gas while
+        /// keeping the child frame successful.
+        fn sstore_42_then_drain_gas_bytecode() -> Bytes {
+            #[rustfmt::skip]
+            let code = vec![
+                PUSH1, 42,        // value = 42
+                PUSH1, 0x00,      // slot = 0
+                SSTORE,           // SSTORE(0, 42)
+                JUMPDEST,         // offset 5
+                GAS,
+                PUSH2, 0x00, 0x40, // stop once gasleft <= 64
+                LT,               // 64 < gasleft
+                PUSH1, 0x05,
+                JUMPI,
+                PUSH1, 0x00,
+                PUSH1, 0x00,
+                RETURN,           // RETURN(0, 0)
+            ];
+            Bytes::from(code)
+        }
+
+        /// Bytecode: burn most remaining gas, then REVERT.
+        ///
+        /// Used to force completion accounting to exceed the caller's retained gas while
+        /// keeping the child result in the EVM revert class (not a halt).
+        fn drain_gas_then_revert_bytecode() -> Bytes {
+            #[rustfmt::skip]
+            let code = vec![
+                JUMPDEST,         // offset 0
+                GAS,
+                PUSH2, 0x00, 0x40, // stop once gasleft <= 64
+                LT,               // 64 < gasleft
+                PUSH1, 0x00,
+                JUMPI,
+                PUSH1, 0x00,
+                PUSH1, 0x00,
+                REVERT,           // REVERT(0, 0)
+            ];
+            Bytes::from(code)
+        }
+
+        /// Control: the gas-draining child bytecode must be capable of persisting its
+        /// SSTORE when completion accounting does not OOG.
+        #[test]
+        fn test_sstore_drain_child_persists_without_excessive_completion_gas() {
+            let sstore_drain_code = sstore_42_then_drain_gas_bytecode();
+            const STORAGE_CONTRACT: Address = address!("c000000000000000000000000000000000000021");
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(STORAGE_CONTRACT, sstore_drain_code)],
+                &[],
+            );
+
+            let input = encode_subcall_test_input(STORAGE_CONTRACT, &[]);
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(SUBCALL_TEST_ADDRESS),
+                value: U256::ZERO,
+                gas_limit: 100_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input,
+                ..Default::default()
+            });
+
+            let result_and_state = evm.replay().expect("replay should succeed");
+            assert!(
+                result_and_state.result.is_success(),
+                "normal completion should let the direct subcall tx succeed: {:?}",
+                result_and_state.result,
+            );
+
+            let storage_account = result_and_state
+                .state
+                .get(&STORAGE_CONTRACT)
+                .expect("storage contract should have a state diff");
+            let slot_value = storage_account
+                .storage
+                .get(&U256::ZERO)
+                .map(|s| s.present_value)
+                .unwrap_or(U256::ZERO);
+            assert_eq!(
+                slot_value,
+                U256::from(42),
+                "control child bytecode should persist SSTORE(0, 42)"
+            );
+        }
+
+        /// Completion accounting that exceeds the subcall gas limit must make the
+        /// subcall fail with OOG and revert successful child state changes.
+        #[test]
+        fn test_complete_subcall_completion_oog_reverts_successful_child_state() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                ExcessiveCompleteSubcallPrecompile, EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+            };
+
+            let wrapper_code = wrapper_call_bytecode(EXCESSIVE_COMPLETE_SUBCALL_ADDRESS);
+            let sstore_drain_code = sstore_42_then_drain_gas_bytecode();
+            const CONTRACT_WRAPPER: Address = WRAPPER;
+            const STORAGE_CONTRACT: Address = address!("c000000000000000000000000000000000000021");
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[
+                    (CONTRACT_WRAPPER, wrapper_code),
+                    (STORAGE_CONTRACT, sstore_drain_code),
+                ],
+                &[],
+            );
+
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(ExcessiveCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+            evm.subcall_registry = Arc::new(registry);
+
+            let input = encode_subcall_test_input(STORAGE_CONTRACT, &[]);
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 100_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input,
+                ..Default::default()
+            });
+
+            let result_and_state = evm.replay().expect("replay should succeed");
+            assert!(
+                result_and_state.result.is_success(),
+                "wrapper should succeed after catching the inner OOG: {:?}",
+                result_and_state.result,
+            );
+
+            let ExecutionResult::Success { output, .. } = &result_and_state.result else {
+                panic!("expected successful wrapper result");
+            };
+            assert!(
+                output.data().is_empty(),
+                "inner completion OOG should not return successful subcall returndata"
+            );
+
+            let storage_account = result_and_state
+                .state
+                .get(&STORAGE_CONTRACT)
+                .expect("storage contract should appear in state diff (child did execute)");
+            let slot_value = storage_account
+                .storage
+                .get(&U256::ZERO)
+                .map(|s| s.present_value)
+                .unwrap_or(U256::ZERO);
+            assert_eq!(
+                slot_value,
+                U256::ZERO,
+                "child's SSTORE(0, 42) should have been reverted after completion OOG"
+            );
+        }
+
+        /// Completion accounting that exceeds the subcall gas limit must OOG even
+        /// when the child result is a revert rather than a halt.
+        #[test]
+        fn test_complete_subcall_child_revert_excessive_completion_gas_oogs() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                ExcessiveCompleteSubcallPrecompile, EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+            };
+
+            const REVERT_DRAINER: Address = address!("c000000000000000000000000000000000000022");
+            let revert_drainer_code = drain_gas_then_revert_bytecode();
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(REVERT_DRAINER, revert_drainer_code)],
+                &[],
+            );
+
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(ExcessiveCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+            evm.subcall_registry = Arc::new(registry);
+
+            let input = encode_subcall_test_input(REVERT_DRAINER, &[]);
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(EXCESSIVE_COMPLETE_SUBCALL_ADDRESS),
+                value: U256::ZERO,
+                gas_limit: 100_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("tx should execute");
+            match result {
+                ExecutionResult::Halt { reason, .. } => {
+                    assert!(
+                        matches!(reason, HaltReason::OutOfGas(_)),
+                        "excessive child-revert completion gas should OOG"
+                    );
+                }
+                other => panic!("expected direct subcall tx to halt OOG, got {other:?}"),
+            }
+        }
+
+        /// Completion gas must also be accounted when the child halts. Calling the
+        /// subcall precompile directly lets the top-level result distinguish OOG from
+        /// a normal completion revert.
+        #[test]
+        fn test_complete_subcall_child_halt_excessive_completion_gas_oogs() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                ExcessiveCompleteSubcallPrecompile, EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+            };
+
+            const GAS_BURNER: Address = address!("c000000000000000000000000000000000000006");
+            let gas_burner_code = gas_burner_bytecode();
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(GAS_BURNER, gas_burner_code)],
+                &[],
+            );
+
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(ExcessiveCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+            evm.subcall_registry = Arc::new(registry);
+
+            let input = encode_subcall_test_input(GAS_BURNER, &[]);
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(EXCESSIVE_COMPLETE_SUBCALL_ADDRESS),
+                value: U256::ZERO,
+                gas_limit: 100_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("tx should execute");
+            match result {
+                ExecutionResult::Halt { reason, .. } => {
+                    assert!(
+                        matches!(reason, HaltReason::OutOfGas(_)),
+                        "excessive child-halt completion gas should OOG"
+                    );
+                }
+                other => panic!("expected direct subcall tx to halt OOG, got {other:?}"),
+            }
+        }
+
+        /// Nonzero completion gas on a halted child should preserve the existing
+        /// full-allocation burn behavior when the completion gas fits in retained gas.
+        #[test]
+        fn test_complete_subcall_child_halt_completion_gas_fits_reverts() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                CostlyCompleteSubcallPrecompile, COSTLY_COMPLETE_SUBCALL_ADDRESS,
+            };
+
+            const GAS_BURNER: Address = address!("c000000000000000000000000000000000000006");
+            let gas_burner_code = gas_burner_bytecode();
+
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(GAS_BURNER, gas_burner_code)],
+                &[],
+            );
+
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                COSTLY_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(CostlyCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+            evm.subcall_registry = Arc::new(registry);
+
+            let input = encode_subcall_test_input(GAS_BURNER, &[]);
+            let gas_limit = 100_000;
+            let tx = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(COSTLY_COMPLETE_SUBCALL_ADDRESS),
+                value: U256::ZERO,
+                gas_limit,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input,
+                ..Default::default()
+            };
+
+            let result = evm.transact_one(tx).expect("tx should execute");
+            match result {
+                ExecutionResult::Revert { gas_used, output } => {
+                    assert_eq!(
+                        gas_used, gas_limit,
+                        "halted child with fitting completion gas should burn the full subcall allocation"
+                    );
+                    assert!(
+                        output.is_empty(),
+                        "halted child should return empty revert data"
+                    );
+                }
+                other => panic!("expected direct subcall tx to revert, got {other:?}"),
+            }
+        }
+
+        /// Exact gas accounting boundary: gas_used == gas_limit succeeds, but
+        /// gas_used == gas_limit + 1 OOGs.
+        #[test]
+        fn test_complete_subcall_completion_gas_exact_boundary() {
+            use arc_precompiles::subcall::{
+                SubcallCompletionResult, SubcallContinuationData, SubcallError, SubcallInitResult,
+                SubcallPrecompile,
+            };
+
+            #[derive(Debug)]
+            struct FixedCompleteSubcallPrecompile {
+                completion_gas: u64,
+                success: bool,
+            }
+
+            impl SubcallPrecompile for FixedCompleteSubcallPrecompile {
+                fn init_subcall(
+                    &self,
+                    _inputs: &CallInputs,
+                ) -> Result<SubcallInitResult, SubcallError> {
+                    unreachable!("test calls complete_subcall directly")
+                }
+
+                fn complete_subcall(
+                    &self,
+                    _continuation_data: SubcallContinuationData,
+                    _child_result: &FrameResult,
+                ) -> Result<SubcallCompletionResult, SubcallError> {
+                    Ok(SubcallCompletionResult {
+                        output: Bytes::new(),
+                        success: self.success,
+                        gas_overhead: self.completion_gas,
+                    })
+                }
+            }
+
+            fn run_with_gas_limit(
+                gas_limit: u64,
+                child_instruction_result: InstructionResult,
+                child_gas_spent: u64,
+                completion_success: bool,
+            ) -> FrameResult {
+                let mut evm = setup_test_evm(&[(EOA, U256::from(1_000_000))], &[], &[]);
+                let checkpoint = evm.inner.ctx.journal_mut().checkpoint();
+                evm.inner.ctx.journal_mut().checkpoint_commit();
+
+                let mut child_gas = Gas::new(10);
+                assert!(child_gas.record_cost(child_gas_spent));
+                let child_result = FrameResult::Call(CallOutcome {
+                    result: InterpreterResult::new(
+                        child_instruction_result,
+                        Bytes::new(),
+                        child_gas,
+                    ),
+                    memory_offset: 0..0,
+                    was_precompile_called: false,
+                    precompile_call_logs: Default::default(),
+                });
+
+                evm.complete_subcall(
+                    child_result,
+                    SubcallContinuation {
+                        precompile: Arc::new(FixedCompleteSubcallPrecompile {
+                            completion_gas: 5,
+                            success: completion_success,
+                        }),
+                        gas_limit,
+                        init_subcall_gas_overhead: 3,
+                        return_memory_offset: 0..0,
+                        continuation_data: SubcallContinuationData {
+                            state: Box::new(()),
+                        },
+                        checkpoint,
+                    },
+                )
+                .expect("complete_subcall should not hit db errors")
+            }
+
+            let FrameResult::Call(exact_outcome) =
+                run_with_gas_limit(12, InstructionResult::Return, 4, true)
+            else {
+                panic!("expected call outcome for exact-fit case");
+            };
+            assert_eq!(
+                exact_outcome.result.result,
+                InstructionResult::Return,
+                "exact gas fit should not OOG"
+            );
+            assert_eq!(
+                exact_outcome.result.gas.spent(),
+                12,
+                "exact gas fit should spend the metered gas"
+            );
+
+            let FrameResult::Call(oog_outcome) =
+                run_with_gas_limit(11, InstructionResult::Return, 4, true)
+            else {
+                panic!("expected call outcome for OOG case");
+            };
+            assert_eq!(
+                oog_outcome.result.result,
+                InstructionResult::OutOfGas,
+                "one gas below metered cost should OOG"
+            );
+            assert_eq!(
+                oog_outcome.result.gas.spent(),
+                11,
+                "OOG should spend the full subcall gas limit"
+            );
+
+            let FrameResult::Call(halted_exact_outcome) =
+                run_with_gas_limit(18, InstructionResult::OutOfGas, 10, false)
+            else {
+                panic!("expected call outcome for halted exact-fit case");
+            };
+            assert_eq!(
+                halted_exact_outcome.result.result,
+                InstructionResult::Revert,
+                "halted child with exact gas fit should not OOG"
+            );
+            assert_eq!(
+                halted_exact_outcome.result.gas.spent(),
+                18,
+                "halted exact gas fit should spend the metered gas"
+            );
+
+            let FrameResult::Call(halted_oog_outcome) =
+                run_with_gas_limit(17, InstructionResult::OutOfGas, 10, false)
+            else {
+                panic!("expected call outcome for halted OOG case");
+            };
+            assert_eq!(
+                halted_oog_outcome.result.result,
+                InstructionResult::OutOfGas,
+                "halted child one gas below metered cost should OOG"
+            );
+            assert_eq!(
+                halted_oog_outcome.result.gas.spent(),
+                17,
+                "halted OOG should spend the full subcall gas limit"
+            );
+        }
+
+        /// CS-ARC-PC-026: When `complete_subcall` rejects a successful child (returns
+        /// `success: false`), the child's committed state changes must be reverted.
+        #[test]
+        fn test_complete_subcall_rejects_successful_child_reverts_state() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                RejectingCompleteSubcallPrecompile, REJECTING_COMPLETE_SUBCALL_ADDRESS,
+            };
+
+            let wrapper_code = wrapper_call_bytecode(REJECTING_COMPLETE_SUBCALL_ADDRESS);
+            let sstore_code = sstore_42_bytecode();
+            const CONTRACT_WRAPPER: Address = WRAPPER;
+            const STORAGE_CONTRACT: Address = address!("c000000000000000000000000000000000000020");
+
+            let chain_spec = LOCAL_DEV.clone();
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                EOA,
+                AccountInfo {
+                    balance: U256::from(1_000_000),
+                    nonce: 0,
+                    code_hash: alloy_primitives::KECCAK256_EMPTY,
+                    code: None,
+                    account_id: None,
+                },
+            );
+            for (addr, code) in [
+                (CONTRACT_WRAPPER, wrapper_code),
+                (STORAGE_CONTRACT, sstore_code),
+            ] {
+                db.insert_account_info(
+                    addr,
+                    AccountInfo {
+                        balance: U256::ZERO,
+                        nonce: 1,
+                        code_hash: keccak256(&code),
+                        code: Some(Bytecode::new_raw(code)),
+                        account_id: None,
+                    },
+                );
+            }
+
+            let spec =
+                reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
+            let mut cfg_env = revm::context::CfgEnv::new()
+                .with_chain_id(chain_spec.chain_id())
+                .with_spec_and_mainnet_gas_params(spec);
+            cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+            let ctx = EthEvmContext::new(db, spec)
+                .with_cfg(cfg_env)
+                .with_block(BlockEnv::default());
+            let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
+            let instruction = EthInstructions::new_mainnet_with_spec(spec);
+
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                REJECTING_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(RejectingCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+
+            let mut evm = ArcEvm::new(
+                ctx,
+                revm::inspector::NoOpInspector {},
+                precompiles,
+                instruction,
+                false,
+                hardfork_flags,
+                Arc::new(registry),
+            );
+
+            // Call wrapper → RejectingCompleteSubcallPrecompile → STORAGE_CONTRACT
+            // The child (STORAGE_CONTRACT) writes SSTORE(0, 42) and succeeds.
+            // But complete_subcall returns success: false, so the child's state must revert.
+            let input = encode_subcall_test_input(STORAGE_CONTRACT, &[]);
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input,
+                ..Default::default()
+            });
+
+            let result_and_state = evm.replay().expect("replay should succeed");
+
+            // The wrapper catches the revert from the precompile, so outer tx succeeds.
+            assert!(
+                result_and_state.result.is_success(),
+                "wrapper should succeed (it catches inner revert): {:?}",
+                result_and_state.result,
+            );
+
+            // The child's SSTORE(0, 42) must have been reverted. Check that STORAGE_CONTRACT
+            // either has no entry in the state diff or has slot 0 unchanged.
+            let storage_account = result_and_state.state.get(&STORAGE_CONTRACT);
+            if let Some(account) = storage_account {
+                let slot_value = account
+                    .storage
+                    .get(&U256::ZERO)
+                    .map(|s| s.present_value)
+                    .unwrap_or(U256::ZERO);
+                assert_eq!(
+                    slot_value,
+                    U256::ZERO,
+                    "child's SSTORE(0, 42) should have been reverted, but slot 0 = {slot_value}"
+                );
+            }
+            // If STORAGE_CONTRACT isn't in state at all, that's also correct (no writes persisted)
+        }
+
+        /// CS-ARC-PC-026: Same as above but for the `Err` path from `complete_subcall`.
+        #[test]
+        fn test_complete_subcall_error_reverts_successful_child_state() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                FailingCompleteSubcallPrecompile, FAILING_COMPLETE_SUBCALL_ADDRESS,
+            };
+
+            let wrapper_code = wrapper_call_bytecode(FAILING_COMPLETE_SUBCALL_ADDRESS);
+            let sstore_code = sstore_42_bytecode();
+            const CONTRACT_WRAPPER: Address = WRAPPER;
+            const STORAGE_CONTRACT: Address = address!("c000000000000000000000000000000000000020");
+
+            let chain_spec = LOCAL_DEV.clone();
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                EOA,
+                AccountInfo {
+                    balance: U256::from(1_000_000),
+                    nonce: 0,
+                    code_hash: alloy_primitives::KECCAK256_EMPTY,
+                    code: None,
+                    account_id: None,
+                },
+            );
+            for (addr, code) in [
+                (CONTRACT_WRAPPER, wrapper_code),
+                (STORAGE_CONTRACT, sstore_code),
+            ] {
+                db.insert_account_info(
+                    addr,
+                    AccountInfo {
+                        balance: U256::ZERO,
+                        nonce: 1,
+                        code_hash: keccak256(&code),
+                        code: Some(Bytecode::new_raw(code)),
+                        account_id: None,
+                    },
+                );
+            }
+
+            let spec =
+                reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
+            let mut cfg_env = revm::context::CfgEnv::new()
+                .with_chain_id(chain_spec.chain_id())
+                .with_spec_and_mainnet_gas_params(spec);
+            cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+            let ctx = EthEvmContext::new(db, spec)
+                .with_cfg(cfg_env)
+                .with_block(BlockEnv::default());
+            let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
+            let instruction = EthInstructions::new_mainnet_with_spec(spec);
+
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                FAILING_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(FailingCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+
+            let mut evm = ArcEvm::new(
+                ctx,
+                revm::inspector::NoOpInspector {},
+                precompiles,
+                instruction,
+                false,
+                hardfork_flags,
+                Arc::new(registry),
+            );
+
+            let input = encode_subcall_test_input(STORAGE_CONTRACT, &[]);
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input,
+                ..Default::default()
+            });
+
+            let result_and_state = evm.replay().expect("replay should succeed");
+
+            assert!(
+                result_and_state.result.is_success(),
+                "wrapper should succeed (it catches inner revert): {:?}",
+                result_and_state.result,
+            );
+
+            let storage_account = result_and_state.state.get(&STORAGE_CONTRACT);
+            if let Some(account) = storage_account {
+                let slot_value = account
+                    .storage
+                    .get(&U256::ZERO)
+                    .map(|s| s.present_value)
+                    .unwrap_or(U256::ZERO);
+                assert_eq!(
+                    slot_value,
+                    U256::ZERO,
+                    "child's SSTORE(0, 42) should have been reverted, but slot 0 = {slot_value}"
+                );
+            }
+        }
+
+        /// Regression test: after a rejected subcall completes (including the revert path),
+        /// the child target address remains warm. A second subcall to the same target in the
+        /// same transaction should use WARM_STORAGE_READ_COST, not COLD_ACCOUNT_ACCESS_COST.
+        ///
+        /// Uses a double-call wrapper that invokes the rejecting precompile twice. Compares
+        /// two runs: one targeting the same contract both times (second call warm), one
+        /// targeting two different contracts (both calls cold). The gas delta should equal
+        /// COLD_ACCOUNT_ACCESS_COST - WARM_STORAGE_READ_COST = 2500.
+        #[test]
+        fn test_rejected_subcall_target_stays_warm() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                RejectingCompleteSubcallPrecompile, REJECTING_COMPLETE_SUBCALL_ADDRESS,
+            };
+            use revm_interpreter::gas::{COLD_ACCOUNT_ACCESS_COST, WARM_STORAGE_READ_COST};
+
+            let double_wrapper = double_call_wrapper_bytecode(REJECTING_COMPLETE_SUBCALL_ADDRESS);
+            let sstore_code = sstore_42_bytecode();
+            const DOUBLE_WRAPPER: Address = address!("c000000000000000000000000000000000000030");
+            const STORAGE_A: Address = address!("c000000000000000000000000000000000000020");
+            const STORAGE_B: Address = address!("c000000000000000000000000000000000000021");
+
+            let chain_spec = LOCAL_DEV.clone();
+            let spec =
+                reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
+
+            let input_a = encode_subcall_test_input(STORAGE_A, &[]);
+            let input_b = encode_subcall_test_input(STORAGE_B, &[]);
+
+            let run_double = |payload1: &[u8], payload2: &[u8]| -> u64 {
+                let mut db = InMemoryDB::default();
+                db.insert_account_info(
+                    EOA,
+                    AccountInfo {
+                        balance: U256::from(1_000_000),
+                        nonce: 0,
+                        code_hash: alloy_primitives::KECCAK256_EMPTY,
+                        code: None,
+                        account_id: None,
+                    },
+                );
+                for (addr, code) in [
+                    (DOUBLE_WRAPPER, double_wrapper.clone()),
+                    (STORAGE_A, sstore_code.clone()),
+                    (STORAGE_B, sstore_code.clone()),
+                ] {
+                    db.insert_account_info(
+                        addr,
+                        AccountInfo {
+                            balance: U256::ZERO,
+                            nonce: 1,
+                            code_hash: keccak256(&code),
+                            code: Some(Bytecode::new_raw(code)),
+                            account_id: None,
+                        },
+                    );
+                }
+                let mut cfg_env = revm::context::CfgEnv::new()
+                    .with_chain_id(chain_spec.chain_id())
+                    .with_spec_and_mainnet_gas_params(spec);
+                cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+                let ctx = EthEvmContext::new(db, spec)
+                    .with_cfg(cfg_env)
+                    .with_block(BlockEnv::default());
+                let mut registry = SubcallRegistry::new();
+                registry.register(
+                    REJECTING_COMPLETE_SUBCALL_ADDRESS,
+                    Arc::new(RejectingCompleteSubcallPrecompile),
+                    AllowedCallers::Unrestricted,
+                );
+                let mut evm = ArcEvm::new(
+                    ctx,
+                    revm::inspector::NoOpInspector {},
+                    ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags),
+                    EthInstructions::new_mainnet_with_spec(spec),
+                    false,
+                    hardfork_flags,
+                    Arc::new(registry),
+                );
+
+                let mut calldata = Vec::new();
+                calldata.extend_from_slice(&U256::from(payload1.len()).to_be_bytes::<32>());
+                calldata.extend_from_slice(payload1);
+                calldata.extend_from_slice(payload2);
+
+                evm.inner.ctx.set_tx(TxEnv {
+                    caller: EOA,
+                    kind: TxKind::Call(DOUBLE_WRAPPER),
+                    value: U256::ZERO,
+                    gas_limit: 1_000_000,
+                    gas_price: 0,
+                    chain_id: Some(chain_spec.chain_id()),
+                    data: Bytes::from(calldata),
+                    ..Default::default()
+                });
+                let result = evm.replay().expect("replay should succeed");
+                assert!(result.result.is_success(), "double wrapper should succeed");
+                result.result.gas_used()
+            };
+
+            // Both-cold: target A then target B (different addresses, both cold)
+            let gas_both_cold = run_double(&input_a, &input_b);
+            // Same-target: target A then target A (second access is warm)
+            let gas_second_warm = run_double(&input_a, &input_a);
+
+            // The only difference between the two runs is that in the second case,
+            // STORAGE_A is already warm from the first subcall. Delta = COLD - WARM.
+            let savings = gas_both_cold - gas_second_warm;
+            let expected_savings = COLD_ACCOUNT_ACCESS_COST - WARM_STORAGE_READ_COST;
+            assert_eq!(
+                savings, expected_savings,
+                "second subcall to same target should save exactly {expected_savings} gas \
+                 (cold={COLD_ACCOUNT_ACCESS_COST} - warm={WARM_STORAGE_READ_COST}), \
+                 got {savings} (gas_both_cold={gas_both_cold}, gas_second_warm={gas_second_warm})"
+            );
+        }
+
+        /// complete_subcall gas overhead (ABI encoding) should be included in total gas consumed.
+        ///
+        /// Proves the framework charges the reported `gas_overhead` from `complete_subcall`.
+        ///
+        /// Compares SubcallTestPrecompile (gas_overhead=0) against CostlyCompleteSubcallPrecompile
+        /// (gas_overhead=500). Both have identical init_subcall logic, so the gas delta is
+        /// exactly the difference in reported completion gas.
+        #[test]
+        fn test_complete_subcall_gas_overhead_is_charged() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                CostlyCompleteSubcallPrecompile, SubcallTestPrecompile,
+                COSTLY_COMPLETE_GAS_OVERHEAD, COSTLY_COMPLETE_SUBCALL_ADDRESS,
+                SUBCALL_TEST_ADDRESS,
+            };
+
+            let zero_wrapper_code = wrapper_call_bytecode(SUBCALL_TEST_ADDRESS);
+            let costly_wrapper_code = wrapper_call_bytecode(COSTLY_COMPLETE_SUBCALL_ADDRESS);
+            let echo_code = echo_double_bytecode();
+            const ZERO_WRAPPER: Address = WRAPPER;
+            const COSTLY_WRAPPER: Address = address!("c000000000000000000000000000000000000011");
+
+            let chain_spec = LOCAL_DEV.clone();
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                EOA,
+                AccountInfo {
+                    balance: U256::from(1_000_000),
+                    nonce: 0,
+                    code_hash: alloy_primitives::KECCAK256_EMPTY,
+                    code: None,
+                    account_id: None,
+                },
+            );
+            for (addr, code) in [
+                (ZERO_WRAPPER, zero_wrapper_code),
+                (COSTLY_WRAPPER, costly_wrapper_code),
+                (ECHO_CONTRACT, echo_code),
+            ] {
+                db.insert_account_info(
+                    addr,
+                    AccountInfo {
+                        balance: U256::ZERO,
+                        nonce: 1,
+                        code_hash: keccak256(&code),
+                        code: Some(Bytecode::new_raw(code)),
+                        account_id: None,
+                    },
+                );
+            }
+
+            let spec =
+                reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
+            let mut cfg_env = revm::context::CfgEnv::new()
+                .with_chain_id(chain_spec.chain_id())
+                .with_spec_and_mainnet_gas_params(spec);
+            cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+            let ctx = EthEvmContext::new(db, spec)
+                .with_cfg(cfg_env)
+                .with_block(BlockEnv::default());
+            let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
+            let instruction = EthInstructions::new_mainnet_with_spec(spec);
+
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                SUBCALL_TEST_ADDRESS,
+                Arc::new(SubcallTestPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+            registry.register(
+                COSTLY_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(CostlyCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+
+            let mut evm = ArcEvm::new(
+                ctx,
+                revm::inspector::NoOpInspector {},
+                precompiles,
+                instruction,
+                false,
+                hardfork_flags,
+                Arc::new(registry),
+            );
+
+            let inner_calldata = U256::from(42).to_be_bytes::<32>().to_vec();
+
+            // Tx 1: SubcallTestPrecompile — gas_overhead = 0
+            let input_zero = encode_subcall_test_input(ECHO_CONTRACT, &inner_calldata);
+            let tx_zero = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(ZERO_WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input_zero,
+                ..Default::default()
+            };
+
+            let result_zero = evm.transact_one(tx_zero).expect("tx should succeed");
+            let gas_used_zero = match &result_zero {
+                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                other => panic!("expected Success, got {other:?}"),
+            };
+
+            // Tx 2: CostlyCompleteSubcallPrecompile — gas_overhead = 500
+            let input_costly = encode_subcall_test_input(ECHO_CONTRACT, &inner_calldata);
+            let tx_costly = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(COSTLY_WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                nonce: 1,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input_costly,
+                ..Default::default()
+            };
+
+            let result_costly = evm.transact_one(tx_costly).expect("tx should succeed");
+            let gas_used_costly = match &result_costly {
+                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                other => panic!("expected Success, got {other:?}"),
+            };
+
+            // The only difference between the two precompiles is gas_overhead (0 vs 500).
+            // The delta must be exactly COSTLY_COMPLETE_GAS_OVERHEAD.
+            assert_eq!(
+                gas_used_costly - gas_used_zero,
+                COSTLY_COMPLETE_GAS_OVERHEAD,
+                "gas delta should equal the reported completion gas_overhead ({COSTLY_COMPLETE_GAS_OVERHEAD})"
+            );
+        }
+
+        /// Completion gas is charged even when the child reverts (not halts).
+        /// Uses the same CostlyCompleteSubcallPrecompile pair, targeting a reverting contract.
+        #[test]
+        fn test_complete_subcall_gas_overhead_charged_on_child_revert() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                CostlyCompleteSubcallPrecompile, SubcallTestPrecompile,
+                COSTLY_COMPLETE_GAS_OVERHEAD, COSTLY_COMPLETE_SUBCALL_ADDRESS,
+                SUBCALL_TEST_ADDRESS,
+            };
+
+            let zero_wrapper_code = wrapper_call_bytecode(SUBCALL_TEST_ADDRESS);
+            let costly_wrapper_code = wrapper_call_bytecode(COSTLY_COMPLETE_SUBCALL_ADDRESS);
+            let revert_code = reverting_bytecode();
+            const ZERO_WRAPPER: Address = WRAPPER;
+            const COSTLY_WRAPPER: Address = address!("c000000000000000000000000000000000000011");
+            const REVERTING: Address = address!("c000000000000000000000000000000000000012");
+
+            let chain_spec = LOCAL_DEV.clone();
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                EOA,
+                AccountInfo {
+                    balance: U256::from(1_000_000),
+                    nonce: 0,
+                    code_hash: alloy_primitives::KECCAK256_EMPTY,
+                    code: None,
+                    account_id: None,
+                },
+            );
+            for (addr, code) in [
+                (ZERO_WRAPPER, zero_wrapper_code),
+                (COSTLY_WRAPPER, costly_wrapper_code),
+                (REVERTING, revert_code),
+            ] {
+                db.insert_account_info(
+                    addr,
+                    AccountInfo {
+                        balance: U256::ZERO,
+                        nonce: 1,
+                        code_hash: keccak256(&code),
+                        code: Some(Bytecode::new_raw(code)),
+                        account_id: None,
+                    },
+                );
+            }
+
+            let spec =
+                reth_ethereum::evm::revm_spec_by_timestamp_and_block_number(&chain_spec, 0, 0);
+            let hardfork_flags = chain_spec.get_hardfork_flags(0, 0);
+            let mut cfg_env = revm::context::CfgEnv::new()
+                .with_chain_id(chain_spec.chain_id())
+                .with_spec_and_mainnet_gas_params(spec);
+            cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+            let ctx = EthEvmContext::new(db, spec)
+                .with_cfg(cfg_env)
+                .with_block(BlockEnv::default());
+            let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
+            let instruction = EthInstructions::new_mainnet_with_spec(spec);
+
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                SUBCALL_TEST_ADDRESS,
+                Arc::new(SubcallTestPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+            registry.register(
+                COSTLY_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(CostlyCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+
+            let mut evm = ArcEvm::new(
+                ctx,
+                revm::inspector::NoOpInspector {},
+                precompiles,
+                instruction,
+                false,
+                hardfork_flags,
+                Arc::new(registry),
+            );
+
+            // Target a reverting contract — child reverts, but does NOT halt.
+            let inner_calldata: Vec<u8> = vec![];
+
+            // Tx 1: SubcallTestPrecompile (gas_overhead=0) with reverting child
+            let input_zero = encode_subcall_test_input(REVERTING, &inner_calldata);
+            let tx_zero = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(ZERO_WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input_zero,
+                ..Default::default()
+            };
+
+            let result_zero = evm.transact_one(tx_zero).expect("tx should succeed");
+            let gas_used_zero = match &result_zero {
+                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                other => panic!("expected Success (wrapper catches revert), got {other:?}"),
+            };
+
+            // Tx 2: CostlyCompleteSubcallPrecompile (gas_overhead=500) with reverting child
+            let input_costly = encode_subcall_test_input(REVERTING, &inner_calldata);
+            let tx_costly = TxEnv {
+                caller: EOA,
+                kind: TxKind::Call(COSTLY_WRAPPER),
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                nonce: 1,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: input_costly,
+                ..Default::default()
+            };
+
+            let result_costly = evm.transact_one(tx_costly).expect("tx should succeed");
+            let gas_used_costly = match &result_costly {
+                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                other => panic!("expected Success (wrapper catches revert), got {other:?}"),
+            };
+
+            // Even with a reverting child, completion gas is charged.
+            assert_eq!(
+                gas_used_costly - gas_used_zero,
+                COSTLY_COMPLETE_GAS_OVERHEAD,
+                "completion gas_overhead must be charged even when child reverts"
+            );
+        }
+
+        /// Unit test: CallFrom complete_subcall reports correct gas_overhead for various data sizes.
+        #[test]
+        fn test_call_from_complete_subcall_gas_overhead() {
+            use arc_precompiles::call_from::abi_encode_gas;
+            use arc_precompiles::subcall::{SubcallContinuationData, SubcallPrecompile};
+
+            let precompile = CallFromPrecompile;
+
+            // Helper: create a FrameResult::Call with given output bytes
+            let make_child_result = |output: Bytes| -> FrameResult {
+                FrameResult::Call(CallOutcome {
+                    result: InterpreterResult::new(
+                        InstructionResult::Return,
+                        output,
+                        Gas::new(100_000),
+                    ),
+                    memory_offset: 0..0,
+                    was_precompile_called: false,
+                    precompile_call_logs: Default::default(),
+                })
+            };
+
+            let continuation_data = SubcallContinuationData {
+                state: Box::new(()),
+            };
+
+            // Empty output
+            let result = precompile
+                .complete_subcall(continuation_data, &make_child_result(Bytes::new()))
+                .expect("complete_subcall should succeed");
+            assert_eq!(result.gas_overhead, abi_encode_gas(0));
+
+            // 32 bytes output
+            let continuation_data = SubcallContinuationData {
+                state: Box::new(()),
+            };
+            let result = precompile
+                .complete_subcall(
+                    continuation_data,
+                    &make_child_result(Bytes::from(vec![0u8; 32])),
+                )
+                .expect("complete_subcall should succeed");
+            assert_eq!(result.gas_overhead, abi_encode_gas(32));
+
+            // 33 bytes output (rounds up to 2 words)
+            let continuation_data = SubcallContinuationData {
+                state: Box::new(()),
+            };
+            let result = precompile
+                .complete_subcall(
+                    continuation_data,
+                    &make_child_result(Bytes::from(vec![0u8; 33])),
+                )
+                .expect("complete_subcall should succeed");
+            assert_eq!(result.gas_overhead, abi_encode_gas(33));
+            // 33 bytes = 2 words → base + 2*COPY
+            assert_eq!(result.gas_overhead, 100 + 2 * 3);
+        }
+
+        // These tests verify that `init_subcall` correctly charges EIP-2929 account
+        // access costs for the child target address.
+
+        /// Integration test: CallFrom targeting a cold account should cost more gas
+        /// than targeting a warm one (pre-warmed via access_list).
+        ///
+        /// Uses two separate EVM instances so each transaction starts with a fresh
+        /// journal — reusing one EVM would leave addresses warm from the first tx.
+        #[test]
+        fn test_call_from_cold_target_costs_more_gas_than_warm() {
+            let contract_a_code = wrapper_call_bytecode(CALL_FROM_ADDRESS);
+            let contract_b_code = echo_double_bytecode();
+            const CONTRACT_A: Address = WRAPPER;
+            const CONTRACT_B: Address = ECHO_CONTRACT;
+
+            let inner_calldata = U256::from(42).to_be_bytes::<32>().to_vec();
+            let call_from_input = encode_call_from_input(EOA, CONTRACT_B, &inner_calldata);
+
+            // Cold target: fresh EVM, no access_list
+            let mut evm_cold = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[
+                    (CONTRACT_A, contract_a_code.clone()),
+                    (CONTRACT_B, contract_b_code.clone()),
+                ],
+                &[CONTRACT_A],
+            );
+            let tx_cold = TxEnv {
+                tx_type: 1, // EIP-2930
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_A),
+                value: U256::ZERO,
+                gas_limit: 200_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input.clone(),
+                access_list: Default::default(),
+                ..Default::default()
+            };
+            let result_cold = evm_cold
+                .transact_one(tx_cold)
+                .expect("cold tx should succeed");
+            let gas_cold = match &result_cold {
+                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                other => panic!("expected Success, got {other:?}"),
+            };
+
+            // Warm target: fresh EVM, pre-warm CONTRACT_B via access_list.
+            // tx_type must be EIP-2930 (1) so revm processes the access_list warmup;
+            // the default Legacy type skips access list handling entirely.
+            let mut evm_warm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(CONTRACT_A, contract_a_code), (CONTRACT_B, contract_b_code)],
+                &[CONTRACT_A],
+            );
+            let tx_warm = TxEnv {
+                tx_type: 1, // EIP-2930
+                caller: EOA,
+                kind: TxKind::Call(CONTRACT_A),
+                value: U256::ZERO,
+                gas_limit: 200_000,
+                gas_price: 0,
+                chain_id: Some(LOCAL_DEV.chain_id()),
+                data: call_from_input,
+                access_list: vec![alloy_eips::eip2930::AccessListItem {
+                    address: CONTRACT_B,
+                    storage_keys: vec![],
+                }]
+                .into(),
+                ..Default::default()
+            };
+            let result_warm = evm_warm
+                .transact_one(tx_warm)
+                .expect("warm tx should succeed");
+            let gas_warm = match &result_warm {
+                ExecutionResult::Success { gas_used, .. } => *gas_used,
+                other => panic!("expected Success, got {other:?}"),
+            };
+
+            // Both txs are EIP-2930; the only difference is the access_list entry.
+            // Delta = COLD_ACCOUNT_ACCESS_COST (2600) − ACCESS_LIST_ADDRESS_COST (2400)
+            //       - WARM_STORAGE_READ_COST (100) = 100.
+            assert_eq!(
+                gas_cold - gas_warm,
+                100,
+                "cold/warm gas delta should be exactly 100 (COLD_ACCOUNT_ACCESS_COST 2600 \
+                 - ACCESS_LIST_ADDRESS_COST 2400 - WARM_STORAGE_READ_COST 100)"
+            );
+        }
+
+        /// Unit test: init_subcall with a cold target should set
+        /// init_subcall_gas_overhead = abi_decode_gas + COLD_ACCOUNT_ACCESS_COST.
+        #[test]
+        fn test_call_from_cold_target_recalculates_child_gas() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            // Clear journal state and load required accounts
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            // tx.origin must match the spoofed sender for the origin check.
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let gas_limit: u64 = 100_000;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should succeed");
+            assert!(
+                matches!(result, ItemOrResult::Item(_)),
+                "expected child frame, got immediate result"
+            );
+
+            let continuation = evm
+                .subcall_continuations
+                .get(&1)
+                .expect("continuation should be stored at depth 1");
+
+            let expected_overhead = abi_decode_gas(child_data.len()) + COLD_ACCOUNT_ACCESS_COST;
+            assert_eq!(
+                continuation.init_subcall_gas_overhead,
+                expected_overhead,
+                "overhead should be abi_decode ({}) + cold access ({COLD_ACCOUNT_ACCESS_COST}), \
+                 got {}",
+                abi_decode_gas(child_data.len()),
+                continuation.init_subcall_gas_overhead
+            );
+        }
+
+        /// Unit test: when the target is already warm, init_subcall should use
+        /// WARM_STORAGE_READ_COST (100) instead of COLD_ACCOUNT_ACCESS_COST (2600).
+        #[test]
+        fn test_call_from_warm_target_uses_warm_cost() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::WARM_STORAGE_READ_COST;
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            // Clear journal state and load required accounts
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            // Pre-warm the target account
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(ECHO_CONTRACT)
+                .unwrap();
+
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let gas_limit: u64 = 100_000;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should succeed");
+            assert!(
+                matches!(result, ItemOrResult::Item(_)),
+                "expected child frame, got immediate result"
+            );
+
+            let continuation = evm
+                .subcall_continuations
+                .get(&1)
+                .expect("continuation should be stored at depth 1");
+
+            let expected_overhead = abi_decode_gas(child_data.len()) + WARM_STORAGE_READ_COST;
+            assert_eq!(
+                continuation.init_subcall_gas_overhead,
+                expected_overhead,
+                "overhead should be abi_decode ({}) + warm read ({WARM_STORAGE_READ_COST}), \
+                 got {}",
+                abi_decode_gas(child_data.len()),
+                continuation.init_subcall_gas_overhead
+            );
+        }
+
+        /// When caller == target, `load_account(caller)` warms the address before
+        /// `load_account(target)`, so only the warm access cost (100) is charged.
+        #[test]
+        fn test_call_from_caller_equals_target_uses_warm_cost() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::WARM_STORAGE_READ_COST;
+
+            let echo_code = echo_double_bytecode();
+            // ECHO_CONTRACT is both the sender and target — give it balance and code.
+            let mut evm = setup_test_evm(
+                &[(ECHO_CONTRACT, U256::from(10_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: ECHO_CONTRACT,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: ECHO_CONTRACT,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let gas_limit: u64 = 100_000;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should succeed");
+            assert!(
+                matches!(result, ItemOrResult::Item(_)),
+                "expected child frame, got immediate result"
+            );
+
+            let continuation = evm
+                .subcall_continuations
+                .get(&1)
+                .expect("continuation should be stored at depth 1");
+
+            let expected_overhead = abi_decode_gas(child_data.len()) + WARM_STORAGE_READ_COST;
+            assert_eq!(
+                continuation.init_subcall_gas_overhead,
+                expected_overhead,
+                "caller==target: overhead should be abi_decode ({}) + warm read \
+                 ({WARM_STORAGE_READ_COST}), got {}",
+                abi_decode_gas(child_data.len()),
+                continuation.init_subcall_gas_overhead
+            );
+        }
+
+        /// Unit test: when gas_limit is just below abi_decode + COLD_ACCOUNT_ACCESS_COST,
+        /// init_subcall should OOG.
+        #[test]
+        fn test_call_from_oog_with_cold_account_access() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            // Gas is enough for ABI decode but NOT enough for ABI decode + cold access
+            let insufficient_gas = abi_decode_gas(child_data.len()) + COLD_ACCOUNT_ACCESS_COST - 1;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit: insufficient_gas,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should not return db error");
+
+            match result {
+                ItemOrResult::Result(FrameResult::Call(outcome)) => {
+                    assert_eq!(
+                        outcome.result.result,
+                        InstructionResult::OutOfGas,
+                        "should OOG when gas is insufficient for account access cost"
+                    );
+                    assert_eq!(
+                        outcome.result.gas.spent(),
+                        insufficient_gas,
+                        "OOG should consume all allocated gas"
+                    );
+                    assert!(
+                        !evm.subcall_continuations.contains_key(&1),
+                        "continuation should be removed after OOG"
+                    );
+                }
+                ItemOrResult::Result(other) => {
+                    panic!("expected Call result, got {other:?}");
+                }
+                ItemOrResult::Item(_) => {
+                    panic!(
+                        "expected OutOfGas when gas_limit ({insufficient_gas}) < \
+                         abi_decode ({}) + cold access ({COLD_ACCOUNT_ACCESS_COST})",
+                        abi_decode_gas(child_data.len())
+                    );
+                }
+            }
+        }
+
+        /// Boundary: gas_limit == abi_decode + COLD_ACCOUNT_ACCESS_COST should succeed
+        /// with child_gas_limit = 0 (child will OOG when it runs, but init_subcall itself
+        /// should not reject it).
+        #[test]
+        fn test_call_from_exact_overhead_gas_succeeds_with_zero_child_gas() {
+            use alloy_sol_types::SolCall;
+            use arc_precompiles::call_from::{abi_decode_gas, ICallFrom};
+            use revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST;
+
+            let echo_code = echo_double_bytecode();
+            let mut evm = setup_test_evm(
+                &[(EOA, U256::from(1_000_000))],
+                &[(ECHO_CONTRACT, echo_code)],
+                &[WRAPPER],
+            );
+
+            evm.ctx_mut().journal_mut().clear();
+            evm.ctx_mut()
+                .journal_mut()
+                .load_account(NATIVE_COIN_CONTROL_ADDRESS)
+                .unwrap();
+
+            evm.inner.ctx.set_tx(TxEnv {
+                caller: EOA,
+                ..Default::default()
+            });
+
+            let child_data: Vec<u8> = vec![0x42];
+            let calldata = ICallFrom::callFromCall {
+                sender: EOA,
+                target: ECHO_CONTRACT,
+                data: child_data.clone().into(),
+            }
+            .abi_encode();
+
+            let exact_gas = abi_decode_gas(child_data.len()) + COLD_ACCOUNT_ACCESS_COST;
+            let call_inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: CALL_FROM_ADDRESS,
+                bytecode_address: CALL_FROM_ADDRESS,
+                known_bytecode: None,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(Bytes::from(calldata)),
+                gas_limit: exact_gas,
+                is_static: false,
+                caller: WRAPPER,
+                return_memory_offset: 0..0,
+            };
+
+            let frame_input = FrameInit {
+                frame_input: FrameInput::Call(Box::new(call_inputs)),
+                memory: SharedMemory::default(),
+                depth: 1,
+            };
+
+            let precompile: Arc<dyn arc_precompiles::subcall::SubcallPrecompile> =
+                Arc::new(CallFromPrecompile);
+            let result = evm
+                .init_subcall(frame_input, precompile)
+                .expect("init_subcall should not return db error");
+
+            assert!(
+                matches!(result, ItemOrResult::Item(_)),
+                "exact overhead gas should push a child frame, not OOG"
+            );
+
+            let continuation = evm
+                .subcall_continuations
+                .get(&1)
+                .expect("continuation should exist at depth 1");
+            assert_eq!(
+                continuation.init_subcall_gas_overhead, exact_gas,
+                "overhead should equal the full gas budget"
+            );
+        }
     }
     fn create_test_evm_with_spec(
         db: InMemoryDB,
@@ -5614,7 +7784,7 @@ mod tests {
         PrecompilesMap,
     > {
         let ctx = Context::new(db, spec);
-        let instruction = EthInstructions::default();
+        let instruction = EthInstructions::new_mainnet_with_spec(spec);
         let precompiles = ArcPrecompileProvider::create_precompiles_map(spec, hardfork_flags);
         ArcEvm::new(
             ctx,
@@ -5640,7 +7810,7 @@ mod tests {
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)
             .unwrap();
 
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(call_input(
                 CallScheme::Call,
                 U256::from(100),
@@ -5651,7 +7821,7 @@ mod tests {
             depth: 1,
         };
 
-        let result = evm.before_frame_init(&frame).unwrap();
+        let result = evm.before_frame_init(&mut frame).unwrap();
         match result {
             BeforeFrameInitResult::Log(log, gas) => {
                 assert!(gas > 0, "Should have SLOAD gas cost");
@@ -5679,7 +7849,7 @@ mod tests {
             .unwrap();
 
         // Self-transfer: from == to
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(call_input(
                 CallScheme::Call,
                 U256::from(100),
@@ -5690,7 +7860,7 @@ mod tests {
             depth: 1,
         };
 
-        let result = evm.before_frame_init(&frame).unwrap();
+        let result = evm.before_frame_init(&mut frame).unwrap();
         match result {
             BeforeFrameInitResult::Checked(gas) => {
                 assert!(gas > 0, "Should have SLOAD gas cost");
@@ -5713,7 +7883,7 @@ mod tests {
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)
             .unwrap();
 
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(call_input(
                 CallScheme::Call,
                 U256::from(100),
@@ -5724,7 +7894,7 @@ mod tests {
             depth: 1,
         };
 
-        let result = evm.before_frame_init(&frame).unwrap();
+        let result = evm.before_frame_init(&mut frame).unwrap();
         match result {
             BeforeFrameInitResult::Log(log, _gas) => {
                 assert_eq!(log.address, NATIVE_COIN_AUTHORITY_ADDRESS);
@@ -5775,7 +7945,7 @@ mod tests {
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)
             .unwrap();
 
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(call_input(
                 CallScheme::Call,
                 U256::from(100),
@@ -5786,7 +7956,7 @@ mod tests {
             depth: 1,
         };
 
-        let result = evm.before_frame_init(&frame).unwrap();
+        let result = evm.before_frame_init(&mut frame).unwrap();
         match result {
             BeforeFrameInitResult::Log(log, _gas) => {
                 assert_eq!(
@@ -5813,7 +7983,7 @@ mod tests {
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)
             .unwrap();
 
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(call_input(
                 CallScheme::Call,
                 U256::from(100),
@@ -5824,7 +7994,7 @@ mod tests {
             depth: 1,
         };
 
-        let result = evm.before_frame_init(&frame).unwrap();
+        let result = evm.before_frame_init(&mut frame).unwrap();
         assert!(
             matches!(result, BeforeFrameInitResult::Reverted(_)),
             "Zero5 should revert CALL with value to zero address, got {:?}",
@@ -5844,7 +8014,7 @@ mod tests {
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)
             .unwrap();
 
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(call_input(
                 CallScheme::Call,
                 U256::from(100),
@@ -5855,7 +8025,7 @@ mod tests {
             depth: 1,
         };
 
-        let result = evm.before_frame_init(&frame).unwrap();
+        let result = evm.before_frame_init(&mut frame).unwrap();
         assert!(
             matches!(result, BeforeFrameInitResult::Reverted(_)),
             "Zero5 should revert CALL with value from zero address, got {:?}",
@@ -5875,7 +8045,7 @@ mod tests {
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)
             .unwrap();
 
-        let frame = FrameInit {
+        let mut frame = FrameInit {
             frame_input: FrameInput::Call(call_input(
                 CallScheme::Call,
                 U256::from(100),
@@ -5886,7 +8056,7 @@ mod tests {
             depth: 1,
         };
 
-        let result = evm.before_frame_init(&frame).unwrap();
+        let result = evm.before_frame_init(&mut frame).unwrap();
         assert!(
             matches!(result, BeforeFrameInitResult::Log(_, _)),
             "Pre-Zero5 should allow CALL to zero address, got {:?}",
@@ -5902,9 +8072,9 @@ mod tests {
         use revm_primitives::TxKind;
 
         let chain_spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, 0),
-            (ArcHardfork::Zero4, 0),
-            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
         ]);
         let sender = Address::repeat_byte(0x11);
         let caller_contract = Address::repeat_byte(0x22);
@@ -5969,9 +8139,9 @@ mod tests {
         use revm_primitives::TxKind;
 
         let chain_spec = localdev_with_hardforks(&[
-            (ArcHardfork::Zero3, 0),
-            (ArcHardfork::Zero4, 0),
-            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero3, ForkCondition::Block(0)),
+            (ArcHardfork::Zero4, ForkCondition::Block(0)),
+            (ArcHardfork::Zero5, ForkCondition::Block(0)),
         ]);
         let sender = Address::repeat_byte(0x33);
         let factory_contract = Address::repeat_byte(0x44);
@@ -6194,8 +8364,7 @@ mod tests {
         );
     }
 
-    // ----- Revm upgrade checklist -----
-
+    /// ----- Revm upgrade checklist -----
     /// Guard against silent drift when upgrading revm. If this test fails, the revm
     /// dependency version has changed and the forked/mirrored functions below must be
     /// reviewed for upstream behavioral changes:

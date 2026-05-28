@@ -28,7 +28,8 @@ use malachitebft_app_channel::app::types::core::Round;
 use crate::streaming;
 
 use arc_consensus_types::{
-    Address, AlloyAddress, ArcContext, BlockHash, Config, ConsensusParams, Height, ValidatorSet,
+    Address, AlloyAddress, ArcContext, BlockHash, ChainId, Config, ConsensusParams, ConsensusSpec,
+    Height, NetworkId, ValidatorSet,
 };
 use arc_eth_engine::json_structures::ExecutionBlock;
 use arc_eth_engine::persistence_meter::{NoopPersistenceMeter, PersistenceMeter};
@@ -40,8 +41,8 @@ use crate::env_config::EnvConfig;
 use crate::metrics::app::AppMetrics;
 use crate::node::ConsensusIdentity;
 use crate::request::Status;
-use crate::spec::{ChainId, ConsensusSpec, NetworkId};
 use crate::stats::Stats;
+use crate::store::repositories::UndecidedBlocksRepository;
 use crate::store::Store;
 use crate::streaming::PartStreamsMap;
 use crate::utils::sync_state::SyncState;
@@ -139,7 +140,7 @@ pub struct State {
     /// Meters EL block persistence to apply backpressure during sync catch-up.
     persistence_meter: Box<dyn PersistenceMeter>,
 
-    /// Consensus-layer chain spec (fork activation by height/time).
+    /// Consensus-layer chain spec (fork activation by height).
     #[allow(dead_code)]
     pub spec: ConsensusSpec,
 
@@ -178,7 +179,7 @@ impl State {
         let network_id = NetworkId::new(
             spec.chain_id,
             genesis_block.block_hash,
-            spec.fork_version_at(initial_height, genesis_block.timestamp),
+            spec.fork_version_at(initial_height),
         );
 
         Self {
@@ -190,7 +191,7 @@ impl State {
             validator_set: ValidatorSet::default(), // initially empty, will be updated from reth
             store,
             stream_nonce: 0,
-            streams_map: PartStreamsMap::new(initial_height),
+            streams_map: PartStreamsMap::new(initial_height, 0),
             config,
             env_config,
             stats: Stats::default(),
@@ -269,6 +270,7 @@ impl State {
     /// Sets the current validator set and updates metrics
     pub fn set_validator_set(&mut self, val_set: ValidatorSet) {
         self.metrics.update_validator_set(&val_set);
+        self.streams_map.set_num_validators(val_set.len());
         self.validator_set = val_set;
     }
 
@@ -320,11 +322,7 @@ impl State {
     /// Recompute the network ID from the current chain ID, genesis hash, and fork version.
     #[must_use]
     fn recompute_network_id(&mut self) -> NetworkId {
-        let timestamp = self
-            .previous_block
-            .map(|b| b.timestamp)
-            .unwrap_or(self.genesis_block.timestamp);
-        let fork_version = self.spec.fork_version_at(self.current_height, timestamp);
+        let fork_version = self.spec.fork_version_at(self.current_height);
 
         self.network_id =
             NetworkId::new(self.chain_id(), self.genesis_block.block_hash, fork_version);
@@ -378,7 +376,12 @@ impl State {
     /// Defined to be equal to the size of the consensus input buffer,
     /// which is itself sized to handle all in-flight sync responses.
     pub fn max_pending_proposals(&self) -> usize {
-        let limit = self.config.value_sync.parallel_requests * self.config.value_sync.batch_size;
+        let limit = self
+            .config
+            .value_sync
+            .parallel_requests
+            .checked_mul(self.config.value_sync.batch_size)
+            .expect("max_pending_proposals overflow");
         assert!(limit > 0, "max_pending_proposals must be greater than 0");
         limit
     }
@@ -406,7 +409,10 @@ impl State {
             height: self.current_height,
             round: self.current_round,
             address: self.address(),
+            public_key: *self.identity.public_key(),
             proposer: self.current_proposer,
+            // elapsed() is always <= time since epoch, so this won't underflow
+            #[allow(clippy::arithmetic_side_effects)]
             height_start_time: SystemTime::now() - self.stats.height_started().elapsed(),
             prev_payload_hash: self.previous_block.map(|b| b.block_hash),
             db_latest_height: self
@@ -424,6 +430,7 @@ impl State {
             undecided_blocks_count,
             pending_proposal_parts,
             validator_set: self.validator_set().to_owned(),
+            sync_state: self.sync_state,
         })
     }
 
@@ -436,11 +443,12 @@ impl State {
         height: Height,
         round: Round,
     ) -> eyre::Result<Vec<ConsensusBlock>> {
-        self
-            .store
-            .get_undecided_blocks(height, round)
+        self.store
+            .get_by_round(height, round)
             .await
-            .wrap_err_with(||format!("Failed to get undecided blocks for height {height} and round {round} from the database"))
+            .wrap_err_with(|| {
+                format!("Failed to get undecided blocks for height {height} and round {round} from the database")
+            })
     }
 
     /// Move to the next height, updating the previous block, validator set, and consensus params.
@@ -467,7 +475,11 @@ impl State {
 
     pub fn next_stream_id(&mut self) -> StreamId {
         let nonce = self.stream_nonce;
-        self.stream_nonce += 1;
+        // Stream nonce is reset each height; cannot realistically reach u32::MAX
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            self.stream_nonce += 1;
+        }
         streaming::new_stream_id(self.current_height, self.current_round, nonce)
     }
 

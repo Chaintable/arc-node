@@ -209,6 +209,13 @@ impl TxSender {
             };
             if let Some(tx) = tx {
                 self.send(tx, wait_response).await?;
+                if !wait_response {
+                    for client in &mut self.ws_clients {
+                        if let Some(result) = client.drain_one_result().await {
+                            let _ = self.result_sender.send(result).await;
+                        }
+                    }
+                }
             } else {
                 break;
             }
@@ -308,7 +315,7 @@ impl TxSender {
         tx.encode_2718(&mut buf);
 
         let tx_hash = compute_tx_hash(&buf);
-        let payload = hex::encode(buf);
+        let payload = format!("0x{}", hex::encode(buf));
         let tx_len = tx_len as u64;
 
         let len = self.ws_clients.len();
@@ -440,27 +447,44 @@ impl TxSender {
         reconnect_attempts: u32,
         reconnect_period: Duration,
     ) -> Result<u64> {
+        let is_send_timeout = |e: &eyre::Report| {
+            matches!(
+                e.downcast_ref::<tungstenite::error::Error>(),
+                Some(tungstenite::error::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::TimedOut
+            )
+        };
+
         let max_attempts = reconnect_attempts.max(1); // At least one attempt
         for attempt in 0..max_attempts {
+            let send_started = Instant::now();
             match ws_client.request(method, params.clone()).await {
                 Ok(req_id) => return Ok(req_id),
                 Err(e) if is_connection_error(&e) => {
-                    debug!(
-                        "TxSender {}: connection error on attempt {}/{} to {}: {}",
+                    let elapsed = send_started.elapsed();
+                    let hint = if is_send_timeout(&e) {
+                        " (EL may be backpressuring)"
+                    } else {
+                        ""
+                    };
+                    warn!(
+                        "TxSender {}: connection error on attempt {}/{} to {} after {:.1}s{}: {}",
                         sender_id,
                         attempt + 1,
                         max_attempts,
                         ws_client.url,
+                        elapsed.as_secs_f32(),
+                        hint,
                         e
                     );
 
                     // Try to reconnect
                     if let Err(reconnect_err) = ws_client.reconnect().await {
-                        debug!(
-                            "TxSender {}: reconnect failed on attempt {}/{}: {}",
+                        warn!(
+                            "TxSender {}: reconnect failed on attempt {}/{} after {:.1}s: {}",
                             sender_id,
                             attempt + 1,
                             max_attempts,
+                            send_started.elapsed().as_secs_f32(),
                             reconnect_err
                         );
 
@@ -481,12 +505,15 @@ impl TxSender {
                         continue;
                     }
 
-                    // Reconnected successfully
-                    debug!(
-                        "TxSender {}: reconnected successfully on attempt {}/{}",
+                    // Reconnected successfully. The total dead time is the timeout that
+                    // just elapsed plus the upcoming sleep, during which no transactions
+                    // are sent. Log at warn so this stall is visible without -vvv.
+                    warn!(
+                        "TxSender {}: reconnected after {:.1}s; sleeping {}ms before retry — total send stall ≈ {:.1}s",
                         sender_id,
-                        attempt + 1,
-                        max_attempts
+                        send_started.elapsed().as_secs_f32(),
+                        reconnect_period.as_millis(),
+                        (send_started.elapsed() + reconnect_period).as_secs_f32(),
                     );
 
                     // Wait before retrying the request to allow the node to be fully ready.

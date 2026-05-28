@@ -17,21 +17,23 @@
 pragma solidity ^0.8.29;
 
 import {ICallFrom} from "../call-from/ICallFrom.sol";
+import {Precompiles} from "../Precompiles.sol";
 import {IMemo} from "./IMemo.sol";
-import {Addresses} from "../../scripts/Addresses.sol";
 
 /**
  * @title Memo
  * @notice Wraps the callFrom precompile to attach memo metadata to subcalls.
  * @dev Not upgradeable, no proxy. Deployed at runtime via CREATE2.
  *      The callFrom precompile enforces its own allowlist — this contract does not add access control.
+ * @dev EOA-only: contract callers hit the callFrom sender-spoofing constraint
+ *      and the call reverts without raising {MemoFailed}. See {IMemo}.
  */
 contract Memo is IMemo {
     /// @inheritdoc IMemo
     uint256 public memoIndex;
 
     /// @notice The callFrom precompile used to forward subcalls with caller preservation.
-    ICallFrom public constant CALL_FROM = ICallFrom(Addresses.CALL_FROM);
+    ICallFrom public constant CALL_FROM = ICallFrom(Precompiles.CALL_FROM);
 
     /// @inheritdoc IMemo
     function memo(address target, bytes calldata data, bytes32 memoId, bytes calldata memoData) external {
