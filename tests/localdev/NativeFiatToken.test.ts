@@ -16,7 +16,6 @@
 
 import { expect } from 'chai'
 import { balancesSnapshot, NativeCoinAuthority, NativeTransferHelper, ReceiptVerifier, getClients } from '../helpers'
-import { ProtocolConfig } from '../helpers/ProtocolConfig'
 import { signPermit, USDC } from '../helpers/FiatToken'
 import { NativeCoinControl, ERR_BLOCKED_ADDRESS } from '../helpers/NativeCoinControl'
 import {
@@ -27,8 +26,10 @@ import {
   getCreate2Address,
   keccak256,
   encodeFunctionData,
+  hexToBytes,
   parseAbi,
   Address,
+  Hex,
   zeroAddress,
   TransactionExecutionError,
   ContractFunctionExecutionError,
@@ -41,6 +42,37 @@ describe('NativeFiatToken', () => {
   let nativeTransferHelperA: NativeTransferHelper
   let nativeTransferHelperB: NativeTransferHelper
   let nativeTransferHelperC: NativeTransferHelper
+
+  const ACCOUNT_CREATION_GAS_COST = 25_000n
+  const TX_DATA_ZERO_BYTE_GAS = 4n
+  const TX_DATA_NON_ZERO_BYTE_GAS = 16n
+
+  const calldataGas = (callData: Hex) => {
+    return hexToBytes(callData).reduce<bigint>(
+      (gas, byte) => gas + (byte === 0 ? TX_DATA_ZERO_BYTE_GAS : TX_DATA_NON_ZERO_BYTE_GAS),
+      0n,
+    )
+  }
+
+  const executionGasUsed = (receipt: ReceiptVerifier, callData: Hex) => {
+    return receipt.receipt.gasUsed - calldataGas(callData)
+  }
+
+  const expectExecutionGasDelta = (
+    left: ReceiptVerifier,
+    leftCallData: Hex,
+    right: ReceiptVerifier,
+    rightCallData: Hex,
+    expected: bigint,
+    message: string,
+  ) => {
+    expect(executionGasUsed(left, leftCallData) - executionGasUsed(right, rightCallData), message).to.equal(expected)
+  }
+
+  const encodeUSDCTransfer = (to: Address, amount: bigint) =>
+    encodeFunctionData({ abi: USDC.abi, functionName: 'transfer', args: [to, amount] })
+  const encodeUSDCMint = (to: Address, amount: bigint) =>
+    encodeFunctionData({ abi: USDC.abi, functionName: 'mint', args: [to, amount] })
 
   const clients = async () => {
     const { client, ...rest } = await getClients()
@@ -77,8 +109,8 @@ describe('NativeFiatToken', () => {
     const receipt = await USDC.attach(sender)
       .write.transfer([receiver.account.address, amount])
       .then(ReceiptVerifier.waitSuccess)
-    // Zero5: EIP-2929 warm/cold gas pricing
-    receipt.verifyGasUsedApproximately(54638n).verifyEvents((ev) => {
+    // Zero6: EIP-2929 warm/cold account-load pricing
+    receipt.verifyGasUsedApproximately(51038n).verifyEvents((ev) => {
       ev.expectNativeTransfer({ from: sender, to: receiver, amount: USDC.toNative(amount) })
         .expectUSDCTransfer({ from: sender, to: receiver, value: amount })
         .expectAllEventsMatched()
@@ -98,6 +130,134 @@ describe('NativeFiatToken', () => {
       })
   })
 
+  /**
+   * Scenario: A USDC transfer to a recipient with no prior state creates the recipient account.
+   * Call flow: sender -> FiatTokenProxy.transfer(existingRecipient, amount), then sender -> FiatTokenProxy.transfer(freshRecipient, amount).
+   * Assertions: both transfers succeed and the fresh-recipient transfer uses one account-creation surcharge more gas.
+   */
+  it('charges account creation gas when transferring USDC to a new account', async () => {
+    const { client, sender, receiver } = await clients()
+    const amount = USDC.parseUnits('0.000001')
+    const freshRecipient = privateKeyToAccount(generatePrivateKey())
+
+    expect(await client.getBalance({ address: freshRecipient.address })).to.equal(0n)
+    expect(await client.getTransactionCount({ address: freshRecipient.address })).to.equal(0)
+
+    const existingCallData = encodeUSDCTransfer(receiver.account.address, amount)
+    const existingReceipt = await USDC.attach(sender)
+      .write.transfer([receiver.account.address, amount])
+      .then(ReceiptVerifier.waitSuccess)
+    existingReceipt.verifyEvents((ev) => {
+      ev.expectNativeTransfer({ from: sender, to: receiver, amount: USDC.toNative(amount) })
+        .expectUSDCTransfer({ from: sender, to: receiver, value: amount })
+        .expectAllEventsMatched()
+    })
+
+    const freshCallData = encodeUSDCTransfer(freshRecipient.address, amount)
+    const freshReceipt = await USDC.attach(sender)
+      .write.transfer([freshRecipient.address, amount])
+      .then(ReceiptVerifier.waitSuccess)
+    freshReceipt.verifyEvents((ev) => {
+      ev.expectNativeTransfer({ from: sender, to: freshRecipient.address, amount: USDC.toNative(amount) })
+        .expectUSDCTransfer({ from: sender, to: freshRecipient.address, value: amount })
+        .expectAllEventsMatched()
+    })
+
+    expectExecutionGasDelta(
+      freshReceipt,
+      freshCallData,
+      existingReceipt,
+      existingCallData,
+      ACCOUNT_CREATION_GAS_COST,
+      'fresh recipient transfer should include account creation gas',
+    )
+  })
+
+  /**
+   * Scenario: A batch sends USDC twice to the same recipient that is fresh at the start of the transaction.
+   * Call flow: sender -> CallHelper.executeBatch([USDC.transfer(freshRecipient), USDC.transfer(freshRecipient)]).
+   * Assertions: the first batch costs one account-creation surcharge more than an identical later batch, not two.
+   */
+  it('charges account creation gas once when a batch transfers repeatedly to the same new recipient', async () => {
+    const { client, sender } = await clients()
+    const amount = USDC.parseUnits('0.000001')
+    const recipient = privateKeyToAccount(generatePrivateKey())
+    const helper = await CallHelper.deploy(sender, client)
+    const helperContract = CallHelper.attach(sender, helper.address)
+
+    await USDC.attach(sender)
+      .write.transfer([helper.address, amount * 4n])
+      .then(ReceiptVerifier.waitSuccess)
+
+    const call = {
+      target: USDC.address,
+      allowFailure: false,
+      value: 0n,
+      callData: encodeUSDCTransfer(recipient.address, amount),
+    }
+    const calls = [call, call]
+
+    const verifyBatchEvents = (receipt: ReceiptVerifier) => {
+      receipt.verifyEvents((ev) => {
+        ev.expectNativeTransfer({ from: helper.address, to: recipient.address, amount: USDC.toNative(amount) })
+          .expectUSDCTransfer({ from: helper.address, to: recipient.address, value: amount })
+          .expectExecutionResult({ helper, success: true, result: toBytes32(1n) })
+          .expectNativeTransfer({ from: helper.address, to: recipient.address, amount: USDC.toNative(amount) })
+          .expectUSDCTransfer({ from: helper.address, to: recipient.address, value: amount })
+          .expectExecutionResult({ helper, success: true, result: toBytes32(1n) })
+          .expectAllEventsMatched()
+      })
+    }
+
+    const firstBatchReceipt = await helperContract.write.executeBatch([calls]).then(ReceiptVerifier.waitSuccess)
+    verifyBatchEvents(firstBatchReceipt)
+
+    const secondBatchReceipt = await helperContract.write.executeBatch([calls]).then(ReceiptVerifier.waitSuccess)
+    verifyBatchEvents(secondBatchReceipt)
+
+    const gasDelta = firstBatchReceipt.receipt.gasUsed - secondBatchReceipt.receipt.gasUsed
+    expect(
+      gasDelta,
+      'batch should charge account creation only once for repeated sends to the same recipient',
+    ).to.equal(ACCOUNT_CREATION_GAS_COST)
+  })
+
+  /**
+   * Scenario: Once a recipient account exists, later USDC transfers to that account should not pay account-creation gas.
+   * Call flow: sender -> FiatTokenProxy.transfer(freshRecipient, amount) twice, then sender -> FiatTokenProxy.transfer(existingRecipient, amount).
+   * Assertions: only the first transfer to the fresh recipient pays the surcharge; the later transfer prices like an existing-recipient transfer.
+   */
+  it('does not charge account creation gas for later transfers to an existing account', async () => {
+    const { sender, receiver } = await clients()
+    const amount = USDC.parseUnits('0.000001')
+    const recipient = privateKeyToAccount(generatePrivateKey())
+
+    const recipientCallData = encodeUSDCTransfer(recipient.address, amount)
+    const firstReceipt = await USDC.attach(sender)
+      .write.transfer([recipient.address, amount])
+      .then(ReceiptVerifier.waitSuccess)
+    const secondReceipt = await USDC.attach(sender)
+      .write.transfer([recipient.address, amount])
+      .then(ReceiptVerifier.waitSuccess)
+    const existingCallData = encodeUSDCTransfer(receiver.account.address, amount)
+    const existingReceipt = await USDC.attach(sender)
+      .write.transfer([receiver.account.address, amount])
+      .then(ReceiptVerifier.waitSuccess)
+
+    expect(
+      firstReceipt.receipt.gasUsed - secondReceipt.receipt.gasUsed,
+      'first transfer should include account creation gas and second transfer should not',
+    ).to.equal(ACCOUNT_CREATION_GAS_COST)
+    expectExecutionGasDelta(
+      secondReceipt,
+      recipientCallData,
+      existingReceipt,
+      existingCallData,
+      0n,
+      'later transfer to created account should price like transfer to an existing account',
+    )
+  })
+
   it('transfer with zero amount', async () => {
     const { client, usdc, sender, receiver, totalSupply } = await clients()
     const amount = USDC.parseUnits('0')
@@ -113,8 +273,7 @@ describe('NativeFiatToken', () => {
     const receipt = await USDC.attach(sender)
       .write.transfer([receiver.account.address, amount])
       .then(ReceiptVerifier.waitSuccess)
-    // Zero5: EIP-2929 warm/cold gas pricing
-    receipt.verifyGasUsedApproximately(40713n).verifyEvents((ev) => {
+    receipt.verifyGasUsedApproximately(38613n).verifyEvents((ev) => {
       ev.expectUSDCTransfer({ from: sender, to: receiver, value: amount }).expectAllEventsMatched()
     })
 
@@ -193,6 +352,66 @@ describe('NativeFiatToken', () => {
       .verify()
   })
 
+  /**
+   * Scenario: A USDC mint to a recipient with no prior state creates the recipient account.
+   * Call flow: operator -> FiatTokenProxy.mint(existingRecipient, amount), then operator -> FiatTokenProxy.mint(freshRecipient, amount) twice.
+   * Assertions: the first mint to the fresh recipient pays one account-creation surcharge; the later mint does not pay it again.
+   */
+  it('charges account creation gas once when minting USDC to a new account', async () => {
+    const { client, operator, receiver } = await clients()
+    const amount = USDC.parseUnits('0.000001')
+    const freshRecipient = privateKeyToAccount(generatePrivateKey())
+
+    expect(await client.getBalance({ address: freshRecipient.address })).to.equal(0n)
+    expect(await client.getTransactionCount({ address: freshRecipient.address })).to.equal(0)
+
+    const existingCallData = encodeUSDCMint(receiver.account.address, amount)
+    const existingReceipt = await USDC.attach(operator)
+      .write.mint([receiver.account.address, amount])
+      .then(ReceiptVerifier.waitSuccess)
+    existingReceipt.verifyEvents((ev) => {
+      ev.expectNativeMint({ recipient: receiver, amount: USDC.toNative(amount) })
+        .expectUSDCMint({ minter: operator, to: receiver, amount })
+        .expectUSDCTransfer({ from: zeroAddress, to: receiver, value: amount })
+        .expectAllEventsMatched()
+    })
+
+    const freshCallData = encodeUSDCMint(freshRecipient.address, amount)
+    const freshReceipt = await USDC.attach(operator)
+      .write.mint([freshRecipient.address, amount])
+      .then(ReceiptVerifier.waitSuccess)
+    freshReceipt.verifyEvents((ev) => {
+      ev.expectNativeMint({ recipient: freshRecipient.address, amount: USDC.toNative(amount) })
+        .expectUSDCMint({ minter: operator, to: freshRecipient.address, amount })
+        .expectUSDCTransfer({ from: zeroAddress, to: freshRecipient.address, value: amount })
+        .expectAllEventsMatched()
+    })
+
+    const repeatCallData = freshCallData
+    const repeatReceipt = await USDC.attach(operator)
+      .write.mint([freshRecipient.address, amount])
+      .then(ReceiptVerifier.waitSuccess)
+    repeatReceipt.verifyEvents((ev) => {
+      ev.expectNativeMint({ recipient: freshRecipient.address, amount: USDC.toNative(amount) })
+        .expectUSDCMint({ minter: operator, to: freshRecipient.address, amount })
+        .expectUSDCTransfer({ from: zeroAddress, to: freshRecipient.address, value: amount })
+        .expectAllEventsMatched()
+    })
+
+    expect(
+      freshReceipt.receipt.gasUsed - repeatReceipt.receipt.gasUsed,
+      'first mint should include account creation gas and repeat mint should not',
+    ).to.equal(ACCOUNT_CREATION_GAS_COST)
+    expectExecutionGasDelta(
+      repeatReceipt,
+      repeatCallData,
+      existingReceipt,
+      existingCallData,
+      0n,
+      'later mint to created account should price like mint to an existing account',
+    )
+  })
+
   it('burn', async () => {
     const { client, usdc, operator, totalSupply } = await clients()
     const amount = USDC.parseUnits('0.000001')
@@ -256,8 +475,7 @@ describe('NativeFiatToken', () => {
         .then(ReceiptVerifier.waitSuccess)
 
       // Verify unblocklist event was emitted
-      // Zero5: cold SSTORE non-zero→zero (EIP-2200)
-      unblocklistReceipt.verifyGasUsedApproximately(40862n).verifyEvents((ev) => {
+      unblocklistReceipt.verifyGasUsedApproximately(38762n).verifyEvents((ev) => {
         ev.expectNativeUnBlocklisted({ account: targetAccount })
           .expectUSDCUnBlacklisted({ account: targetAccount })
           .expectAllEventsMatched()
@@ -436,16 +654,11 @@ describe('NativeFiatToken', () => {
       const { client, operator, sender, createRandWallet } = await clients()
       const receiver = await createRandWallet().then((x) => x.account)
 
-      // Get beneficiary address from ProtocolConfig
-      const protocolConfig = ProtocolConfig.attach(client)
-      const beneficiary = await protocolConfig.read.rewardBeneficiary()
-
       // Blocklist the receiver address first
       await USDC.attach(operator).write.blacklist([receiver.address]).then(ReceiptVerifier.waitSuccess)
 
       // Setup balance tracking AFTER blocklist operation to avoid interference
       const balances = await balancesSnapshot(client, {
-        beneficiary,
         sender: sender.account.address,
         receiver: receiver.address,
       })
@@ -458,13 +671,19 @@ describe('NativeFiatToken', () => {
       // Calculate gas fees and verify balance changes
       const totalFee = receiptVerifier.totalFee()
 
-      // Verify that gas was consumed from sender and reward sent to beneficiary
+      // Verify the actual block miner received the gas fees. Derived from block.miner
+      // (not hard-coded) so this works under both smoke scenarios — reth --dev always
+      // mines to the genesis coinbase, malachite rotates per proposer.
+      const block = await client.getBlock({ blockHash: receiptVerifier.blockHash })
+      const [minerBefore, minerAfter] = await Promise.all([
+        client.getBalance({ address: block.miner, blockNumber: block.number - 1n }),
+        client.getBalance({ address: block.miner, blockNumber: block.number }),
+      ])
+      expect(minerAfter - minerBefore, `miner ${block.miner} should receive gas fees`).to.equal(totalFee)
+
       await balances
-        .increase({
-          beneficiary: totalFee, // Beneficiary receives gas fees
-        })
         .decrease({
-          sender: totalFee, // Sender pays the gas fees
+          sender: totalFee,
         })
         .verify()
 
@@ -561,7 +780,7 @@ describe('NativeFiatToken', () => {
 
       // Verify we have 1 transfer events for the chain
       // - Event 0: sender -> nativeTransferHelperA
-      receipt.verifyGasUsedApproximately(37760n).verifyEvents((ev) => {
+      receipt.verifyGasUsedApproximately(33518n).verifyEvents((ev) => {
         ev.expectCount(1).expectNativeTransfer({ from: sender, to: nativeTransferHelperA.address, amount })
       })
 
@@ -645,7 +864,7 @@ describe('NativeFiatToken', () => {
           60000n, // set gas manually
         )
         .then(ReceiptVerifier.build)
-      receipt.isReverted().verifyNoEvents().verifyGasUsedApproximately(37849n)
+      receipt.isReverted().verifyNoEvents().verifyGasUsedApproximately(33607n)
 
       // Verify that no balance changes occurred
       await balances.decrease({ sender: receipt.totalFee() }).verify()
@@ -663,7 +882,7 @@ describe('NativeFiatToken', () => {
           120000n, // set gas manually
         )
         .then(ReceiptVerifier.build)
-      receipt2.isReverted().verifyNoEvents().verifyGasUsedApproximately(37849n)
+      receipt2.isReverted().verifyNoEvents().verifyGasUsedApproximately(33607n)
 
       // Verify that no balance changes occurred
       await balances.decrease({ sender: receipt2.totalFee() }).verify()
@@ -917,17 +1136,6 @@ describe('NativeFiatToken', () => {
 
       // Unblocklist for cleanup
       await USDC.attach(operator).write.unBlacklist([predictedAddress]).then(ReceiptVerifier.waitSuccess)
-    })
-
-    it('execution frames blocklist: CREATE from EOA succeeds when created address is blocklisted and no value is transferred', async () => {
-      const { client, operator, sender } = await clients()
-
-      // Calculate the address that will be created
-      const nonce = await client.getTransactionCount({ address: sender.account.address })
-      const predictedAddress = getCreateAddress({ from: sender.account.address, nonce: BigInt(nonce) })
-
-      // Blocklist the predicted contract address
-      await USDC.attach(operator).write.blacklist([predictedAddress]).then(ReceiptVerifier.waitSuccess)
     })
 
     it('execution frames blocklist: CREATE from EOA succeeds when created address is blocklisted and no value is transferred', async () => {
@@ -1195,9 +1403,9 @@ describe('NativeFiatToken', () => {
                 //     {caller: A, target: A, delegate: B, value: amount1, data: transfer...}
                 //     frame: A.callCode -> B.transfer -> receiver
                 //       {caller: A, target: receiver: value: amount2, data: 0x}
-                //       revert: "address is blocklisted"
+                //       revert: "Blocked address"
                 //     event: ExecutionContext(A, amount1)
-                //     event: ExecutionResult(false, "address is blocklisted")
+                //     event: ExecutionResult(false, "Blocked address")
                 //   event: ExecutionResult(true, "0x")
                 ev.expectExecutionContext({ helper: blocklistedA, sender: blocklistedA, value: amount1 })
                   .expectExecutionResult({ helper: blocklistedA, success: false, result: blocklistedResult })
@@ -1212,9 +1420,9 @@ describe('NativeFiatToken', () => {
                 //     {caller: Sender, target: A, delegate: B, value: 0, data: transfer...}
                 //     frame: A.delegateCall -> B.transfer -> receiver
                 //       {caller: A, target: receiver: value: amount2, data: 0x}
-                //       revert: "address is blocklisted"
+                //       revert: "Blocked address"
                 //     event: ExecutionContext(Sender, 0)
-                //     event: ExecutionResult(false, "address is blocklisted")
+                //     event: ExecutionResult(false, "Blocked address")
                 //   event: ExecutionResult(true, "0x")
                 ev.expectExecutionContext({ helper: blocklistedA, sender, value: 0n })
                   .expectExecutionResult({ helper: blocklistedA, success: false, result: blocklistedResult })
@@ -1320,7 +1528,7 @@ describe('NativeFiatToken', () => {
     // Transfer away the 12 decimals of dust on this account, so that
     // the USDC transferFrom (using 6 decimals) will fully drain the account
     const divisor = 1_000_000_000_000n // 1e12
-    const gas = 25_200n // intrinsic gas for a simple native transfer (21000 + 4200 for blocklist checks)
+    const gas = 21_000n // intrinsic gas for a simple native transfer
 
     let balance = await client.getBalance({ address: randomWallet.account.address })
     const gasPrice = await client.getGasPrice() // or pick e.g. 1_000_000_000n (1 gwei) in tests
@@ -1668,7 +1876,7 @@ describe('NativeFiatToken', () => {
       const helper = await CallHelper.deploy(sender, client)
 
       // setup the helper as the minter
-      await USDC.attach(admin).write.configureMinter([helper.address, 1n])
+      await USDC.attach(admin).write.configureMinter([helper.address, 1n]).then(ReceiptVerifier.waitSuccess)
 
       const receipt = await sender
         .sendTransaction({

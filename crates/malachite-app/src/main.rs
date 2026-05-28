@@ -31,14 +31,21 @@ use arc_consensus_types::{
 use arc_node_consensus::hardcoded_config;
 use arc_node_consensus::node::{App, StartConfig};
 use arc_node_consensus::store::migrations::MigrationCoordinator;
+use arc_node_consensus::store::{rollback_to_height, CERTIFICATES_TABLE, ROLLBACK_BATCH_SIZE};
 use arc_node_consensus_cli::{
     args::{Args, Commands},
     cmd::{
-        db::DbCommands, db::MigrateCmd, download::DownloadCmd, init::InitCmd, key::KeyCmd,
-        start::StartCmd,
+        db::DbCommands,
+        db::MigrateCmd,
+        db::RollbackCmd,
+        download::DownloadCmd,
+        init::InitCmd,
+        key::KeyCmd,
+        start::{StartCmd, RUNTIME_MULTI_THREADED, RUNTIME_SINGLE_THREADED},
     },
     config, logging, runtime,
 };
+use redb::ReadableTable;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -48,7 +55,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(feature = "pprof")]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
-pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
 /// Main entry point for the application
 ///
@@ -64,14 +71,15 @@ fn main() -> Result<()> {
     // Load command-line arguments and possible configuration file.
     let args = Args::new();
 
-    // Override logging configuration (if exists) with optional command-line parameters.
-    let mut logging = config::LoggingConfig::default();
-    if let Some(log_level) = args.log_level {
-        logging.log_level = log_level;
-    }
-    if let Some(log_format) = args.log_format {
-        logging.log_format = log_format;
-    }
+    // StartCmd log_level/log_format take precedence over Args-level (for backwards compat).
+    let (start_cmd_log_level, start_cmd_log_format) = match &args.command {
+        Commands::Start(cmd) => (cmd.log_level, cmd.log_format),
+        _ => (None, None),
+    };
+    let logging = config::LoggingConfig {
+        log_level: start_cmd_log_level.unwrap_or(args.log_level),
+        log_format: start_cmd_log_format.unwrap_or(args.log_format),
+    };
 
     // This is a drop guard responsible for flushing any remaining logs when the program terminates.
     // It must be assigned to a binding that is not _, as _ will result in the guard being dropped immediately.
@@ -93,6 +101,7 @@ fn main() -> Result<()> {
         Commands::Db(db_cmd) => match db_cmd {
             DbCommands::Migrate(cmd) => db_migrate(&args, cmd),
             DbCommands::Compact => compact(&args),
+            DbCommands::Rollback(cmd) => rollback(&args, cmd),
         },
         Commands::Download(cmd) => download(&args, cmd),
     }
@@ -148,12 +157,14 @@ fn build_config_from_cli(cmd: &StartCmd, logging: config::LoggingConfig) -> Resu
     };
 
     let runtime = match cmd.runtime_flavor.as_str() {
-        "single-threaded" => RuntimeConfig::single_threaded(),
-        "multi-threaded" => RuntimeConfig::multi_threaded(cmd.worker_threads.unwrap_or(0)),
+        RUNTIME_SINGLE_THREADED => RuntimeConfig::single_threaded(),
+        RUNTIME_MULTI_THREADED => RuntimeConfig::multi_threaded(cmd.worker_threads.unwrap_or(0)),
         _ => {
             return Err(eyre!(
-                "Invalid runtime flavor: {}. Must be 'single-threaded' or 'multi-threaded'",
-                cmd.runtime_flavor
+                "Invalid runtime flavor: {}. Must be '{}' or '{}'",
+                cmd.runtime_flavor,
+                RUNTIME_SINGLE_THREADED,
+                RUNTIME_MULTI_THREADED,
             ));
         }
     };
@@ -232,8 +243,10 @@ fn start(args: &Args, cmd: &StartCmd, logging: config::LoggingConfig) -> Result<
         execution_ws_endpoint: cmd.execution_ws_endpoint.clone(),
         execution_jwt: cmd.execution_jwt.clone(),
         pprof_bind_address: Some(cmd.pprof_addr.parse()?),
+        pprof_heap_prof: cmd.pprof_heap_prof,
         suggested_fee_recipient: cmd.suggested_fee_recipient,
         skip_db_upgrade: cmd.skip_db_upgrade,
+        validator: cmd.validator,
         rpc_sync_enabled: cmd.follow,
         rpc_sync_endpoints: cmd.follow_endpoints.clone(),
     };
@@ -286,7 +299,18 @@ fn db_migrate(args: &Args, cmd: &MigrateCmd) -> Result<()> {
     }
 
     if cmd.dry_run {
-        info!("Dry-run mode: would perform migration but not committing");
+        let stats = coordinator
+            .preview_migrate()
+            .map_err(|e| eyre!("Dry-run migration scan failed: {e}"))?;
+
+        info!(
+            tables = stats.tables_migrated,
+            scanned = stats.records_scanned,
+            would_upgrade = stats.records_upgraded,
+            skipped = stats.records_skipped,
+            duration = ?stats.duration,
+            "Dry-run mode: migration scan complete (no changes committed)"
+        );
         return Ok(());
     }
 
@@ -348,6 +372,104 @@ fn compact(args: &Args) -> Result<()> {
         reclaimed = %ByteSize::b(before_size.saturating_sub(after_size)),
         "Database compaction completed successfully"
     );
+
+    Ok(())
+}
+
+fn rollback(args: &Args, cmd: &RollbackCmd) -> Result<()> {
+    info!("Starting database rollback");
+
+    let db_path = args.get_db_path()?;
+    if !db_path.exists() {
+        return Err(eyre!("Database file not found at {}", db_path.display()));
+    }
+
+    info!(path = %db_path.display(), "Opening database");
+
+    let db = redb::Database::builder()
+        .open(&db_path)
+        .map_err(|e| eyre!("Failed to open database: {e}"))?;
+
+    let current_height = {
+        let tx = db
+            .begin_read()
+            .map_err(|e| eyre!("Failed to start read transaction: {e}"))?;
+        let table = tx
+            .open_table(CERTIFICATES_TABLE)
+            .map_err(|e| eyre!("Failed to open certificates table: {e}"))?;
+        table
+            .last()
+            .map_err(|e| eyre!("Failed to read certificates tip: {e}"))?
+            .map(|(k, _)| k.value())
+            .ok_or_else(|| eyre!("Consensus database is empty; nothing to roll back"))?
+    };
+
+    let target_height = match (cmd.num_heights, cmd.to_height) {
+        (Some(n), None) => {
+            if n == 0 {
+                return Err(eyre!("--num-heights must be greater than 0"));
+            }
+            current_height.saturating_sub(n)
+        }
+        (None, Some(h)) => Height::new(h),
+        _ => {
+            return Err(eyre!(
+                "Specify exactly one of --num-heights <COUNT> or --to-height <HEIGHT>"
+            ));
+        }
+    };
+
+    if target_height >= current_height {
+        return Err(eyre!(
+            "Target height {} is not below current height {}; nothing to roll back",
+            target_height,
+            current_height,
+        ));
+    }
+
+    if target_height < Height::new(1) {
+        return Err(eyre!(
+            "Rolling back to height {} would erase genesis (height 1). \
+             Minimum target height is 1.",
+            target_height,
+        ));
+    }
+
+    let heights_to_remove = current_height
+        .as_u64()
+        .checked_sub(target_height.as_u64())
+        .expect("target_height < current_height guarded above");
+
+    info!(
+        current_height = %current_height,
+        target_height = %target_height,
+        heights_to_remove = heights_to_remove,
+        execute = cmd.execute,
+        "Rolling back consensus database"
+    );
+
+    let dry_run = !cmd.execute;
+    let report = rollback_to_height(&db, target_height, ROLLBACK_BATCH_SIZE, dry_run)
+        .map_err(|e| eyre!("Rollback failed: {e}"))?;
+
+    info!(
+        prior_height = %current_height,
+        target_height = %target_height,
+        certificates = report.certificates,
+        decided_blocks = report.decided_blocks,
+        invalid_payloads = report.invalid_payloads,
+        misbehavior_evidence = report.misbehavior_evidence,
+        proposal_monitor_data = report.proposal_monitor_data,
+        undecided_blocks = report.undecided_blocks,
+        pending_proposal_parts = report.pending_proposal_parts,
+        "Rollback report"
+    );
+
+    if dry_run {
+        info!("Dry run complete. To execute this rollback, re-run with --execute");
+    } else {
+        info!("Database rollback completed successfully");
+    }
 
     Ok(())
 }
@@ -619,7 +741,7 @@ mod tests {
     #[test]
     fn build_config_from_cli_multi_threaded_runtime_with_threads() {
         let mut cmd = minimal_start_cmd();
-        cmd.runtime_flavor = "multi-threaded".to_string();
+        cmd.runtime_flavor = RUNTIME_MULTI_THREADED.to_string();
         cmd.worker_threads = Some(8);
 
         let logging = test_logging_config();
@@ -632,7 +754,7 @@ mod tests {
     #[test]
     fn build_config_from_cli_single_threaded_runtime() {
         let mut cmd = minimal_start_cmd();
-        cmd.runtime_flavor = "single-threaded".to_string();
+        cmd.runtime_flavor = RUNTIME_SINGLE_THREADED.to_string();
 
         let logging = test_logging_config();
         let config = build_config_from_cli(&cmd, logging).unwrap();

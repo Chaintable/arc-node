@@ -20,7 +20,7 @@ use crate::accounts::PartitionMode;
 use color_eyre::eyre::{self, Result};
 use std::str::FromStr;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GuzzlerFunction {
     #[default]
     HashLoop,
@@ -30,13 +30,13 @@ pub enum GuzzlerFunction {
     Guzzle2,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuzzlerFnConfig {
     pub weight: u32,
     pub arg: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuzzlerFnWeights {
     pub hash_loop: GuzzlerFnConfig,
     pub storage_write: GuzzlerFnConfig,
@@ -145,7 +145,7 @@ impl FromStr for GuzzlerFnWeights {
 }
 
 /// ERC-20 function the spammer can call.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Erc20Function {
     #[default]
     Transfer,
@@ -158,7 +158,7 @@ pub enum Erc20Function {
 /// Parsed from a comma-separated string such as `transfer=70,approve=20,transfer-from=10`.
 /// Weights are ratios. When all weights are 0 (the default), the generator
 /// defaults to 100% transfer for backward compatibility.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Erc20FnWeights {
     pub transfer: u32,
     pub approve: u32,
@@ -232,7 +232,7 @@ pub enum TxType {
 /// Parsed from a comma-separated string such as `transfer=70,erc20=20,guzzler=10`.
 /// Weights are ratios, not percentages, so `transfer=2,erc20=1` produces ~67% transfers
 /// and ~33% ERC-20 calls.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TxTypeMix {
     pub transfer: u32,
     pub legacy: u32,
@@ -384,6 +384,41 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+/// Subset of [`Config`] used when resuming a spammer across phases.
+///
+/// Fields that control account provisioning (`num_generators`, `partition_mode`,
+/// `max_num_accounts`, `preinit_accounts`) are intentionally absent — those come
+/// from the captured [`SpammerState`](crate::SpammerState) instead.
+pub struct ResumeConfig {
+    pub max_rate: u64,
+    pub max_num_txs: u64,
+    pub max_time: u64,
+    pub wait_response: bool,
+    pub reconnect_attempts: u32,
+    pub reconnect_period: std::time::Duration,
+    pub silent: bool,
+    pub show_pool_status: bool,
+    pub tx_latency: bool,
+    pub csv_dir: Option<PathBuf>,
+}
+
+impl From<&Config> for ResumeConfig {
+    fn from(c: &Config) -> Self {
+        Self {
+            max_rate: c.max_rate,
+            max_num_txs: c.max_num_txs,
+            max_time: c.max_time,
+            wait_response: c.wait_response,
+            reconnect_attempts: c.reconnect_attempts,
+            reconnect_period: c.reconnect_period,
+            silent: c.silent,
+            show_pool_status: c.show_pool_status,
+            tx_latency: c.tx_latency,
+            csv_dir: c.csv_dir.clone(),
+        }
     }
 }
 

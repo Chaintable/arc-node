@@ -14,6 +14,15 @@ resource "aws_instance" "cc" {
   vpc_security_group_ids = [aws_security_group.cc_sg.id]
   iam_instance_profile   = local.ec2_profile_name
 
+  dynamic "root_block_device" {
+    for_each = var.cc_volume_size != null ? [var.cc_volume_size] : []
+    iterator = vol
+    content {
+      volume_size = vol.value
+      volume_type = "gp3"
+    }
+  }
+
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required" # IMDSv2 only
@@ -40,6 +49,13 @@ resource "aws_instance" "cc" {
     { for tag in var.tags : tag => "true" },
     { cc = "true" },
     { region = var.region },
+    { project = local.project_name }
+  )
+
+  # See nodes.tf for rationale.
+  volume_tags = merge(
+    { Name = "cc-root" },
+    { for tag in var.tags : tag => "true" },
     { project = local.project_name }
   )
 }

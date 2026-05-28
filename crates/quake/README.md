@@ -19,6 +19,7 @@ Quake is a tool for deploying Arc testnets and running end-to-end tests.
   - change the voting power of validators in the validator set of a node,
   - upgrade the running version of individual nodes.
 - Emulate network latency between nodes by assigning data-center regions to nodes and injecting artificial latency between regions.
+- Web-based topology viewer for real-time visualization of nodes, connections, peer status, and network health.
 - MCP (Model Context Protocol) server for AI-assisted testnet management via Claude Code, Cursor, and other MCP-compatible clients.
 
 __Table of contents__
@@ -37,6 +38,7 @@ __Table of contents__
       - [Upgrade](#upgrade)
       - [Chaos testing](#chaos-testing)
     - [The `valset` command](#the-valset-command)
+    - [The `web` command](#the-web-command)
     - [The `mcp` command](#the-mcp-command)
     - [The `generate` command](#the-generate-command)
   - [Manifest File Format](#manifest-file-format)
@@ -62,6 +64,7 @@ __Table of contents__
     - [Custom Docker images](#custom-docker-images)
     - [Remote commands](#remote-commands)
     - [Sharing a remote testnet](#sharing-a-remote-testnet)
+    - [Cleaning up orphaned AWS resources](#cleaning-up-orphaned-aws-resources)
   - [Profiling](#profiling)
     - [Prerequisites](#prerequisites)
     - [Feature environment variables](#feature-environment-variables)
@@ -133,16 +136,16 @@ modify the generated configuration files before starting the nodes.
 ./quake perturb pause val*_cl
 
 # Send 1000 transactions per second during 30 seconds to one validator node
-./quake load -t 30 -r 1000 validator1
+./quake load -t 30 -r 1000 --targets validator1
 
 # Mixed EIP-1559 and legacy transfer load (70/30 split)
-./quake load -t 30 -r 1000 --mix transfer=70,legacy=30 validator1
+./quake load -t 30 -r 1000 --mix transfer=70,legacy=30 --targets validator1
 
 # Mixed ERC-20 and native transfer load (70/30 split)
-./quake load -t 30 -r 1000 --mix transfer=70,erc20=30 validator1
+./quake load -t 30 -r 1000 --mix transfer=70,erc20=30 --targets validator1
 
 # ERC-20 with mixed functions: 60% transfer, 30% approve, 10% transferFrom
-./quake load -t 30 -r 1000 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 validator1
+./quake load -t 30 -r 1000 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 --targets validator1
 
 # Stop one node (both CL and EL containers)
 ./quake stop val*3
@@ -184,6 +187,7 @@ graph LR
         logs
         valset
         load
+        web
         ssh["remote ssh"]
         export["remote export"]
         import["remote import"]
@@ -280,9 +284,11 @@ You can customize the timeout and number of retries for transient RPC failures:
 ```
 
 > [!TIP]
-> When a node name is required as parameter, we can use a wildcard '*'. For
-> example, `val*_cl` will expand to the names of all consensus layer containers
-> of validator nodes (`validator1_cl`, `validator2_cl`, etc.).
+> When a command takes node or container names directly, we can use a
+> wildcard `*`. For example, `val*_cl` expands to the names of all
+> consensus-layer containers of validator nodes (`validator1_cl`,
+> `validator2_cl`, etc.). This does not apply to `load` or `spam`
+> `--targets`, which accept exact node names and manifest node groups.
 
 Apply a pause of 300ms to the consensus layer containers of all validators:
 ```bash
@@ -293,17 +299,17 @@ of time. For more on perturbations, see below.
 
 Send 1000 transactions per second during 30 seconds to one validator node:
 ```bash
-./quake load -t 30 -r 1000 validator1
+./quake load -t 30 -r 1000 --targets validator1
 ```
 
 Send a mixed workload (ERC-20 and native transfers) at 500 TPS:
 ```bash
-./quake load -t 60 -r 500 --mix transfer=50,erc20=50 validator1
+./quake load -t 60 -r 500 --mix transfer=50,erc20=50 --targets validator1
 ```
 
 Send ERC-20 traffic with diverse function calls (approve, transferFrom alongside transfer):
 ```bash
-./quake load -t 60 -r 500 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 validator1
+./quake load -t 60 -r 500 --mix erc20=100 --erc20-fn-weights transfer=60,approve=30,transfer-from=10 --targets validator1
 ```
 
 Stop the nodes
@@ -315,17 +321,18 @@ Remove generated files
 ```bash
 ./quake clean
 ```
-It will `stop` the nodes, if not done before.
+It will stop the nodes first if needed. Monitoring services are managed
+separately with `quake monitoring`.
 
 Clean and restart the testnet in one step:
 ```bash
 ./quake restart
 ```
-This is equivalent to running `clean` followed by `start`. It accepts the same
-flags as both commands, e.g. `--all` (from `clean`) and `--remote` (from `start`):
+This is equivalent to running `clean` followed by `start`. It accepts clean
+scope flags such as `--all` and `--data`, plus the regular `start` flags:
 ```bash
-# Clean everything (including monitoring data) and restart
-./quake restart --all
+# Clean everything (including monitoring data) and restart without monitoring services
+./quake restart --all --monitoring=false
 
 # Clean all nodes and restart specific nodes
 ./quake restart validator1 validator2
@@ -357,21 +364,27 @@ while still using optimistic nonces; expect multiple `nonce too low` errors to b
 Both commands support blending transaction types with `--mix`:
 ```bash
 # 1000 TPS of native transfers for 30 seconds (backpressure)
-./quake load -t 30 -r 1000 validator1
+./quake load -t 30 -r 1000 --targets validator1
 
 # Same workload in fire-and-forget mode
-./quake spam -t 30 -r 1000 validator1
+./quake spam -t 30 -r 1000 --targets validator1
 
 # Mixed workload: 70% native transfers, 30% ERC-20
-./quake load -t 60 -r 500 --mix transfer=70,erc20=30 validator1
+./quake load -t 60 -r 500 --mix transfer=70,erc20=30 --targets validator1
 
 # Gas-intensive workload with diverse guzzler functions
 ./quake load -t 60 -r 200 --mix guzzler=100 \
-  --guzzler-fn-weights hash-loop=70@2000,storage-write=30@600 validator1
+  --guzzler-fn-weights hash-loop=70@2000,storage-write=30@600 \
+  --targets validator1
 
 # Fire-and-forget at high throughput, targeting all nodes
 ./quake spam -t 120 -r 5000
 ```
+
+`--targets` accepts a comma-separated list of explicit node names or manifest
+node groups such as `ALL_VALIDATORS`, `ALL_NON_VALIDATORS`, `ALL_NODES`, or
+custom groups defined under `[node_groups]`. If `--targets` is omitted,
+transactions are sent to all manifest nodes.
 
 Common flags (see `./quake load --help` for the full list):
 
@@ -384,8 +397,6 @@ Common flags (see `./quake load --help` for the full list):
 | `--mix` | | `transfer=100` | Transaction type blend: `transfer`, `erc20`, `guzzler` |
 | `--tx-latency` | | `false` | Record submit-to-finalized latency to CSV |
 
-If no target nodes are specified, transactions are sent to all nodes.
-
 #### Latency tracking (`--tx-latency`)
 
 The `--tx-latency` flag measures end-to-end transaction latency: the wall-clock
@@ -394,8 +405,8 @@ See the [spammer README](../spammer/README.md#transaction-latency-tracking) for
 full details on the tracking architecture, CSV output format, and analysis tools.
 
 ```bash
-./quake load -t 30 -r 1000 --tx-latency validator1
-./quake load -t 30 -r 1000 --tx-latency --csv-dir .quake/results validator1
+./quake load -t 30 -r 1000 --tx-latency --targets validator1
+./quake load -t 30 -r 1000 --tx-latency --csv-dir .quake/results --targets validator1
 ```
 
 **Recording behavior by mode:**
@@ -610,6 +621,37 @@ Notes:
 do not use container names (`validator1_cl`, `validator2_cl`).
 - it does not accept `*` wildcards.
 
+### The `web` command
+
+The `web` command starts a browser-based topology viewer that visualizes the testnet in real time and allows you to control the testnet.
+Open `http://localhost:7777` in a browser to see the web application.
+Currently, it only works in local mode.
+
+There is one tab per topology:
+- **Manifest**: expected topology from manifest peers and subnets (always available)
+- **CL Consensus / Liveness / Proposal Parts**: gossipsub mesh per topic (live)
+- **EL Peers**: execution layer devp2p peer connections (live)
+
+Two views: **Graph** (force-directed layout with subnet clustering) and **Map** (world map with nodes at their AWS region coordinates).
+
+#### Data architecture
+
+- **CL data** (mesh topology, proposer, rounds): Fetched via HTTP from each node's `/network-state` and `/status` endpoints during each topology poll.
+- **EL data** (block heights, peers, mempool): Collected via a single WebSocket connection per node. Block heights arrive in real-time via `eth_subscribe(newHeads)`. Peer data (`admin_peers`) and mempool status (`txpool_status`) are polled periodically on the same connection.
+- **Container statuses**: Tracked by two background tasks: a `docker events` subscriber for real-time state changes (start, stop, pause, die) and a periodic `docker inspect` poller for network disconnect detection.
+
+For a deeper dive (server state, background tasks, topology assembly, frontend rendering pipeline), see [`docs/web-architecture.md`](docs/web-architecture.md).
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `127.0.0.1` | Bind address for the web server |
+| `--port` | `7777` | Web server port |
+| `--refresh-ms` | `1000` | Frontend topology poll interval (ms) |
+| `--el-refresh-ms` | `1000` | EL peer refresh poller interval (ms) |
+| `--container-refresh-ms` | `1000` | Docker container status poller interval (ms) |
+
 ### The `mcp` command
 
 The `mcp` command starts a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that exposes Quake's testnet tools to AI assistants like Claude Code, Cursor, and other MCP-compatible clients. This lets you observe, manage, and test a running testnet through natural language.
@@ -734,7 +776,7 @@ quake generate -o target/manifests
 
 **Nightly CI**
 
-A [nightly workflow](../../.github/workflows/nightly-random-manifests.yml) runs daily at 3 AM UTC and can be triggered:
+A nightly workflow runs daily at 3 AM UTC and can be triggered:
 - **Scheduled/PR runs**: Use seed `42` for reproducibility.
 - **Manual dispatch** (`workflow_dispatch`): Optionally specify a base seed (must be a non-negative integer; leave blank to use `42`) and a per-job count (positive integer ≤ 50; leave blank to use `3`).
 
@@ -742,6 +784,46 @@ The workflow runs **10 parallel jobs** (matrix indices 0–9). Each job computes
 
 PRs labeled `test-random` will also trigger this workflow.
 
+### The `clean` command
+
+By default, `clean` stops the testnet and removes all node data and configuration,
+but leaves monitoring data alone. The following flags control what is removed:
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--all` | `-a` | Remove everything, including monitoring services and their data. Cannot be combined with data flags. |
+| `--data` | `-d` | Remove only execution and consensus layer data, preserving configuration. Cannot be combined with `--execution-data` or `--consensus-data`. |
+| `--execution-data` | `-x` | Remove only execution layer (Reth) data. Cannot be combined with `--data` or `--consensus-data`. |
+| `--consensus-data` | `-c` | Remove only consensus layer (Malachite) data. Cannot be combined with `--data` or `--execution-data`. |
+
+```bash
+# Remove node data only (keep config, monitoring intact)
+./quake clean --data
+
+# Remove only execution layer data
+./quake clean --execution-data
+
+# Remove only consensus layer data
+./quake clean --consensus-data
+
+# Remove everything including monitoring
+./quake clean --all
+```
+
+### The `monitoring` command
+
+Monitoring services (Prometheus, Grafana, cAdvisor, Blockscout) can be controlled with the `monitoring` command:
+
+```bash
+# Start monitoring services
+./quake monitoring start
+
+# Stop monitoring services
+./quake monitoring stop
+
+# Stop monitoring services and remove monitoring data
+./quake monitoring clean
+```
 
 ## Manifest File Format
 
@@ -766,6 +848,37 @@ Optional top-level settings:
     `${IMAGE_REGISTRY_URL}/arc-execution:<version>`, where `IMAGE_REGISTRY_URL`
     is taken from the `.env` file (see [Custom Docker images](#custom-docker-images)).
 - **image_cl_upgrade**, **image_el_upgrade**: Docker images to use when upgrading containers with `quake perturb upgrade`. Required for upgrade scenarios; not supported in remote mode.
+- **node_size**: EC2 instance type for validator/full nodes (e.g. `"m6a.4xlarge"`). Equivalent to
+  the `--node-size` CLI flag. See [Instance sizing](#instance-sizing) for available options.
+  **Remote mode only** — ignored in local mode (a warning is printed).
+- **cc_size**: EC2 instance type for the Control Center. Equivalent to `--cc-size`.
+  **Remote mode only** — ignored in local mode.
+- **node_disk_gb**: Root EBS volume size in GiB for each node. Must be ≥ 8. Equivalent to
+  `--node-disk-gb`. Omit to keep the AMI default. **Remote mode only** — ignored in local mode.
+- **cc_disk_gb**: Root EBS volume size in GiB for the Control Center. Must be ≥ 8. Equivalent to
+  `--cc-disk-gb`. **Remote mode only** — ignored in local mode.
+- **node_volume_type**: AWS EBS volume type for each node's root disk; tunes disk
+  cost/performance (e.g. match a production disk profile). General Purpose SSD
+  (`gp2`, `gp3`), Provisioned IOPS SSD (`io1`, `io2`), Throughput Optimized HDD (`st1`),
+  Cold HDD (`sc1`). Default: `gp3`. See [AWS EBS volume types][ebs-types]. Equivalent
+  to `--node-volume-type`. **Remote mode only**.
+- **node_volume_iops**: Provisioned IOPS for the node root EBS volume; raises the I/O
+  ceiling above the volume type's baseline. Only valid with `gp3`, `io1`, `io2`; range
+  100–256000. Default: AMI's baseline IOPS for the chosen type. Equivalent to
+  `--node-volume-iops`. **Remote mode only**.
+- **el_cpu_limit**: Hard CPU cap for each EL container; reproduces production CPU quotas
+  on the testnet. Whole or fractional CPUs (e.g. `0.5`). Maps to Docker Compose
+  [`cpus`][compose-cpus]. Default: no limit (container uses all host CPUs).
+- **el_memory_limit_gb**: Hard memory cap for each EL container in GiB; fractional values
+  (e.g. `2.5`) are allowed. Maps to Docker Compose [`mem_limit`][compose-mem-limit].
+  Default: no limit locally; 2.5 GiB on remote.
+- **cl_cpu_limit**: Hard CPU cap for each CL container; same semantics as `el_cpu_limit`.
+- **cl_memory_limit_gb**: Hard memory cap for each CL container in GiB; fractional values
+  allowed. Default: no limit locally; 1 GiB on remote.
+
+[ebs-types]: https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volume-types.html
+[compose-cpus]: https://docs.docker.com/reference/compose-file/services/#cpus
+[compose-mem-limit]: https://docs.docker.com/reference/compose-file/services/#mem_limit
 
 ### Nodes
 
@@ -780,24 +893,61 @@ Nodes are defined as individual TOML sections with names starting with `validato
 
 ### Node Configuration
 
-- The configuration of the Malachite application (Consensus Layer) is defined in
-`crates/types/src/config.rs`. It can be set globally or for each node by
-prefixing the config field with `cl.config.`.
-- The default configuration of Reth (Execution Layer) is defined in `crates/quake/src/manifest.rs`.
-It can be set globally or for each node by prefixing the config field with `el.config.`.
+Consensus Layer (CL) configuration is set under `cl.config.*` keys. The
+schema depends on the CL image version (`image_cl`):
 
-For example:
+- **Modern CL (>= v0.5.0)**: the schema matches the `StartCmd` struct in
+  [`crates/malachite-cli/src/cmd/start.rs`](../malachite-cli/src/cmd/start.rs).
+  Keys are flat and map 1:1 to the `arc-node-consensus start` CLI flags
+  (e.g. `cl.config.log_level = "debug"` → `--log-level=debug`). Quake
+  translates the merged config into CLI flags at setup time and the node is
+  launched with no `config.toml`.
+- **Legacy CL (< v0.5.0)**: the schema matches the `Config` struct in
+  [`crates/types/src/config.rs`](../types/src/config.rs). Keys are nested
+  (e.g. `cl.config.logging.log_level = "debug"`) and the merged config is
+  written to `config.toml` at setup time. Legacy mode is scheduled for
+  deprecation.
+
+Quake detects which schema to use by parsing the `image_cl` tag; `latest`,
+missing tags, and unparsable tags are treated as Modern. The two formats
+are not interchangeable — `cl.config.log_level` on a Legacy image (and
+`cl.config.logging.log_level` on a Modern image) will fail to parse.
+Upgrading a running testnet across the legacy/modern boundary with
+`perturb upgrade` is **not supported**: the upgraded binary would start
+with no CLI flags. For upgrade scenarios, start the testnet on a Modern
+version.
+
+#### Matching Flags to the Target Image Version
+
+Upgrade scenarios can pin an older `arc_consensus` image tag (e.g.
+`v0.6.0`). Quake derives CLI flags from the `StartCmd` definition
+compiled into its own binary, which may have gained, renamed, or removed
+flags since that image shipped. Before handing the flags to the
+container, Quake rewrites them to match the target version, i.e., older
+images receive a compatible subset, and `"latest"`, missing, or
+unparsable tags pass through unchanged.
+
+If pinning an older image fails with `unexpected argument`, that version
+likely needs a new compatible entry. See `apply_version_compat` in
+[`src/cli_version.rs`](src/cli_version.rs) for the rustdoc describing
+how to add one.
+
+The default configuration of Reth (Execution Layer) is defined in
+[`crates/quake/src/manifest.rs`](src/manifest.rs). It can be set globally
+or for each node by prefixing the config field with `el.config.`.
+
+For example (Modern CL):
 
 ```toml
 # Global settings that apply to all nodes
 engine_api_connection = "rpc"  # or "ipc" (default)
-cl.config.logging.log_level = "debug"
+cl.config.log_level = "debug"
 el.config.disable-discovery = true
 
 [[nodes]]
 [validator1]
 # Node-specific settings
-cl.config.consensus.p2p.rpc_max_size = "1Mb"
+cl.config.discovery_num_outbound_peers = 30
 [validator2]
 # Node-specific settings
 el.config.builder.deadline = 5
@@ -998,6 +1148,9 @@ You can define custom groups of nodes and use them to configure peer connections
 - `ALL_VALIDATORS` - All validator nodes, that is, nodes with names starting with `val` (e.g., `validator1`, `val2`)
 - `ALL_NON_VALIDATORS` - All nodes that are not validators
 
+These names are reserved built-ins and cannot be redefined under
+`[node_groups]`.
+
 **Custom node groups** are defined in the `[node_groups]` section. Groups can reference individual node names, pre-defined groups, or other groups previously declared:
 
 ```toml
@@ -1025,6 +1178,14 @@ In this example:
 - `validator1` will have persistent peers: `validator2`, `validator3`, `validator4`, `full1`, `full2`, `other_node` (the `TRUSTED` group, excluding itself)
 - `full1` will connect to all non-validators: `full2`, `sentry`, `other_node`
 - `sentry` will connect to all nodes except itself
+
+The same group names can also be used as `quake load` and `quake spam`
+targets. For example:
+
+```bash
+./quake load -t 60 -r 500 --targets ALL_VALIDATORS
+./quake spam -t 30 -r 1000 --targets TRUSTED
+```
 
 To distinguish group references from individual nodes in peer lists, by convention we use lowercase for node names and uppercase for node group names.
 
@@ -1286,14 +1447,19 @@ described below.
 ### Instance sizing
 
 The `--node-size` and `--cc-size` flags let you override the default EC2 instance
-types when creating remote infrastructure:
+types when creating remote infrastructure. The `--node-disk-gb` and `--cc-disk-gb`
+flags set the root EBS volume size in GiB for nodes and the Control Center;
+omit them to keep the AMI default volume size.
 
 ```bash
 # Use larger nodes for a multi-day testnet
 quake remote create --node-size t3.large --cc-size t3.2xlarge
 
+# Larger root volume for long runs (disk fills before RAM on default volume)
+quake remote create --node-size t3.large --node-disk-gb 100 --cc-disk-gb 100
+
 # Or with the shorthand
-quake start --remote --node-size t3.large
+quake start --remote --node-size t3.large --node-disk-gb 100
 ```
 
 #### Node instances
@@ -1311,14 +1477,14 @@ consumer of both memory (~2.5 GiB) and disk (debug logs grow at ~200 MiB/hr).
 The duration estimates assume debug-level logging with no log rotation on a 20
 GiB root volume. The primary constraint is **disk space**: the 4 GiB swap file,
 ~9 GiB of Docker images, and growing log files fill the default 20 GiB volume in
-roughly 20 hours. Larger instances don't change the disk size (that requires a
-Terraform change to `root_block_device`), but they provide more RAM headroom,
-reducing swap pressure and making the node more resilient to memory spikes.
+roughly 20 hours. Larger instances do not increase disk size; use `--node-disk-gb`
+for that. Larger instances do provide more RAM headroom, reducing swap pressure
+and making the node more resilient to memory spikes.
 
 > [!TIP]
 > For testnets that need to run longer than 20 hours, consider both upgrading
-> the instance size (for RAM) **and** increasing the EBS volume size in
-> `crates/quake/terraform/nodes.tf` (for disk).
+> the instance size (for RAM) **and** passing `--node-disk-gb` (and `--cc-disk-gb`
+> if the CC needs more space) for disk.
 
 #### Control Center (CC) instance
 
@@ -1478,7 +1644,7 @@ Initialize Terraform plugins and state. This step is required only once.
 
 Create EC2 instances for each node in the testnet, plus one extra for the Control Center (CC) server.
 ```bash
-./quake [-f <manifest>] remote create [--dry-run] [--yes] [--node-size <type>] [--cc-size <type>]
+./quake [-f <manifest>] remote create [--dry-run] [--yes] [--node-size <type>] [--cc-size <type>] [--node-disk-gb <GIB>] [--cc-disk-gb <GIB>]
 ```
 See [Instance sizing](#instance-sizing) for recommended instance types.
 
@@ -1540,9 +1706,37 @@ stop.
 
 Send transaction load:
 ```sh
-./quake remote load -- -r 1000 -t 60 validator1 validator2
+./quake load --targets validator1,validator2 -r 1000 -t 60
 ```
-Under the hood, this commands calls Spammer from CC. All Spammer options are supported.
+`quake load` and `quake spam` auto-dispatch based on testnet type: local testnets
+run the spammer directly, remote testnets forward to the Control Center via SSH.
+All Spammer options are supported. `--targets` accepts comma-separated selectors
+including manifest node groups such as `ALL_VALIDATORS` or custom `[node_groups]`.
+
+Download diagnostic artifacts from the remote testnet:
+```bash
+# Download all Prometheus metrics (covers the current head block, ~2h by default)
+./quake remote download metrics
+
+# Download metrics for a specific time range
+./quake remote download metrics --from 2024-01-15T10:30:00Z --to 2024-01-15T12:00:00Z
+
+# Download specific metrics only (metric names go after --)
+./quake remote download metrics -- reth_db_size_bytes go_goroutines
+
+# Download node databases (both execution and consensus layers, all nodes)
+./quake remote download db
+
+# Download execution layer only, from specific nodes
+./quake remote download db --execution-only -- validator1 validator2
+
+# Save to a custom output path
+./quake remote download metrics -o /tmp/my-metrics.tar.gz
+./quake remote download db -o /tmp/my-db.tar.gz
+```
+
+Both `download` subcommands output a `.tar.gz` archive named `quake-metrics-<timestamp>.tar.gz` /
+`quake-db-<timestamp>.tar.gz` unless overridden with `-o`.
 
 Once finished with your tests, remember to destroy the remote infrastructure!
 ```bash
@@ -1596,6 +1790,47 @@ also tear down the infrastructure when done. Bundles exported with
 > The export file contains the SSH private key and Terraform state for the remote
 > infrastructure. Treat it as sensitive material: transfer it securely and do not
 > commit it to version control.
+
+### Cleaning up orphaned AWS resources
+
+`quake clean` relies on Terraform state to delete the AWS infrastructure for a
+remote testnet. If that state is lost (e.g. the `.quake/` directory was deleted,
+or `quake remote create` crashed before state was written), the nodes, VPC,
+security groups, and related resources stay in AWS with no supported way for
+`quake` to remove them.
+
+`crates/quake/scripts/aws-resources.sh` is the recovery path. It discovers
+resources by the project name they were created with
+(`arc-<testnet>-testnet-<user>`) and removes them using the AWS CLI directly,
+no Terraform state required.
+
+```bash
+# Summarize every orphaned project for the current user.
+./crates/quake/scripts/aws-resources.sh list
+
+# Show the full resource plan for a single testnet (no deletion).
+./crates/quake/scripts/aws-resources.sh list <testnet>
+
+# Delete orphaned resources for a testnet. Without --yes, the script prints the
+# plan and prompts before deleting; with --yes, it proceeds non-interactively.
+./crates/quake/scripts/aws-resources.sh remove <testnet>
+./crates/quake/scripts/aws-resources.sh remove <testnet> --yes
+```
+
+`list` is read-only. `remove` defaults to an interactive confirmation, so a
+bare invocation never deletes anything without an explicit `y`. The script
+scopes to the current user (`$GITHUB_USER`, or `--user NAME`); `remove` and
+`list TESTNET` refuse to touch a project belonging to another user unless
+`--user` is passed explicitly, and the bare `list` summary surfaces a notice
+when `--user` overrides the current `$GITHUB_USER`. Run `--help` for the full
+option set.
+
+> [!IMPORTANT]
+> Prefer `quake clean` whenever the Terraform state is still available. This
+> script is a recovery tool for orphaned infrastructure only. It matches
+> resources on AWS-side names and tags alone, so a mistyped testnet or the
+> wrong `--region` can tear down infrastructure belonging to an active
+> testnet.
 
 ## Profiling
 
@@ -1748,9 +1983,15 @@ TODO: more testing scenarios to come
 
 ### Running tests
 
-Run all tests in all groups:
+Run all tests (except excluded groups: `validation`, `health`, `validator_set`, `perf`):
 ```bash
 ./quake test
+```
+
+Run an excluded group explicitly:
+```bash
+./quake test perf:block_time
+./quake test validation:basic
 ```
 
 Run all tests in a specific group:

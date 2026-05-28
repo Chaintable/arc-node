@@ -14,11 +14,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import fs from 'fs'
+import path from 'path'
 import hre from 'hardhat'
 import { expect } from 'chai'
-import { createWalletClient, encodeDeployData, Hex, http, keccak256, parseAbi, parseGwei, toHex } from 'viem'
+import {
+  Address,
+  concat,
+  createWalletClient,
+  encodeAbiParameters,
+  encodeDeployData,
+  encodeFunctionData,
+  Hex,
+  http,
+  keccak256,
+  parseAbi,
+  parseGwei,
+  toHex,
+} from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import {
+  AdminUpgradeableProxy,
   Denylist,
   DeterministicDeployerProxy,
   expectAddressEq,
@@ -26,16 +42,20 @@ import {
   gasGuzzlerArtifact,
   getClients,
   ProtocolConfig,
+  readForgeArtifactSync,
 } from '../helpers'
 import { USDC } from '../helpers/FiatToken'
 import { PermissionedValidatorManager, ValidatorRegistry, ValidatorStatus } from '../helpers/ValidatorManager'
 import {
   memoAddress,
-  denylistAddress,
+  denylistAddressByNetwork,
   gasGuzzlerAddress,
   Manifest,
   multicall3Address,
   multicall3FromAddress,
+  permissionedManagerAddress,
+  protocolConfigAddress,
+  validatorRegistryAddress,
 } from '../../scripts/genesis'
 import { getValidators } from '../helpers/networks/localdev'
 import manifest from '../../assets/artifacts/manifest.json'
@@ -119,6 +139,115 @@ describe('genesis', () => {
     expect(address).to.addressEqual(ktAddress)
   })
 
+  // Regression guards: compute the CREATE2 address from current Forge-compiled bytecode
+  // (what genesis deploys), then assert it matches BOTH the hardcoded constant in
+  // scripts/genesis/addresses.ts AND the genesis placement (code present at that address
+  // on-chain). Guards against:
+  //   - stale constants when bytecode shifts (compiler settings, source edits)
+  //   - stale genesis when constants shift but genesis wasn't regenerated
+  describe('CREATE2 reproducibility', () => {
+    // Helper: read the implementation slot of an AdminUpgradeableProxy at `proxyAddress`.
+    // Used to verify proxies point at the CREATE2 impl address we compute from bytecode.
+    const implAt = async (proxyAddress: Address): Promise<Address> => {
+      const { client } = await getClients()
+      return AdminUpgradeableProxy.attach(client, proxyAddress).read.implementation()
+    }
+
+    // The stablecoin contracts (SignatureChecker, NativeFiatTokenV2_2, FiatTokenProxy) are
+    // not compiled locally — they ship as static artifacts under
+    // assets/artifacts/stablecoin-contracts/. Read those directly for CREATE2 recomputation.
+    const loadStablecoinArtifact = (name: string) => {
+      const p = path.join(__dirname, '../../assets/artifacts/stablecoin-contracts', `${name}.json`)
+      return JSON.parse(fs.readFileSync(p, 'utf8')) as { bytecode: string; linkReferences?: unknown }
+    }
+
+    it('Memo (genesis-placed)', async () => {
+      const { client } = await getClients()
+      const memoArtifact = readForgeArtifactSync('Memo')
+      const computed = DeterministicDeployerProxy.getDeployAddress(memoArtifact.bytecode)
+
+      // (1) computed address matches hardcoded constant
+      expect(computed).to.be.addressEqual(memoAddress)
+
+      // (2) genesis placed code at the computed address
+      const code = await client.getCode({ address: computed })
+      expect(code?.length).to.be.greaterThan(0)
+    })
+
+    it('Multicall3From (genesis-placed)', async () => {
+      const { client } = await getClients()
+      const m3fArtifact = readForgeArtifactSync('Multicall3From')
+      const computed = DeterministicDeployerProxy.getDeployAddress(m3fArtifact.bytecode)
+
+      // (1) computed address matches hardcoded constant
+      expect(computed).to.be.addressEqual(multicall3FromAddress)
+
+      // (2) genesis placed code at the computed address
+      const code = await client.getCode({ address: computed })
+      expect(code?.length).to.be.greaterThan(0)
+    })
+
+    it('ProtocolConfig implementation (salt=0)', async () => {
+      const { client } = await getClients()
+      const artifact = readForgeArtifactSync('ProtocolConfig')
+      const computed = DeterministicDeployerProxy.getDeployAddress(artifact.bytecode)
+
+      // (1) on-chain proxy's IMPL_SLOT points at the CREATE2 address
+      expect(await implAt(protocolConfigAddress)).to.be.addressEqual(computed)
+
+      // (2) genesis placed code at the computed address
+      const code = await client.getCode({ address: computed })
+      expect(code?.length).to.be.greaterThan(0)
+    })
+
+    it('ValidatorRegistry implementation (salt=0)', async () => {
+      const { client } = await getClients()
+      const artifact = readForgeArtifactSync('ValidatorRegistry')
+      const computed = DeterministicDeployerProxy.getDeployAddress(artifact.bytecode)
+
+      expect(await implAt(validatorRegistryAddress)).to.be.addressEqual(computed)
+
+      const code = await client.getCode({ address: computed })
+      expect(code?.length).to.be.greaterThan(0)
+    })
+
+    it('PermissionedValidatorManager implementation (salt=0, ctor arg: validatorRegistryProxy)', async () => {
+      const { client } = await getClients()
+      const artifact = readForgeArtifactSync('PermissionedValidatorManager')
+      const ctorArgs = encodeAbiParameters([{ type: 'address' }], [validatorRegistryAddress])
+      const fullInit = concat([artifact.bytecode, ctorArgs])
+      const computed = DeterministicDeployerProxy.getDeployAddress(fullInit)
+
+      expect(await implAt(permissionedManagerAddress)).to.be.addressEqual(computed)
+
+      const code = await client.getCode({ address: computed })
+      expect(code?.length).to.be.greaterThan(0)
+    })
+
+    it('NativeFiatTokenV2_2 implementation (salt=0, linked with SignatureChecker)', async () => {
+      const { client, usdc } = await clients()
+
+      // 1. SignatureChecker CREATE2 (salt=0, no args) from static stablecoin artifact
+      const sc = loadStablecoinArtifact('SignatureChecker')
+      const scAddress = DeterministicDeployerProxy.getDeployAddress(sc.bytecode as Hex)
+
+      // 2. NativeFiatTokenV2_2 has a library placeholder for SignatureChecker; replace with
+      //    the computed address before hashing. Placeholder format: __$<34-hex-hash>$__.
+      const nft = loadStablecoinArtifact('NativeFiatTokenV2_2')
+      const placeholder = '__$715109b5d747ea58b675c6ea3f0dba8c60$__'
+      const linked = nft.bytecode.split(placeholder).join(scAddress.slice(2).toLowerCase())
+
+      const computed = DeterministicDeployerProxy.getDeployAddress(linked as Hex)
+
+      // (1) FiatTokenProxy's implementation points at the computed address
+      expect(await usdc.implementation()).to.be.addressEqual(computed)
+
+      // (2) genesis placed code at the computed address
+      const code = await client.getCode({ address: computed })
+      expect(code?.length).to.be.greaterThan(0)
+    })
+  })
+
   describe('USDC contract setup', () => {
     it('implementation', async () => {
       const { client, usdc } = await clients()
@@ -129,18 +258,20 @@ describe('genesis', () => {
 
     it('admin', async () => {
       const { usdc, expectAddr } = await clients()
-      const [admin, owner, masterMinter, pauser, blacklister] = await Promise.all([
+      const [admin, owner, masterMinter, pauser, blacklister, rescuer] = await Promise.all([
         usdc.admin(),
         usdc.owner(),
         usdc.masterMinter(),
         usdc.pauser(),
         usdc.blacklister(),
+        usdc.rescuer(),
       ])
       expect(admin).to.be.addressEqual(expectAddr.proxyAdmin)
       expect(owner).to.be.addressEqual(expectAddr.admin)
       expectAddressEq(masterMinter, expectAddr.admin)
       expectAddressEq(pauser, expectAddr.admin)
       expectAddressEq(blacklister, expectAddr.operator)
+      expectAddressEq(rescuer, expectAddr.admin)
     })
 
     it('token info', async () => {
@@ -171,18 +302,16 @@ describe('genesis', () => {
     it('initial addresses', async () => {
       const { protocolConfig, expectAddr } = await clients()
 
-      const [admin, owner, controller, pauser, beneficiary] = await Promise.all([
+      const [admin, owner, controller, pauser] = await Promise.all([
         protocolConfig.admin(),
         protocolConfig.owner(),
         protocolConfig.controller(),
         protocolConfig.pauser(),
-        protocolConfig.rewardBeneficiary(),
       ])
       expect(admin).to.be.addressEqual(expectAddr.proxyAdmin)
       expect(owner.toLowerCase()).to.be.eq(expectAddr.admin)
       expect(controller.toLowerCase()).to.be.eq(expectAddr.admin)
       expect(pauser.toLowerCase()).to.be.eq(expectAddr.admin)
-      expect(beneficiary.toLowerCase()).to.be.eq(expectAddr.proxyAdmin)
     })
 
     it('fee params', async () => {
@@ -194,6 +323,21 @@ describe('genesis', () => {
       expect(feeParams.minBaseFee).to.be.eq(1n)
       expect(feeParams.maxBaseFee).to.be.eq(parseGwei('1000'))
       expect(feeParams.blockGasLimit).to.be.eq(30_000_000n)
+    })
+
+    // Guards the bit-packed uint16 layout in ProtocolConfig.ts: a mis-shifted
+    // field would silently ship wrong consensus timeouts to malachite.
+    it('consensus params', async () => {
+      const { protocolConfig } = await clients()
+      const consensusParams = await protocolConfig.consensusParams()
+      expect(consensusParams.timeoutProposeMs).to.be.eq(3000)
+      expect(consensusParams.timeoutProposeDeltaMs).to.be.eq(500)
+      expect(consensusParams.timeoutPrevoteMs).to.be.eq(1000)
+      expect(consensusParams.timeoutPrevoteDeltaMs).to.be.eq(500)
+      expect(consensusParams.timeoutPrecommitMs).to.be.eq(1000)
+      expect(consensusParams.timeoutPrecommitDeltaMs).to.be.eq(500)
+      expect(consensusParams.timeoutRebroadcastMs).to.be.eq(1000)
+      expect(consensusParams.targetBlockTimeMs).to.be.eq(500)
     })
   })
 
@@ -253,25 +397,41 @@ describe('genesis', () => {
 
   describe('permissioned validator manager', () => {
     it('initial addresses', async () => {
-      const { poaValidatorManager, expectAddr, getController } = await clients()
-      const controller1 = getController(1n)
-      const controller5 = getController(5n)
+      const { poaValidatorManager, expectAddr } = await clients()
 
-      const [admin, owner, isController1, isController5, isValidatorRegisterer1, isValidatorRegisterer2] =
-        await Promise.all([
-          poaValidatorManager.admin(),
-          poaValidatorManager.owner(),
-          poaValidatorManager.isController([controller1.account.address]),
-          poaValidatorManager.isController([controller5.account.address]),
-          poaValidatorManager.isValidatorRegisterer([expectAddr.admin]),
-          poaValidatorManager.isValidatorRegisterer([expectAddr.operator]),
-        ])
+      const [admin, owner, pauser, isValidatorRegisterer1, isValidatorRegisterer2] = await Promise.all([
+        poaValidatorManager.admin(),
+        poaValidatorManager.owner(),
+        poaValidatorManager.pauser(),
+        poaValidatorManager.isValidatorRegisterer([expectAddr.admin]),
+        poaValidatorManager.isValidatorRegisterer([expectAddr.operator]),
+      ])
       expect(admin).to.be.addressEqual(expectAddr.proxyAdmin)
       expect(owner.toLowerCase()).to.be.eq(expectAddr.admin)
-      expect(isController1).to.be.true
-      expect(isController5).to.be.true
+      expect(pauser.toLowerCase()).to.be.eq(expectAddr.admin)
       expect(isValidatorRegisterer1).to.be.true
       expect(isValidatorRegisterer2).to.be.true
+    })
+
+    // Every validator's controller must be wired at genesis to its registrationId
+    // with the configured voting power limit (UINT64_MAX in localdev). Guards
+    // against regressions in slotForAddressMap or per-controller flattening.
+    it('controllers wired with voting power limits', async () => {
+      const { poaValidatorManager, getController } = await clients()
+      const validators = await getValidators()
+      const UINT64_MAX = (1n << 64n) - 1n
+
+      await Promise.all(
+        validators.map(async (v) => {
+          const controller = getController(v.registrationID)
+          const [isCtrl, limit] = await Promise.all([
+            poaValidatorManager.isController([controller.account.address]),
+            poaValidatorManager.getVotingPowerLimit([controller.account.address]),
+          ])
+          expect(isCtrl, `controller ${v.registrationID} registered`).to.be.true
+          expect(limit, `controller ${v.registrationID} voting power limit`).to.be.eq(UINT64_MAX)
+        }),
+      )
     })
   })
 
@@ -280,7 +440,7 @@ describe('genesis', () => {
       const { client } = await getClients()
       const code = await client.getCode({ address: Denylist.address })
       expect(code?.length).to.be.greaterThan(0)
-      expect(Denylist.address).to.be.addressEqual(denylistAddress)
+      expect(Denylist.address).to.be.addressEqual(denylistAddressByNetwork.localdev)
     })
 
     it('implementation contract exists', async () => {
@@ -334,6 +494,60 @@ describe('genesis', () => {
       const contractStorageLocation = await denylistContract.read.DENYLIST_STORAGE_LOCATION()
       expect(contractStorageLocation).to.be.eq(expectedSlot)
     })
+
+    // Regression guard: compute the Denylist implementation CREATE2 address (salt=0) from
+    // current Forge bytecode, and assert it matches BOTH the on-chain proxy's IMPL_SLOT AND that
+    // runtime code is present at that address. Catches drift if bytecode changes without
+    // genesis regeneration.
+    it('implementation at expected CREATE2 address (salt=0)', async () => {
+      const { client, denylist } = await clients()
+      const denylistArtifact = readForgeArtifactSync('Denylist')
+      const computed = DeterministicDeployerProxy.getDeployAddress(denylistArtifact.bytecode)
+
+      // (1) computed matches on-chain IMPL_SLOT (proxy points at genesis-placed impl)
+      const onChainImpl = await denylist.implementation()
+      expect(onChainImpl).to.be.addressEqual(computed)
+
+      // (2) genesis placed runtime code at the computed address
+      const code = await client.getCode({ address: computed })
+      expect(code?.length).to.be.greaterThan(0)
+    })
+
+    // Regression guard: compute the Denylist proxy CREATE2 address from
+    //   AdminUpgradeableProxy bytecode + abi.encode(impl, proxyAdmin, initData)
+    // combined with the documented mined salt, and assert it matches BOTH the hardcoded
+    // denylistAddressByNetwork.localdev constant AND that runtime code is placed at that
+    // address in genesis. Mined via `INIT_CODE_HASH=<hash> make mine-denylist-salt` —
+    // see scripts/genesis/addresses.ts.
+    it('proxy at expected CREATE2 address (mined salt)', async () => {
+      const { client, denylist } = await clients()
+      const denylistArtifact = readForgeArtifactSync('Denylist')
+      const proxyArtifact = readForgeArtifactSync('AdminUpgradeableProxy')
+
+      const impl = DeterministicDeployerProxy.getDeployAddress(denylistArtifact.bytecode)
+      const [owner, proxyAdmin] = await Promise.all([denylist.owner(), denylist.admin()])
+
+      const initData = encodeFunctionData({
+        abi: Denylist.abi,
+        functionName: 'initialize',
+        args: [owner],
+      })
+      const ctorArgs = encodeAbiParameters(
+        [{ type: 'address' }, { type: 'address' }, { type: 'bytes' }],
+        [impl, proxyAdmin, initData],
+      )
+      const fullInit = concat([proxyArtifact.bytecode, ctorArgs])
+
+      const MINED_SALT = 0x2e8184e0b708cc70e9f829091612c4c8efef8006ee7527c777e0bd70b64c36c8n
+      const computed = DeterministicDeployerProxy.getDeployAddress(fullInit, MINED_SALT)
+
+      // (1) computed matches hardcoded constant
+      expect(computed).to.be.addressEqual(denylistAddressByNetwork.localdev)
+
+      // (2) genesis placed runtime code at the computed address
+      const code = await client.getCode({ address: computed })
+      expect(code?.length).to.be.greaterThan(0)
+    })
   })
 
   describe('GasGuzzler', () => {
@@ -368,7 +582,7 @@ describe('genesis', () => {
     it('bytecode matches artifact', async () => {
       const { client } = await getClients()
       const code = await client.getCode({ address: memoAddress })
-      const artifact = hre.artifacts.readArtifactSync('Memo')
+      const artifact = readForgeArtifactSync('Memo')
       expect(code).to.equal(artifact.deployedBytecode)
     })
   })
@@ -383,7 +597,7 @@ describe('genesis', () => {
     it('bytecode matches artifact', async () => {
       const { client } = await getClients()
       const code = await client.getCode({ address: multicall3FromAddress })
-      const artifact = hre.artifacts.readArtifactSync('Multicall3From')
+      const artifact = readForgeArtifactSync('Multicall3From')
       expect(code).to.equal(artifact.deployedBytecode)
     })
   })

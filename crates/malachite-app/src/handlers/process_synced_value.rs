@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use eyre::Context;
 use ssz::Decode;
-use tracing::error;
+use tracing::{error, warn};
 
 use malachitebft_app_channel::app::types::core::Round;
 use malachitebft_app_channel::app::types::ProposedValue;
@@ -33,6 +33,7 @@ use arc_eth_engine::persistence_meter::PersistenceMeter;
 use malachitebft_app_channel::app::types::core::Validity;
 
 use crate::block::ConsensusBlock;
+use crate::metrics::{AppMetrics, InvalidPayloadSource};
 use crate::payload::{validate_consensus_block, EnginePayloadValidator, PayloadValidator};
 use crate::state::State;
 use crate::store::repositories::{InvalidPayloadsRepository, UndecidedBlocksRepository};
@@ -63,6 +64,7 @@ pub async fn handle(
         state.store(),
         state.store(),
         state.persistence_meter(),
+        state.metrics(),
         height,
         round,
         proposer,
@@ -98,7 +100,7 @@ pub async fn handle(
 ///
 /// Decodes the raw bytes into an [`ExecutionPayloadV3`], validates it via
 /// [`validate_consensus_block`], and stores the resulting [`ConsensusBlock`] as an
-/// undecided block. If the engine rejects the payload, an [`InvalidPayload`]
+/// undecided block. If the engine rejects the payload, an
 /// [`InvalidPayload`](crate::invalid_payloads::InvalidPayload) record is persisted
 /// through `store` and the block is kept with [`Validity::Invalid`] so that
 /// consensus can proceed with the correct validity information.
@@ -111,6 +113,7 @@ async fn on_process_synced_value(
     undecided_blocks_repo: impl UndecidedBlocksRepository,
     invalid_payloads_repo: impl InvalidPayloadsRepository,
     persistence_meter: impl PersistenceMeter,
+    metrics: &AppMetrics,
     height: Height,
     round: Round,
     proposer: Address,
@@ -119,6 +122,12 @@ async fn on_process_synced_value(
     let payload = match ExecutionPayloadV3::from_ssz_bytes(&value_bytes) {
         Ok(payload) => payload,
         Err(e) => {
+            warn!(
+                %height, %round, %proposer,
+                "Failed to decode synced value into an execution payload: {e:?}",
+            );
+            metrics.inc_invalid_payloads_count(InvalidPayloadSource::SyncDecode);
+
             let invalid =
                 InvalidPayload::new_without_payload(height, round, proposer, &format!("{e:?}"));
 
@@ -127,11 +136,6 @@ async fn on_process_synced_value(
                     "Failed to store invalid payload after receiving synced value (height={height}, round={round}, proposer={proposer})",
                 )
             })?;
-
-            error!(
-                %height, %round, %proposer,
-                "Failed to decode synced value into an execution payload: {e:?}",
-            );
 
             return Ok(None);
         }
@@ -151,7 +155,7 @@ async fn on_process_synced_value(
     };
 
     let validity = validate_consensus_block(
-        &engine, &block, &invalid_payloads_repo,
+        &engine, &block, &invalid_payloads_repo, metrics,
     )
     .await
     .wrap_err_with(|| {
@@ -169,9 +173,30 @@ async fn on_process_synced_value(
         error!(%height, %round, %proposer, %block_hash, "❌ Received invalid payload via sync");
     }
 
+    // If a undecided block for the sync value height round and hash exists then skip `wait_for_persisted_block`
+    // so consensus path is not blocked on EL persistence.
+    if let Some(existing) = undecided_blocks_repo
+        .get_by_round_and_hash(height, round, block_hash)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "Failed to query undecided blocks repo for dedup at \
+                 height={height}, round={round}, block_hash={block_hash}"
+            )
+        })?
+    {
+        debug_assert_eq!(
+            existing.validity, validity,
+            "dedup hit at height={height}, round={round}, block_hash={block_hash}: \
+             existing.validity ({:?}) != freshly-computed validity ({validity:?})",
+            existing.validity,
+        );
+        return Ok(Some(ProposedValue::from(&existing)));
+    }
+
     let proposal = ProposedValue::from(&block);
 
-    undecided_blocks_repo.store(block).await.wrap_err_with(|| {
+    undecided_blocks_repo.store_undecided_block(block).await.wrap_err_with(|| {
         format!(
             "Failed to store undecided block {} synced from the network for height={}, round={}, proposer={}",
             block_hash, height, round, proposer,
@@ -204,6 +229,7 @@ mod tests {
     };
 
     use arbitrary::{Arbitrary, Unstructured};
+    use arc_consensus_types::Value;
     use arc_eth_engine::mocks::MockPersistenceMeter;
     use arc_eth_engine::persistence_meter::NoopPersistenceMeter;
     use bytes::Bytes;
@@ -211,6 +237,15 @@ mod tests {
     use mockall::predicate::*;
     use ssz::Encode;
     use std::io;
+
+    /// Sets up the dedup query (`get_by_round_and_hash`) on an
+    /// `UndecidedBlocksRepository` mock to return `None` so the main path
+    /// flows through to `store_undecided_block`. Use in tests that are not
+    /// specifically exercising the dedup race.
+    fn expect_no_undecided_dedup_hit(mock: &mut MockUndecidedBlocksRepository) {
+        mock.expect_get_by_round_and_hash()
+            .returning(|_, _, _| Ok(None));
+    }
 
     async fn test_on_process_synced_value_validity(
         result: PayloadValidationResult,
@@ -231,8 +266,9 @@ mod tests {
             .returning(move |_| Ok(result.clone()));
 
         let mut undecided = MockUndecidedBlocksRepository::new();
+        expect_no_undecided_dedup_hit(&mut undecided);
         undecided
-            .expect_store()
+            .expect_store_undecided_block()
             .withf(move |block| {
                 block.height == height && block.round == round && block.proposer == proposer
             })
@@ -246,11 +282,13 @@ mod tests {
             .times(if is_invalid { 1 } else { 0 })
             .returning(|_| Ok(()));
 
+        let metrics = AppMetrics::default();
         let Some(proposal) = on_process_synced_value(
             engine,
             undecided,
             invalid,
             NoopPersistenceMeter,
+            &metrics,
             height,
             round,
             proposer,
@@ -262,6 +300,8 @@ mod tests {
         };
 
         assert_eq!(proposal.validity, expected);
+        let expected_count = if expected.is_valid() { 0 } else { 1 };
+        assert_eq!(metrics.get_invalid_payloads_count(), expected_count);
     }
 
     #[tokio::test]
@@ -290,7 +330,7 @@ mod tests {
         // Expectation: If bytes are invalid, we should NOT validate the payload
         // and definitely NOT store the block.
         engine.expect_validate_payload().times(0);
-        undecided.expect_store().times(0);
+        undecided.expect_store_undecided_block().times(0);
         invalid.expect_append().times(1).returning(|_| Ok(()));
 
         let height = Height::new(1);
@@ -298,11 +338,13 @@ mod tests {
         let proposer = Address::new([0u8; 20]);
         let value_bytes = Bytes::from(vec![0u8; 10]);
 
+        let metrics = AppMetrics::default();
         let proposal = on_process_synced_value(
             engine,
             undecided,
             invalid,
             NoopPersistenceMeter,
+            &metrics,
             height,
             round,
             proposer,
@@ -312,6 +354,7 @@ mod tests {
         .expect("Failed to process synced value");
 
         assert!(proposal.is_none());
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
     // These two tests cover error paths in `on_process_synced_value` that were
@@ -334,16 +377,18 @@ mod tests {
             .returning(|_| Err(io::Error::other("Simulated engine error").into()));
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(0);
+        undecided.expect_store_undecided_block().times(0);
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);
 
+        let metrics = AppMetrics::default();
         let result = on_process_synced_value(
             engine,
             undecided,
             invalid,
             NoopPersistenceMeter,
+            &metrics,
             height,
             round,
             proposer,
@@ -352,6 +397,7 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
@@ -365,7 +411,7 @@ mod tests {
         engine.expect_validate_payload().times(0);
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(0);
+        undecided.expect_store_undecided_block().times(0);
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid
@@ -373,11 +419,13 @@ mod tests {
             .times(1)
             .returning(|_| Err(io::Error::other("Simulated invalid payload store error")));
 
+        let metrics = AppMetrics::default();
         let result = on_process_synced_value(
             engine,
             undecided,
             invalid,
             NoopPersistenceMeter,
+            &metrics,
             height,
             round,
             proposer,
@@ -386,6 +434,7 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
     #[tokio::test]
@@ -404,19 +453,22 @@ mod tests {
             .returning(|_| Ok(PayloadValidationResult::Valid));
 
         let mut undecided = MockUndecidedBlocksRepository::new();
+        expect_no_undecided_dedup_hit(&mut undecided);
         undecided
-            .expect_store()
+            .expect_store_undecided_block()
             .times(1)
             .returning(|_| Err(io::Error::other("Simulated store error")));
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);
 
+        let metrics = AppMetrics::default();
         let result = on_process_synced_value(
             engine,
             undecided,
             invalid,
             NoopPersistenceMeter,
+            &metrics,
             height,
             round,
             proposer,
@@ -426,6 +478,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().downcast_ref::<io::Error>().is_some());
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
@@ -444,7 +497,11 @@ mod tests {
             .returning(|_| Ok(PayloadValidationResult::Valid));
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(1).returning(|_| Ok(()));
+        expect_no_undecided_dedup_hit(&mut undecided);
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);
@@ -456,11 +513,13 @@ mod tests {
             .times(1)
             .return_once(|_, _| Ok(()));
 
+        let metrics = AppMetrics::default();
         let proposal = on_process_synced_value(
             engine,
             undecided,
             invalid,
             persistence_meter,
+            &metrics,
             height,
             round,
             proposer,
@@ -471,6 +530,7 @@ mod tests {
 
         assert!(proposal.is_some());
         assert_eq!(proposal.unwrap().validity, Validity::Valid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
     }
 
     #[tokio::test]
@@ -491,7 +551,11 @@ mod tests {
         });
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(1).returning(|_| Ok(()));
+        expect_no_undecided_dedup_hit(&mut undecided);
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(1).returning(|_| Ok(()));
@@ -499,11 +563,13 @@ mod tests {
         let mut persistence_meter = MockPersistenceMeter::new();
         persistence_meter.expect_wait_for_persisted_block().times(0);
 
+        let metrics = AppMetrics::default();
         let proposal = on_process_synced_value(
             engine,
             undecided,
             invalid,
             persistence_meter,
+            &metrics,
             height,
             round,
             proposer,
@@ -514,6 +580,7 @@ mod tests {
 
         assert!(proposal.is_some());
         assert_eq!(proposal.unwrap().validity, Validity::Invalid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 1);
     }
 
     #[tokio::test]
@@ -532,7 +599,11 @@ mod tests {
             .returning(|_| Ok(PayloadValidationResult::Valid));
 
         let mut undecided = MockUndecidedBlocksRepository::new();
-        undecided.expect_store().times(1).returning(|_| Ok(()));
+        expect_no_undecided_dedup_hit(&mut undecided);
+        undecided
+            .expect_store_undecided_block()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut invalid = MockInvalidPayloadsRepository::new();
         invalid.expect_append().times(0);
@@ -544,11 +615,13 @@ mod tests {
             .times(1)
             .return_once(|_, _| Err(eyre::eyre!("persistence meter timeout")));
 
+        let metrics = AppMetrics::default();
         let proposal = on_process_synced_value(
             engine,
             undecided,
             invalid,
             persistence_meter,
+            &metrics,
             height,
             round,
             proposer,
@@ -559,5 +632,85 @@ mod tests {
 
         assert!(proposal.is_some());
         assert_eq!(proposal.unwrap().validity, Validity::Valid);
+        assert_eq!(metrics.get_invalid_payloads_count(), 0);
+    }
+
+    /// Race: the proposer's gossiped proposal arrived first and was already
+    /// stored as `UndecidedBlock(height, round, block_hash)` (and the EL has
+    /// it persisted) by the time the in-flight ProcessSyncedValue with
+    /// identical bytes runs. We must:
+    ///   - still run engine validation (defense in depth: the synced bytes
+    ///     are from a peer we don't trust implicitly), but
+    ///   - skip the redundant `store_undecided_block` upsert and the
+    ///     `wait_for_persisted_block` call,
+    /// and return a `ProposedValue` carrying the existing block's validity
+    /// (which equals the freshly-validated one, since engine validation is
+    /// deterministic).
+    #[tokio::test]
+    async fn on_process_synced_value_dedups_against_existing_undecided_block() {
+        let mut u = Unstructured::new(&[7u8; 512]);
+
+        let height = Height::new(42);
+        let round = Round::new(0);
+        let proposer = Address::new([1u8; 20]);
+        let payload = ExecutionPayloadV3::arbitrary(&mut u).unwrap();
+        let block_hash = payload.payload_inner.payload_inner.block_hash;
+        let value_bytes = Bytes::from(payload.as_ssz_bytes());
+
+        let existing_block = ConsensusBlock {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer,
+            execution_payload: payload,
+            validity: Validity::Valid,
+            signature: None,
+        };
+
+        // Engine validation still runs once (defense in depth on the synced
+        // bytes), and accepts.
+        let mut engine = MockPayloadValidator::new();
+        engine
+            .expect_validate_payload()
+            .times(1)
+            .returning(|_| Ok(PayloadValidationResult::Valid));
+
+        let mut undecided = MockUndecidedBlocksRepository::new();
+        undecided
+            .expect_get_by_round_and_hash()
+            .with(eq(height), eq(round), eq(block_hash))
+            .times(1)
+            .return_once(move |_, _, _| Ok(Some(existing_block)));
+        // No redundant upsert.
+        undecided.expect_store_undecided_block().times(0);
+
+        let mut invalid = MockInvalidPayloadsRepository::new();
+        invalid.expect_append().times(0);
+
+        // No persistence wait — the proposer's path already satisfied it.
+        let mut persistence_meter = MockPersistenceMeter::new();
+        persistence_meter.expect_wait_for_persisted_block().times(0);
+
+        let metrics = AppMetrics::default();
+        let proposal = on_process_synced_value(
+            engine,
+            undecided,
+            invalid,
+            persistence_meter,
+            &metrics,
+            height,
+            round,
+            proposer,
+            value_bytes,
+        )
+        .await
+        .expect("should succeed via dedup short-circuit");
+
+        let proposal = proposal.expect("expected Some(proposal) on dedup hit");
+        assert_eq!(proposal.height, height);
+        assert_eq!(proposal.round, round);
+        assert_eq!(proposal.proposer, proposer);
+        assert_eq!(proposal.validity, Validity::Valid);
+        assert_eq!(proposal.value, Value::new(block_hash));
     }
 }

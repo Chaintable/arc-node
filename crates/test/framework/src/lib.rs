@@ -14,7 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::unwrap_used
+)]
 
 //! Arc Integration Test Framework
 //!
@@ -64,6 +68,11 @@ impl NodeId {
     /// Create a new node identifier
     pub const fn new(id: usize) -> Self {
         Self(id)
+    }
+
+    /// Convert the node identifier to a usize.
+    pub const fn as_usize(self) -> usize {
+        self.0
     }
 }
 

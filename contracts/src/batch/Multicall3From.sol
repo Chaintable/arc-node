@@ -17,8 +17,8 @@
 pragma solidity ^0.8.29;
 
 import {ICallFrom} from "../call-from/ICallFrom.sol";
+import {Precompiles} from "../Precompiles.sol";
 import {IMulticall3From} from "./IMulticall3From.sol";
-import {Addresses} from "../../scripts/Addresses.sol";
 
 /// @title Multicall3From
 /// @notice Sender-preserving batch-call contract that mirrors the original
@@ -28,26 +28,25 @@ import {Addresses} from "../../scripts/Addresses.sol";
 ///      callFrom precompile does not support value forwarding on Arc.
 ///      Reentrancy is safe: the contract holds no state that could be
 ///      corrupted by a reentrant call.
+/// @dev EOA-only: contract callers hit the callFrom sender-spoofing
+///      constraint. Failure-tolerant paths return `success = false`;
+///      hard-fail paths revert the batch. See {IMulticall3From}.
 contract Multicall3From is IMulticall3From {
-    ICallFrom public constant CALL_FROM = ICallFrom(Addresses.CALL_FROM);
+    ICallFrom public constant CALL_FROM = ICallFrom(Precompiles.CALL_FROM);
 
     /// @inheritdoc IMulticall3From
-    function aggregate(Call[] calldata calls)
-        external
-        returns (uint256 blockNumber, bytes[] memory returnData)
-    {
+    function aggregate(Call[] calldata calls) external returns (uint256 blockNumber, bytes[] memory returnData) {
         blockNumber = block.number;
         uint256 length = calls.length;
         returnData = new bytes[](length);
-        for (uint256 i = 0; i < length;) {
-            (bool success, bytes memory result) = CALL_FROM.callFrom(msg.sender, calls[i].target, calls[i].callData);
+        for (uint256 i = 0; i < length; ++i) {
+            (bool success, bytes memory result) = _callFrom(msg.sender, calls[i].target, calls[i].callData);
             if (!success) {
                 assembly {
                     revert(add(result, 0x20), mload(result))
                 }
             }
             returnData[i] = result;
-            unchecked { ++i; }
         }
     }
 
@@ -55,15 +54,14 @@ contract Multicall3From is IMulticall3From {
     function aggregate3(Call3[] calldata calls) external returns (Result[] memory returnData) {
         uint256 length = calls.length;
         returnData = new Result[](length);
-        for (uint256 i = 0; i < length;) {
-            (bool success, bytes memory result) = CALL_FROM.callFrom(msg.sender, calls[i].target, calls[i].callData);
+        for (uint256 i = 0; i < length; ++i) {
+            (bool success, bytes memory result) = _callFrom(msg.sender, calls[i].target, calls[i].callData);
             returnData[i] = Result(success, result);
             if (!calls[i].allowFailure && !success) {
                 assembly {
                     revert(add(result, 0x20), mload(result))
                 }
             }
-            unchecked { ++i; }
         }
     }
 
@@ -76,21 +74,17 @@ contract Multicall3From is IMulticall3From {
     }
 
     /// @inheritdoc IMulticall3From
-    function tryAggregate(bool requireSuccess, Call[] calldata calls)
-        external
-        returns (Result[] memory returnData)
-    {
+    function tryAggregate(bool requireSuccess, Call[] calldata calls) external returns (Result[] memory returnData) {
         uint256 length = calls.length;
         returnData = new Result[](length);
-        for (uint256 i = 0; i < length;) {
-            (bool success, bytes memory result) = CALL_FROM.callFrom(msg.sender, calls[i].target, calls[i].callData);
+        for (uint256 i = 0; i < length; ++i) {
+            (bool success, bytes memory result) = _callFrom(msg.sender, calls[i].target, calls[i].callData);
             if (requireSuccess && !success) {
                 assembly {
                     revert(add(result, 0x20), mload(result))
                 }
             }
             returnData[i] = Result(success, result);
-            unchecked { ++i; }
         }
     }
 
@@ -163,15 +157,33 @@ contract Multicall3From is IMulticall3From {
         blockHash = blockhash(block.number);
         uint256 length = calls.length;
         returnData = new Result[](length);
-        for (uint256 i = 0; i < length;) {
-            (bool success, bytes memory result) = CALL_FROM.callFrom(msg.sender, calls[i].target, calls[i].callData);
+        for (uint256 i = 0; i < length; ++i) {
+            (bool success, bytes memory result) = _callFrom(msg.sender, calls[i].target, calls[i].callData);
             if (requireSuccess && !success) {
                 assembly {
                     revert(add(result, 0x20), mload(result))
                 }
             }
             returnData[i] = Result(success, result);
-            unchecked { ++i; }
+        }
+    }
+
+    /// @dev Low-level call to the callFrom precompile. Captures framework-level
+    ///      reverts (e.g. static context, sender-spoofing rejection) into the
+    ///      return tuple instead of propagating them, so callers can honor
+    ///      allowFailure / requireSuccess uniformly.
+    function _callFrom(address sender, address target, bytes calldata data)
+        internal
+        returns (bool success, bytes memory returnData)
+    {
+        (bool ok, bytes memory raw) = address(CALL_FROM).call(
+            abi.encodeCall(ICallFrom.callFrom, (sender, target, data))
+        );
+        if (ok) {
+            (success, returnData) = abi.decode(raw, (bool, bytes));
+        } else {
+            success = false;
+            returnData = raw;
         }
     }
 }

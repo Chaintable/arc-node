@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use arc_execution_config::chainspec::{BaseFeeConfigProvider, BlockGasLimitProvider};
 use arc_execution_config::gas_fee::decode_base_fee_from_bytes;
-use arc_execution_config::hardforks::ArcHardfork;
+use arc_execution_config::hardforks::{is_arc_fork_active, ArcHardfork};
 
 /// Arc Network custom consensus implementation
 #[derive(Debug, Clone)]
@@ -68,6 +68,9 @@ where
 
         // ADR-0004: base_fee_per_gas must be present (EIP-1559) and within absolute bounds (Zero5+).
         arc_validate_header_base_fee(header.header(), &self.chain_spec)?;
+
+        // Reject blocks with a zero beneficiary (Zero6+).
+        arc_validate_beneficiary_nonzero(header.header(), &self.chain_spec)?;
 
         Ok(())
     }
@@ -143,7 +146,12 @@ where
     let Some(expected_base_fee) = decode_base_fee_from_bytes(parent.extra_data()) else {
         // Post-Zero5 this branch should be unreachable: `arc_validate_extra_data_format`
         // enforces that extra_data is exactly 8 bytes.
-        if chain_spec.is_fork_active_at_block(ArcHardfork::Zero5, parent.number()) {
+        if is_arc_fork_active(
+            chain_spec,
+            ArcHardfork::Zero5,
+            parent.number(),
+            parent.timestamp(),
+        ) {
             tracing::error!(
                 parent_number = parent.number(),
                 extra_data_len = parent.extra_data().len(),
@@ -178,7 +186,12 @@ fn arc_validate_extra_data_format<H: BlockHeader, CS: Hardforks>(
     header: &H,
     chain_spec: &CS,
 ) -> Result<(), ConsensusError> {
-    if !chain_spec.is_fork_active_at_block(ArcHardfork::Zero5, header.number()) {
+    if !is_arc_fork_active(
+        chain_spec,
+        ArcHardfork::Zero5,
+        header.number(),
+        header.timestamp(),
+    ) {
         return Ok(());
     }
 
@@ -209,7 +222,12 @@ fn arc_validate_header_base_fee<
     validate_header_base_fee(header, chain_spec)?;
 
     // Post-Zero5: enforce absolute bounds.
-    if !chain_spec.is_fork_active_at_block(ArcHardfork::Zero5, header.number()) {
+    if !is_arc_fork_active(
+        chain_spec,
+        ArcHardfork::Zero5,
+        header.number(),
+        header.timestamp(),
+    ) {
         return Ok(());
     }
 
@@ -238,7 +256,12 @@ fn arc_validate_gas_limit_bounds<H: BlockHeader, CS: Hardforks + BlockGasLimitPr
     header: &H,
     chain_spec: &CS,
 ) -> Result<(), ConsensusError> {
-    if !chain_spec.is_fork_active_at_block(ArcHardfork::Zero5, header.number()) {
+    if !is_arc_fork_active(
+        chain_spec,
+        ArcHardfork::Zero5,
+        header.number(),
+        header.timestamp(),
+    ) {
         return Ok(());
     }
 
@@ -251,6 +274,34 @@ fn arc_validate_gas_limit_bounds<H: BlockHeader, CS: Hardforks + BlockGasLimitPr
             config.min(),
             config.max()
         )));
+    }
+
+    Ok(())
+}
+
+/// Rejects blocks whose beneficiary (coinbase) is the zero address.
+///
+/// Post-Zero6, every block must have an explicit non-zero fee recipient set by the CL
+/// via `--suggested-fee-recipient`. A zero beneficiary would burn all transaction fees
+/// irrecoverably.
+#[inline]
+fn arc_validate_beneficiary_nonzero<H: BlockHeader, CS: Hardforks>(
+    header: &H,
+    chain_spec: &CS,
+) -> Result<(), ConsensusError> {
+    if !is_arc_fork_active(
+        chain_spec,
+        ArcHardfork::Zero6,
+        header.number(),
+        header.timestamp(),
+    ) {
+        return Ok(());
+    }
+
+    if header.beneficiary().is_zero() {
+        return Err(ConsensusError::Other(
+            "block beneficiary must not be the zero address".into(),
+        ));
     }
 
     Ok(())
@@ -280,7 +331,7 @@ fn arc_validate_header_timestamp_with_time<H: BlockHeader>(
     local_time: u64,
 ) -> Result<(), ConsensusError> {
     // Validate that the header's timestamp is not too far in the future
-    if header.timestamp() > local_time + ARC_PROPOSER_CLOCK_SKEW_THRESHOLD {
+    if header.timestamp() > local_time.saturating_add(ARC_PROPOSER_CLOCK_SKEW_THRESHOLD) {
         return Err(ConsensusError::TimestampIsInFuture {
             timestamp: header.timestamp(),
             present_timestamp: local_time,
@@ -905,7 +956,7 @@ mod tests {
         }
 
         // Pre-Zero5: bounds check is skipped entirely.
-        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, 0)]);
+        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
         let header = Header {
             number: 1,
             base_fee_per_gas: Some(config.absolute_min_base_fee - 1),
@@ -949,7 +1000,7 @@ mod tests {
         ));
 
         // Pre-Zero5: length check is skipped entirely.
-        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, 0)]);
+        let pre_zero5 = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
         let header = Header {
             number: 1,
             extra_data: Bytes::from([0u8; 7].as_slice()),
@@ -991,6 +1042,57 @@ mod tests {
         assert!(
             matches!(result, Err(ConsensusError::Other(_))),
             "At Zero5, gas limit 0 should be invalid: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_beneficiary_nonzero_rejected_at_zero6() {
+        use alloy_primitives::{address, Address};
+
+        let spec = LOCAL_DEV.clone();
+
+        let zero_beneficiary = Header {
+            number: 1,
+            beneficiary: Address::ZERO,
+            ..Default::default()
+        };
+        let result = arc_validate_beneficiary_nonzero(&zero_beneficiary, spec.as_ref());
+        assert!(
+            matches!(result, Err(ConsensusError::Other(_))),
+            "Zero beneficiary should be rejected post-Zero6: {result:?}"
+        );
+
+        let nonzero_beneficiary = Header {
+            number: 1,
+            beneficiary: address!("0x65E0a200006D4FF91bD59F9694220dafc49dbBC1"),
+            ..Default::default()
+        };
+        let result = arc_validate_beneficiary_nonzero(&nonzero_beneficiary, spec.as_ref());
+        assert!(
+            result.is_ok(),
+            "Non-zero beneficiary should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_beneficiary_nonzero_skipped_before_zero6() {
+        use alloy_primitives::Address;
+
+        let mut inner = ChainSpecBuilder::mainnet().build();
+        inner
+            .hardforks
+            .insert(ArcHardfork::Zero6, ForkCondition::Block(100));
+        let spec = Arc::new(ArcChainSpec::new(inner));
+
+        let header = Header {
+            number: 99,
+            beneficiary: Address::ZERO,
+            ..Default::default()
+        };
+        let result = arc_validate_beneficiary_nonzero(&header, spec.as_ref());
+        assert!(
+            result.is_ok(),
+            "Before Zero6, zero beneficiary should be allowed: {result:?}"
         );
     }
 }

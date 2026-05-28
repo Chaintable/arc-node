@@ -60,6 +60,8 @@ A validator is a node that participates in consensus, proposes and votes on bloc
 arc-node-consensus start \
    --home=~/.arc/consensus \
    --moniker=validator-1 \
+   --validator \
+   --suggested-fee-recipient=0xYourAddressHere \
    --eth-socket=/tmp/reth.ipc \
    --execution-socket=/tmp/auth.ipc \
    --minimal
@@ -71,6 +73,8 @@ arc-node-consensus start \
 arc-node-consensus start \
    --home=~/.arc/consensus \
    --moniker=validator-1 \
+   --validator \
+   --suggested-fee-recipient=0xYourAddressHere \
    --p2p.addr=/ip4/172.19.0.5/tcp/27000 \
    --p2p.persistent-peers=/ip4/172.19.0.6/tcp/27000,/ip4/172.19.0.7/tcp/27000 \
    --metrics=172.19.0.5:29000 \
@@ -86,6 +90,8 @@ arc-node-consensus start \
 arc-node-consensus start \
    --home=~/.arc/consensus \
    --moniker=validator-1 \
+   --validator \
+   --suggested-fee-recipient=0xYourAddressHere \
    --p2p.addr=/ip4/172.19.0.5/tcp/27000 \
    --p2p.persistent-peers=/ip4/172.19.0.6/tcp/27000,/ip4/172.19.0.7/tcp/27000 \
    --metrics=0.0.0.0:29000 \
@@ -112,9 +118,10 @@ arc-node-consensus start \
    --moniker=full-1 \
    --eth-socket=/tmp/reth.ipc \
    --execution-socket=/tmp/auth.ipc \
-   --no-consensus \
    --full
 ```
+
+To run as a sync-only node that does not subscribe to consensus gossip topics, pass `--no-consensus`.
 
 #### c) Follow mode (RPC sync)
 
@@ -148,7 +155,8 @@ https://example.com,wss=ws.example.com:1212
 
 - `--p2p.persistent-peers` - Comma-separated list of persistent peer multiaddrs
 - `--p2p.persistent-peers-only` - Only allow connections to/from persistent peers (default: false). Useful for sentry node setups where a validator should only communicate with known trusted peers.
-- `--no-consensus` - Run as a full node that syncs with the network but does not participate in consensus as a validator (no block proposing or voting).
+- `--validator` - Run as a validator: load the consensus signing key, sign the validator proof (ADR-006), and advertise a validator identity. Without this flag the node runs as a full node (no signing, ephemeral consensus key). Mutually exclusive with `--no-consensus` and `--follow`. Requires `--suggested-fee-recipient`.
+- `--no-consensus` - Run as a sync-only node that does not subscribe to consensus gossip topics. Mutually exclusive with `--validator`.
 - `--discovery` - Enable peer discovery (default: false)
 - `--discovery.num-outbound-peers` - Number of outbound peers (default: 20)
 - `--discovery.num-inbound-peers` - Number of inbound peers (default: 20)
@@ -162,14 +170,14 @@ https://example.com,wss=ws.example.com:1212
 - `--log-level` - Log level: "trace", "debug", "info", "warn", "error" (default: "debug")
 - `--log-format` - Log format: "plaintext" or "json" (default: "plaintext")
 - `--pprof.addr` - Profiling server bind address (default: "0.0.0.0:6060")
-- `--suggested-fee-recipient` - Address to receive tips and rewards
+- `--suggested-fee-recipient <ADDRESS>` - 20-byte address to receive tips and rewards. Required when `--validator` is set.
 - `--follow` - Enable RPC sync mode. The node fetches blocks from trusted RPC endpoints instead of participating in consensus (requires `--follow.endpoint`)
 - `--follow.endpoint <ENDPOINT>` - RPC endpoint to fetch blocks from in sync mode. Can be repeated. Format: `http://host:port[,ws=port]` (requires `--follow`)
 - `--runtime.flavor` - Tokio runtime flavor: "single-threaded" or "multi-threaded" (default: "multi-threaded")
 - `--runtime.worker-threads <COUNT>` - Number of worker threads for the multi-threaded runtime (default: number of CPU cores; ignored with single-threaded)
 - `--private-key <PATH>` - Path to private validator key file. Used for P2P identity and (when not using `--signing.remote`) consensus signing. Default: `{home}/config/priv_validator_key.json`
 - `--db.skip-upgrade` - Skip database schema upgrade on startup
-- `--signing.remote` - Use remote signing with specified endpoint URL (if not provided, uses local signing)
+- `--signing.remote` - Use remote signing with specified endpoint URL (if not provided, uses local signing). Requires `--validator`.
 - `--signing.tls-cert-path` - Path to TLS certificate file for remote signing; auto-enables TLS (requires `--signing.remote`)
 
 #### Remote Signing
@@ -180,6 +188,8 @@ For validator nodes that use a remote signing service instead of local private k
 arc-node-consensus start \
    --home=~/.arc/consensus \
    --moniker=validator-1 \
+   --validator \
+   --suggested-fee-recipient=0xYourAddressHere \
    --eth-socket=/tmp/reth.ipc \
    --execution-socket=/tmp/auth.ipc \
    --minimal \

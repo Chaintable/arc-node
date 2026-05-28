@@ -21,7 +21,7 @@
 use alloy_primitives::{address, Address};
 
 /// Address of the `Memo` contract (CREATE2-deployed, zero salt).
-pub const MEMO_ADDRESS: Address = address!("9702466268ccF55eAB64cdf484d272Ac08d3b75b");
+pub const MEMO_ADDRESS: Address = address!("5294E9927c3306DcBaDb03fe70b92e01cCede505");
 
 /// Address of the `Multicall3From` contract (CREATE2-deployed, zero salt).
-pub const MULTICALL3_FROM_ADDRESS: Address = address!("Eb7cc06E3D3b5F9F9a5fA2B31B477ff72bB9c8b6");
+pub const MULTICALL3_FROM_ADDRESS: Address = address!("522fAf9A91c41c443c66765030741e4AaCe147D0");

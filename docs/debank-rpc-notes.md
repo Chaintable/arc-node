@@ -355,3 +355,37 @@ The Tempo strategy applies verbatim:
 
 Other Arc precompiles (`SYSTEM_ACCOUNTING`, `CALL_FROM`) may behave the
 same; the fallback handles all symmetrically.
+
+## 2026-05-28 — upstream v0.7.1 merge
+
+### D21. Crate-level `#![allow(clippy::arithmetic_side_effects)]` [decided]
+
+upstream v0.7.1 enabled `arithmetic_side_effects = "deny"` workspace-wide
+(via bd637da "fix: use checked arithmetic for cumulative gas accounting in
+payload builder"). After merging v0.7.1 into `debank`, `cargo clippy
+-p debank-rpc --all-targets -- -D warnings` failed with 11 errors across
+`debank_trace.rs` and `trace_block.rs` — all on index/counter increments
+(`log_index += 1`, `pos_in_parent_trace + 1`, `idx + 1`) or gas
+accumulation (`events.len() + error_events.len()`, `start.elapsed()...`).
+
+These are statistically safe: wrapping would only happen on blocks with
+> 2^64 events/gas — physically impossible (Arc gas limit 30M, single-tx
+event budget bounded by gas, single block bounded by gas_limit, so total
+events/block << 10^9 << 2^64).
+
+Following the same crate-level pattern as D10 (`unwrap_used` allow for
+tests) and D13 (`too_many_arguments` for jsonrpsee macro output), add:
+
+```rust
+#![allow(clippy::arithmetic_side_effects)]
+```
+
+at the top of `crates/debank-rpc/src/lib.rs`. If a future change needs
+checked arithmetic for a specific codepath, scope a narrower `#[allow]`
+there.
+
+**Conflict resolution in `Cargo.toml`**: upstream added `criterion = "0.7"`
+and `csv = "1.4"` adjacent to `crunchy`/`deranged`; we had inserted
+`debank-rpc = ...` between them. Combined all three in alphabetical order:
+`criterion`, `crunchy`, `csv`, `debank-rpc`, `deranged`.
+

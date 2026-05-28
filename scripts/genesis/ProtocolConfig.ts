@@ -19,6 +19,7 @@ import {
   addressToBytes32,
   buildImplContractAlloc,
   buildSystemContractAlloc,
+  enforceOperatorsNotProxyAdmin,
   schemaAddress,
   schemaBigInt,
   slotIndex,
@@ -64,10 +65,6 @@ export const schemaProtocolConfig = z
      */
     pauser: schemaAddress,
 
-    /**
-     * The initial beneficiary, which can receive the block rewards.
-     */
-    beneficiary: schemaAddress,
     feeParams: z.object({
       alpha: schemaBigInt.min(0n).max(100n),
       kRate: schemaBigInt.min(0n).max(10000n),
@@ -90,6 +87,13 @@ export const schemaProtocolConfig = z
       .optional(),
   })
   .strict()
+  .superRefine((data, ctx) => {
+    enforceOperatorsNotProxyAdmin(ctx, 'ProtocolConfig', data.proxy.admin, [
+      { key: 'owner', value: data.owner },
+      { key: 'controller', value: data.controller },
+      { key: 'pauser', value: data.pauser },
+    ])
+  })
 
 export type ProtocolConfigConfig = z.infer<typeof schemaProtocolConfig>
 
@@ -100,7 +104,6 @@ export const buildProtocolConfigGenesisAllocs = async (ctx: BuilderContext, conf
     owner,
     controller,
     pauser,
-    beneficiary,
     feeParams,
     consensusParams,
   } = schemaProtocolConfig.parse(config)
@@ -153,7 +156,8 @@ export const buildProtocolConfigGenesisAllocs = async (ctx: BuilderContext, conf
        * Slot 1: minBaseFee (uint256)
        * Slot 2: maxBaseFee (uint256)
        * Slot 3: blockGasLimit (uint256)
-       * Slot 4: rewardBeneficiary (address)
+       * Slot 4: _reserved_address (address) — address placeholder;
+       *         left zero at genesis. Slot retained to avoid storage migration on upgrade.
        * Slot 5: ConsensusParams packed (8 * uint16 = 128 bits)
        */
       /*
@@ -172,8 +176,7 @@ export const buildProtocolConfigGenesisAllocs = async (ctx: BuilderContext, conf
       StorageSlot(slotIndex(PROTOCOL_CONFIG_STORAGE_LOCATION + 1n), toBytes32(feeParams.minBaseFee)),
       StorageSlot(slotIndex(PROTOCOL_CONFIG_STORAGE_LOCATION + 2n), toBytes32(feeParams.maxBaseFee)),
       StorageSlot(slotIndex(PROTOCOL_CONFIG_STORAGE_LOCATION + 3n), toBytes32(feeParams.blockGasLimit)),
-      // rewardBeneficiary in slot 4
-      StorageSlot(slotIndex(PROTOCOL_CONFIG_STORAGE_LOCATION + 4n), addressToBytes32(beneficiary)),
+      // Slot 4 is the deprecated address placeholder — genesis leaves it zero.
       // ConsensusParams packed into one slot (8 * uint16 = 128 bits) in slot 5
       ...(consensusParams
         ? [

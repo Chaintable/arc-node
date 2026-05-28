@@ -14,12 +14,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::unwrap_used
+)]
 
 pub mod fetch;
 pub mod health;
 pub mod mempool;
 pub mod mesh;
+pub mod metric;
 pub mod mev;
 pub mod perf;
 pub mod store;
@@ -33,13 +38,17 @@ pub use health::{
 };
 pub use mempool::check_mempool;
 pub use mesh::check_mesh;
+pub use metric::parse_counter;
 pub use mev::check_pending_state;
-pub use perf::{check_block_time, check_block_time_delta, format_perf_report, parse_perf_metrics};
+pub use perf::{
+    check_block_time, check_block_time_delta, format_perf_report, parse_perf_metrics,
+    parse_perf_metrics_delta,
+};
 pub use store::{check_store_pruning, collect_store_info, StoreInfo};
 pub use sync_speed::{
     check_sync_speed, collect_sync_speed, poll_height, SyncSpeedConfig, SyncSpeedResult,
 };
 pub use types::{
     CheckResult, HistogramStats, NodeHealthData, NodeHealthDelta, NodePerfData, PerfDisplayOptions,
-    Report,
+    PerfReportKind, Report,
 };

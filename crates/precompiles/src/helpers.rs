@@ -16,11 +16,12 @@
 
 use alloy_evm::EvmInternals;
 use alloy_primitives::{Address, Bytes, StorageKey, U256};
-use alloy_sol_types::{SolEvent, SolValue};
+use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use reth_ethereum::evm::revm::precompile::{PrecompileError, PrecompileOutput};
 use reth_evm::precompiles::PrecompileInput;
 use revm::context_interface::journaled_state::TransferError;
 use revm::state::AccountInfo;
+use revm_context_interface::cfg::gas::CALL_STIPEND;
 use revm_interpreter::Gas;
 use revm_primitives::address;
 use revm_primitives::constants::KECCAK_EMPTY;
@@ -37,6 +38,8 @@ pub const REVERT_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
 /// Approximate gas costs for precompile read / writes
 pub const PRECOMPILE_SSTORE_GAS_COST: u64 = 2900;
 pub const PRECOMPILE_SLOAD_GAS_COST: u64 = 2100;
+/// EIP-161 account creation surcharge when crediting an empty account.
+pub const PRECOMPILE_EMPTY_ACCOUNT_GAS_COST: u64 = 25_000;
 
 /// Gas costs for emitting a log
 pub const LOG_BASE_COST: u64 = 375; // Base cost for emitting a log
@@ -63,15 +66,22 @@ pub const ERR_SELFDESTRUCTED_BALANCE_INCREASED: &str =
 /// - ABI-encoded string value of the error message.
 pub fn revert_message_to_bytes(msg: &str) -> Bytes {
     let encoded = msg.abi_encode();
-    let mut result = Vec::with_capacity(4 + encoded.len());
+    let mut result = Vec::with_capacity(REVERT_SELECTOR.len().saturating_add(encoded.len()));
     result.extend_from_slice(&REVERT_SELECTOR);
     result.extend_from_slice(&encoded);
     Bytes::from(result)
 }
 
-/// Gas penalty for ABI decode revert (invalid selector, etc)
-/// In normal cases we didn't record this cost, but when reverted, add this penalty to the gas usage.
-pub(crate) const PRECOMPILE_ABI_DECODE_REVERT_GAS_PENALTY: u64 = 200;
+/// Gas penalty added to early-path reverts so callers cannot probe precompiles
+/// for free.
+///
+/// Pre-Zero6: applied only to ABI decode failures (truncated input, unknown
+/// selector) via `new_reverted_with_penalty`.
+///
+/// Zero6+: also applied to authorization and validation reverts (unauthorized
+/// caller, blocklist, zero address, zero amount, overflow) via
+/// [`new_reverted_with_early_penalty`].
+pub(crate) const PRECOMPILE_EARLY_REVERT_GAS_PENALTY: u64 = 200;
 
 /// Enum to represent either a reverted precompile output or an error
 pub(crate) enum PrecompileErrorOrRevert {
@@ -97,6 +107,36 @@ impl PrecompileErrorOrRevert {
             revert_message_to_bytes(msg),
         ))
     }
+}
+
+/// Gas cost to load an account balance for stateful precompiles.
+///
+/// Under Zero6+, applies EIP-2929 warm/cold pricing. Before Zero6, a flat
+/// cost is charged (matches pre-hardfork behavior for the `balance_incr`,
+/// `balance_decr` and `transfer` helpers).
+fn account_load_cost(is_cold: bool, hardfork_flags: ArcHardforkFlags) -> u64 {
+    if hardfork_flags.is_active(ArcHardfork::Zero6) {
+        if is_cold {
+            revm_interpreter::gas::COLD_ACCOUNT_ACCESS_COST
+        } else {
+            revm_interpreter::gas::WARM_STORAGE_READ_COST
+        }
+    } else {
+        PRECOMPILE_SLOAD_GAS_COST
+    }
+}
+
+fn record_zero6_empty_account_creation_cost(
+    gas_counter: &mut Gas,
+    account_info: &AccountInfo,
+    amount: U256,
+    hardfork_flags: ArcHardforkFlags,
+) -> Result<(), PrecompileErrorOrRevert> {
+    if hardfork_flags.is_active(ArcHardfork::Zero6) && !amount.is_zero() && account_info.is_empty()
+    {
+        record_cost_or_out_of_gas(gas_counter, PRECOMPILE_EMPTY_ACCOUNT_GAS_COST)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn record_cost_or_out_of_gas(
@@ -125,6 +165,44 @@ impl From<PrecompileErrorOrRevert> for Result<PrecompileOutput, PrecompileError>
             PrecompileErrorOrRevert::Revert(output) => Ok(output.reverted()),
             PrecompileErrorOrRevert::Error(error) => Err(error),
         }
+    }
+}
+
+/// Build a revert that charges [`PRECOMPILE_EARLY_REVERT_GAS_PENALTY`]
+/// when Zero6 is active, and zero gas otherwise.
+///
+/// Use at early-path reverts (unauthorized caller, blocklist, zero address,
+/// zero amount, overflow) to give uniform gas accounting under Zero6 and
+/// prevent free probing of precompile revert paths.
+pub(crate) fn new_reverted_with_early_penalty(
+    gas_counter: Gas,
+    msg: &str,
+    hardfork_flags: ArcHardforkFlags,
+) -> PrecompileErrorOrRevert {
+    if hardfork_flags.is_active(ArcHardfork::Zero6) {
+        PrecompileErrorOrRevert::new_reverted_with_penalty(
+            gas_counter,
+            PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+            msg,
+        )
+    } else {
+        PrecompileErrorOrRevert::new_reverted(gas_counter, msg)
+    }
+}
+
+/// ABI-decodes raw precompile call arguments.
+///
+/// Pre-Zero6, this preserves the legacy lenient Alloy decode behavior. Zero6
+/// switches to validated decoding, which rejects non-canonical ABI padding for
+/// short static types such as `address`, `bool`, and `uint64`.
+pub(crate) fn abi_decode_raw_with_zero6_validation<C: SolCall>(
+    input: &[u8],
+    hardfork_flags: ArcHardforkFlags,
+) -> alloy_sol_types::Result<C> {
+    if hardfork_flags.is_active(ArcHardfork::Zero6) {
+        C::abi_decode_raw_validate(input)
+    } else {
+        C::abi_decode_raw(input)
     }
 }
 
@@ -193,6 +271,11 @@ pub(crate) fn read(
 /// - Pre-Zero5: Fixed cost of 2,900 gas units
 /// - Zero5+: EIP-2929/EIP-2200 aware (varies based on warm/cold and value changes)
 ///
+/// # EIP-2200 Sentry (Zero6+)
+/// Mirrors revm's SSTORE opcode behavior: if the remaining gas is less than or
+/// equal to [`CALL_STIPEND`] (2,300), the call frame fails with `OutOfGas`
+/// before any storage mutation is journaled.
+///
 /// # Returns
 /// - `Ok(())`: Success
 /// - `Err(PrecompileErrorOrRevert)`: If out of gas or storage write fails
@@ -217,6 +300,12 @@ pub(crate) fn write(
     gas_counter: &mut Gas,
     hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
+    // EIP-2200 reentrancy sentry: refuse SSTORE when remaining gas does not
+    // exceed the call stipend.
+    if hardfork_flags.is_active(ArcHardfork::Zero6) && gas_counter.remaining() <= CALL_STIPEND {
+        return Err(PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas));
+    }
+
     // Parse the input as a U256 value
     let value = U256::from_be_slice(input);
 
@@ -240,13 +329,21 @@ pub(crate) fn write(
             if vals.is_original_zero() {
                 20000 // SSTORE_SET
             } else {
-                5000 - revm_interpreter::gas::COLD_SLOAD_COST // WARM_SSTORE_RESET
+                // WARM_SSTORE_RESET: 5000 - COLD_SLOAD_COST (2,100) = 2,900
+                #[allow(clippy::arithmetic_side_effects)]
+                {
+                    5000 - revm_interpreter::gas::COLD_SLOAD_COST
+                }
             }
         } else {
             revm_interpreter::gas::WARM_STORAGE_READ_COST
         };
         if sstore_result.is_cold {
-            base_cost + revm_interpreter::gas::COLD_SLOAD_COST
+            // base_cost <= 20,000; + COLD_SLOAD_COST (2,100) fits in u64
+            #[allow(clippy::arithmetic_side_effects)]
+            {
+                base_cost + revm_interpreter::gas::COLD_SLOAD_COST
+            }
         } else {
             base_cost
         }
@@ -265,41 +362,40 @@ pub(crate) fn transfer(
     to: Address,
     amount: U256,
     gas_counter: &mut Gas,
-    is_burn: bool,
-    check_selfdestructed: bool,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
     let loaded_from_account = internals.load_account(from).map_err(|_| {
         PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
     })?;
+    record_cost_or_out_of_gas(
+        gas_counter,
+        account_load_cost(loaded_from_account.is_cold, hardfork_flags),
+    )?;
 
     // Check that the account can be decremented by the amount
     check_can_decr_account(&loaded_from_account.info, amount, gas_counter)?;
 
-    // Overflow checking is handled by the Journal and the TransferError
-    // returned
-    // Here we stack the STORE gas cost, mimicking the prior balance_decr + balance_incr calls,
-    // where we charged:
-    // SLOAD, SSTORE
-    // SLOAD, SSTORE
-    // For burns, we only charge the first SLOAD, SSTORE to mimick balance_decr
+    // Mirrors prior balance_decr + balance_incr; Zero6+ uses cold/warm via account_load_cost.
     record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
-    if !is_burn {
-        record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
-        record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
+
+    let to_load = internals.load_account(to).map_err(|_| {
+        PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
+    })?;
+    record_cost_or_out_of_gas(
+        gas_counter,
+        account_load_cost(to_load.is_cold, hardfork_flags),
+    )?;
+
+    record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
+
+    if hardfork_flags.is_active(ArcHardfork::Zero5) && to_load.is_selfdestructed() {
+        return Err(PrecompileErrorOrRevert::new_reverted(
+            *gas_counter,
+            ERR_SELFDESTRUCTED_BALANCE_INCREASED,
+        ));
     }
 
-    if check_selfdestructed {
-        let to_account = internals.load_account(to).map_err(|_| {
-            PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
-        })?;
-        if to_account.is_selfdestructed() {
-            return Err(PrecompileErrorOrRevert::new_reverted(
-                *gas_counter,
-                ERR_SELFDESTRUCTED_BALANCE_INCREASED,
-            ));
-        }
-    }
+    record_zero6_empty_account_creation_cost(gas_counter, &to_load.info, amount, hardfork_flags)?;
 
     let transfer_result = internals.transfer(from, to, amount).map_err(|_e| {
         PrecompileErrorOrRevert::new_reverted(*gas_counter, ERR_EXECUTION_REVERTED)
@@ -331,16 +427,18 @@ pub(crate) fn balance_incr(
     to: Address,
     amount: U256,
     gas_counter: &mut Gas,
-    check_selfdestructed: bool,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
-
     // Balance check, but doesn't touch state
     let account = internals.load_account(to).map_err(|_| {
         PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
     })?;
+    record_cost_or_out_of_gas(
+        gas_counter,
+        account_load_cost(account.is_cold, hardfork_flags),
+    )?;
 
-    if check_selfdestructed && account.is_selfdestructed() {
+    if hardfork_flags.is_active(ArcHardfork::Zero5) && account.is_selfdestructed() {
         return Err(PrecompileErrorOrRevert::new_reverted(
             *gas_counter,
             ERR_SELFDESTRUCTED_BALANCE_INCREASED,
@@ -357,6 +455,7 @@ pub(crate) fn balance_incr(
 
     // Update state
     record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SSTORE_GAS_COST)?;
+    record_zero6_empty_account_creation_cost(gas_counter, &account.info, amount, hardfork_flags)?;
     internals.balance_incr(to, amount).map_err(|_| {
         PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
     })?;
@@ -370,11 +469,15 @@ pub(crate) fn balance_decr(
     from: Address,
     amount: U256,
     gas_counter: &mut Gas,
+    hardfork_flags: ArcHardforkFlags,
 ) -> Result<(), PrecompileErrorOrRevert> {
-    record_cost_or_out_of_gas(gas_counter, PRECOMPILE_SLOAD_GAS_COST)?;
     let loaded_from_account = internals.load_account(from).map_err(|_| {
         PrecompileErrorOrRevert::Error(PrecompileError::Other(ERR_EXECUTION_REVERTED.into()))
     })?;
+    record_cost_or_out_of_gas(
+        gas_counter,
+        account_load_cost(loaded_from_account.is_cold, hardfork_flags),
+    )?;
 
     // Check that the account can be decremented by the amount
     check_can_decr_account(&loaded_from_account.info, amount, gas_counter)?;
@@ -416,7 +519,7 @@ pub(crate) fn check_staticcall(
 pub(crate) fn check_delegatecall(
     precompile_address: Address,
     precompile_input: &PrecompileInput,
-    gas_counter: &mut Gas,
+    gas_counter: &Gas,
 ) -> Result<(), PrecompileErrorOrRevert> {
     if precompile_input.target_address != precompile_address
         || precompile_input.bytecode_address != precompile_address
@@ -467,12 +570,12 @@ pub(crate) fn emit_event<Event: SolEvent>(
 ) -> Result<(), PrecompileErrorOrRevert> {
     let data = event.encode_log_data();
 
-    record_cost_or_out_of_gas(
-        gas_counter,
-        LOG_BASE_COST
-            + LOG_TOPIC_COST * data.topics().len() as u64
-            + LOG_DATA_COST * data.data.len() as u64,
-    )?;
+    let topic_gas = LOG_TOPIC_COST.saturating_mul(data.topics().len() as u64);
+    let data_gas = LOG_DATA_COST.saturating_mul(data.data.len() as u64);
+    let log_gas = LOG_BASE_COST
+        .saturating_add(topic_gas)
+        .saturating_add(data_gas);
+    record_cost_or_out_of_gas(gas_counter, log_gas)?;
 
     let log = revm::primitives::Log { address, data };
 
@@ -483,8 +586,131 @@ pub(crate) fn emit_event<Event: SolEvent>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::U256;
+    use alloy_primitives::{address, U256};
+    use alloy_sol_types::sol;
     use revm_primitives::B256;
+
+    sol! {
+        interface IAbiDecodeTest {
+            function takesAddress(address account) external;
+            function takesUint64(uint64 value) external;
+        }
+    }
+
+    #[test]
+    fn abi_decode_raw_validation_is_zero6_gated_for_address_padding() {
+        let mut input = [0u8; 32];
+        input[..12].fill(0x11);
+        input[12] = 0xaa;
+
+        let pre_zero6 = abi_decode_raw_with_zero6_validation::<IAbiDecodeTest::takesAddressCall>(
+            &input,
+            ArcHardforkFlags::with(&[ArcHardfork::Zero5]),
+        )
+        .expect("pre-Zero6 decode preserves legacy lenient padding");
+        assert_eq!(
+            pre_zero6.account,
+            address!("aa00000000000000000000000000000000000000")
+        );
+
+        let zero6 = abi_decode_raw_with_zero6_validation::<IAbiDecodeTest::takesAddressCall>(
+            &input,
+            ArcHardforkFlags::with(&[ArcHardfork::Zero6]),
+        );
+        assert!(zero6.is_err(), "Zero6 rejects non-zero address padding");
+    }
+
+    #[test]
+    fn abi_decode_raw_validation_is_zero6_gated_for_uint64_padding() {
+        let mut input = [0u8; 32];
+        input[0] = 0x11;
+        input[31] = 42;
+
+        let pre_zero6 = abi_decode_raw_with_zero6_validation::<IAbiDecodeTest::takesUint64Call>(
+            &input,
+            ArcHardforkFlags::with(&[ArcHardfork::Zero5]),
+        )
+        .expect("pre-Zero6 decode preserves legacy lenient padding");
+        assert_eq!(pre_zero6.value, 42);
+
+        let zero6 = abi_decode_raw_with_zero6_validation::<IAbiDecodeTest::takesUint64Call>(
+            &input,
+            ArcHardforkFlags::with(&[ArcHardfork::Zero6]),
+        );
+        assert!(zero6.is_err(), "Zero6 rejects non-zero uint64 padding");
+    }
+
+    #[test]
+    fn zero6_empty_account_creation_cost_charges_only_for_nonzero_empty_accounts() {
+        let zero6 = ArcHardforkFlags::with(&[ArcHardfork::Zero6]);
+        let pre_zero6 = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+
+        let mut gas_counter = Gas::new(100_000);
+        assert!(record_zero6_empty_account_creation_cost(
+            &mut gas_counter,
+            &AccountInfo::default(),
+            U256::from(1),
+            pre_zero6,
+        )
+        .is_ok());
+        assert_eq!(gas_counter.used(), 0);
+
+        assert!(record_zero6_empty_account_creation_cost(
+            &mut gas_counter,
+            &AccountInfo::default(),
+            U256::ZERO,
+            zero6,
+        )
+        .is_ok());
+        assert_eq!(gas_counter.used(), 0);
+
+        assert!(record_zero6_empty_account_creation_cost(
+            &mut gas_counter,
+            &AccountInfo::default(),
+            U256::from(1),
+            zero6,
+        )
+        .is_ok());
+        assert_eq!(gas_counter.used(), PRECOMPILE_EMPTY_ACCOUNT_GAS_COST);
+
+        for non_empty_account in [
+            AccountInfo {
+                balance: U256::from(1),
+                ..Default::default()
+            },
+            AccountInfo {
+                nonce: 1,
+                ..Default::default()
+            },
+            AccountInfo {
+                code_hash: B256::from([1u8; 32]),
+                ..Default::default()
+            },
+        ] {
+            assert!(record_zero6_empty_account_creation_cost(
+                &mut gas_counter,
+                &non_empty_account,
+                U256::from(1),
+                zero6,
+            )
+            .is_ok());
+            assert_eq!(gas_counter.used(), PRECOMPILE_EMPTY_ACCOUNT_GAS_COST);
+        }
+    }
+
+    #[test]
+    fn zero6_empty_account_creation_cost_errors_when_out_of_gas() {
+        let mut gas_counter = Gas::new(PRECOMPILE_EMPTY_ACCOUNT_GAS_COST.saturating_sub(1));
+        assert!(matches!(
+            record_zero6_empty_account_creation_cost(
+                &mut gas_counter,
+                &AccountInfo::default(),
+                U256::from(1),
+                ArcHardforkFlags::with(&[ArcHardfork::Zero6]),
+            ),
+            Err(PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas))
+        ));
+    }
 
     // Generated 11/30/2025 with AI assistance
     #[test]
@@ -634,5 +860,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn from_precompile_error_or_revert_revert_sets_reverted_flag() {
+        let revert_bytes = revert_message_to_bytes("test revert");
+        let err_or_revert =
+            PrecompileErrorOrRevert::Revert(PrecompileOutput::new(1_000, revert_bytes.clone()));
+
+        let result: Result<PrecompileOutput, PrecompileError> = err_or_revert.into();
+
+        let output = result.expect("Revert variant must convert to Ok(PrecompileOutput)");
+        assert!(
+            output.reverted,
+            "canonical From impl must set reverted flag on Revert variant"
+        );
+        assert_eq!(output.gas_used, 1_000);
+        assert_eq!(output.bytes, revert_bytes);
+    }
+
+    #[test]
+    fn from_precompile_error_or_revert_error_maps_to_err() {
+        let err_or_revert = PrecompileErrorOrRevert::Error(PrecompileError::OutOfGas);
+
+        let result: Result<PrecompileOutput, PrecompileError> = err_or_revert.into();
+
+        assert!(matches!(result, Err(PrecompileError::OutOfGas)));
     }
 }

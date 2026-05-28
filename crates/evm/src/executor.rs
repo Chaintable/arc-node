@@ -52,7 +52,7 @@ use arc_execution_config::chainspec::{BaseFeeConfigProvider, BlockGasLimitProvid
 use arc_execution_config::gas_fee::{
     self, arc_calc_next_block_base_fee, decode_base_fee_from_bytes,
 };
-use arc_execution_config::hardforks::ArcHardfork;
+use arc_execution_config::hardforks::{is_arc_fork_active, ArcHardfork};
 use arc_execution_config::native_coin_control::{
     compute_is_blocklisted_storage_slot, is_blocklisted_status,
 };
@@ -63,9 +63,8 @@ use reth_evm::block::StateChangePostBlockSource;
 use revm::DatabaseCommit;
 
 const ERR_BLOCKLIST_READ_FAILED: &str = "Failed to read beneficiary blocklist status";
-const ERR_BENEFICIARY_MISMATCH: &str =
-    "Block beneficiary does not match ProtocolConfig.rewardBeneficiary()";
 const ERR_BLOCK_NUMBER_CONVERSION_FAILED: &str = "Failed to convert block number to u64";
+const ERR_BLOCK_TIMESTAMP_CONVERSION_FAILED: &str = "Failed to convert block timestamp to u64";
 
 /// Result of executing an Arc transaction.
 #[derive(Debug)]
@@ -141,25 +140,24 @@ where
             BlockExecutionError::msg(ERR_BLOCK_NUMBER_CONVERSION_FAILED)
         })
     }
-}
 
-fn validate_expected_beneficiary(
-    header_beneficiary: Address,
-    expected_beneficiary: Address,
-    block_number: u64,
-) -> Result<(), BlockExecutionError> {
-    if expected_beneficiary.is_zero() || header_beneficiary == expected_beneficiary {
-        return Ok(());
+    /// Current block timestamp as `u64`.
+    ///
+    /// Needed alongside [`Self::block_number_u64`] because Arc hardforks may activate
+    /// either by block or by timestamp (e.g. testnet Zero5/Zero6, all networks' Zero7+);
+    /// runtime hardfork gating must consult both dimensions via
+    /// [`arc_execution_config::hardforks::is_arc_fork_active`].
+    fn block_timestamp_u64(&self) -> Result<u64, BlockExecutionError> {
+        let block_timestamp = self.evm.block().timestamp();
+        block_timestamp.try_into().map_err(|err| {
+            tracing::error!(
+                error = %err,
+                block_timestamp = %block_timestamp,
+                "Failed to convert block timestamp to u64"
+            );
+            BlockExecutionError::msg(ERR_BLOCK_TIMESTAMP_CONVERSION_FAILED)
+        })
     }
-
-    tracing::warn!(
-        header_beneficiary = %header_beneficiary,
-        expected_beneficiary = %expected_beneficiary,
-        block_number = block_number,
-        "{}",
-        ERR_BENEFICIARY_MISMATCH
-    );
-    Err(BlockValidationError::msg(ERR_BENEFICIARY_MISMATCH).into())
 }
 
 fn validate_beneficiary_not_blocklisted<DB: Database>(
@@ -292,7 +290,9 @@ where
             );
         }
 
-        let base_fee_config = self.chain_spec.base_fee_config(block_number + 1);
+        let base_fee_config = self
+            .chain_spec
+            .base_fee_config(block_number.checked_add(1).expect("block number overflow"));
         let calc = base_fee_config.resolve_calc_params(fee_params.as_ref());
 
         let parent_block_number = block_number.saturating_sub(1);
@@ -359,42 +359,23 @@ where
         // Spurious Dragon hardfork is enabled
         self.evm.db_mut().set_state_clear_flag(true);
 
-        // For block voter to validate block beneficiary matches ProtocolConfig.rewardBeneficiary()
-        // Only validate after Zero5 hardfork when this requirement is active
+        // Zero5+ pre-execution checks: beneficiary blocklist, gas limit validation
         let block_number = self.block_number_u64()?;
+        let block_timestamp = self.block_timestamp_u64()?;
 
-        if self
-            .chain_spec
-            .is_fork_active_at_block(ArcHardfork::Zero5, block_number)
-        {
+        if is_arc_fork_active(
+            &self.chain_spec,
+            ArcHardfork::Zero5,
+            block_number,
+            block_timestamp,
+        ) {
             // EIP-2935: persist parent block hash in history storage contract.
             // Internally gates on Prague activation and is a no-op at block 0 (genesis).
             self.system_caller
                 .apply_blockhashes_contract_call(self.ctx.parent_hash, &mut self.evm)?;
 
-            let header_beneficiary = self.evm.block().beneficiary();
-            if let Ok(expected_beneficiary) = protocol_config::retrieve_reward_beneficiary(&mut self.evm)
-                .inspect_err(|error| {
-                    // Log and continue to avoid halting the chain (e.g. if ProtocolConfig is deprecated).
-                    tracing::warn!(
-                        error = %error,
-                        block_number = block_number,
-                        "Failed to retrieve reward beneficiary from ProtocolConfig, continuing without validation"
-                    );
-                })
-            {
-                validate_expected_beneficiary(
-                    header_beneficiary,
-                    expected_beneficiary,
-                    block_number,
-                )?;
-            }
-
-            validate_beneficiary_not_blocklisted(
-                self.evm.db_mut(),
-                header_beneficiary,
-                block_number,
-            )?;
+            let beneficiary = self.evm.block().beneficiary();
+            validate_beneficiary_not_blocklisted(self.evm.db_mut(), beneficiary, block_number)?;
 
             // ADR-0003: Stateful gas limit validation against ProtocolConfig (Zero5+)
             let block_gas_limit = self.evm.block().gas_limit();
@@ -429,7 +410,12 @@ where
 
         // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
         // must be no greater than the block's gasLimit.
-        let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
+        let block_available_gas = self
+            .evm
+            .block()
+            .gas_limit()
+            .checked_sub(self.gas_used)
+            .expect("gas_used must not exceed block gas_limit");
 
         if tx.tx().gas_limit() > block_available_gas {
             return Err(
@@ -467,7 +453,10 @@ where
         let gas_used = result.gas_used();
 
         // append gas used
-        self.gas_used += gas_used;
+        self.gas_used = self
+            .gas_used
+            .checked_add(gas_used)
+            .expect("cumulative gas overflow");
 
         // Cancun is always active for arc
         self.blob_gas_used = self.blob_gas_used.saturating_add(blob_gas_used);
@@ -495,6 +484,7 @@ where
         let requests = Requests::default();
 
         let block_number = self.block_number_u64()?;
+        let block_timestamp = self.block_timestamp_u64()?;
 
         // At the end of the block, call a system contract (precompile) to persist gas accounting
         // state: raw gas used, smoothed gas used, and the next block's base fee.
@@ -507,9 +497,12 @@ where
                 );
             })
             .ok();
-        let is_zero5 = self
-            .chain_spec
-            .is_fork_active_at_block(ArcHardfork::Zero5, block_number);
+        let is_zero5 = is_arc_fork_active(
+            &self.chain_spec,
+            ArcHardfork::Zero5,
+            block_number,
+            block_timestamp,
+        );
         let gas_values = if is_zero5 {
             // ADR-0004 implementation: compute gas values within local bounds
             self.compute_gas_values(block_number, fee_params)?
@@ -530,6 +523,9 @@ where
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(Box::new(e)))
             })?;
 
+        // BalanceIncrements is semantically imprecise (this is a storage write, not a balance
+        // change), but it's the least-wrong variant available in the upstream enum, and functionally
+        // equivalent to others.
         self.system_caller.on_state(
             StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements),
             &state,
@@ -574,7 +570,7 @@ mod tests {
     use alloy_primitives::map::HashMap;
     use alloy_primitives::B256 as AlloyB256;
     use alloy_primitives::KECCAK256_EMPTY;
-    use reth_chainspec::EthChainSpec;
+    use reth_chainspec::{EthChainSpec, ForkCondition};
     use reth_evm::ConfigureEvm;
     use reth_evm::EvmEnv;
 
@@ -655,47 +651,6 @@ mod tests {
             chain_spec.clone(),
             crate::evm::ArcEvmFactory::new(chain_spec),
         ))
-    }
-
-    /// Helper function to query the expected beneficiary from ProtocolConfig
-    fn query_expected_beneficiary(
-        chain_spec: alloc::sync::Arc<ArcChainSpec>,
-        db: &mut InMemoryDB,
-        block_number: u64,
-    ) -> Address {
-        let evm_config = create_evm_config(chain_spec.clone());
-
-        let mut temp_block_env = get_mock_block_env();
-        temp_block_env.number = U256::from(block_number);
-        let temp_cfg_env = CfgEnv::new()
-            .with_chain_id(chain_spec.chain_id())
-            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
-        let temp_evm_env = EvmEnv {
-            cfg_env: temp_cfg_env,
-            block_env: temp_block_env,
-        };
-        let mut temp_state = State::builder().with_database(db).build();
-        let mut temp_evm = evm_config.evm_with_env(&mut temp_state, temp_evm_env);
-
-        protocol_config::retrieve_reward_beneficiary(&mut temp_evm)
-            .expect("Should be able to query reward beneficiary")
-    }
-
-    /// Patch ProtocolConfig storage so rewardBeneficiary() returns 0x00.
-    fn set_beneficiary_to_zero_address(db: &mut InMemoryDB) {
-        // ProtocolConfig ERC-7201 base slot from the contract (see ProtocolConfig.sol).
-        const PROTOCOL_CONFIG_STORAGE_LOCATION_HEX: &str =
-            "668f09ce856848ead6cb1ddee963f15ef833cea8958030868f867aec84385200";
-        let base_slot = U256::from_str_radix(PROTOCOL_CONFIG_STORAGE_LOCATION_HEX, 16).unwrap();
-        // rewardBeneficiary is at base slot + 4.
-        let reward_beneficiary_slot = base_slot.saturating_add(U256::from(4));
-
-        db.insert_account_storage(
-            protocol_config::PROTOCOL_CONFIG_ADDRESS,
-            reward_beneficiary_slot,
-            StorageValue::from(0u64),
-        )
-        .expect("Insert storage");
     }
 
     fn mark_address_as_blocklisted(db: &mut InMemoryDB, beneficiary: Address) {
@@ -879,7 +834,7 @@ mod tests {
     #[test]
     fn test_zero4_invalid_alpha_stores_zero_next_base_fee() {
         let block_env = get_mock_block_env();
-        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero3, 0)]);
+        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero3, ForkCondition::Block(0))]);
 
         let mut db = InMemoryDB::default();
         insert_alloc_into_db(&mut db, chain_spec.genesis());
@@ -1063,148 +1018,6 @@ mod tests {
     }
 
     #[test]
-    fn test_beneficiary_validation_succeeds_when_matching() {
-        // Test that beneficiary validation passes when header beneficiary matches ProtocolConfig
-        let chain_spec = LOCAL_DEV.clone();
-
-        let mut db = InMemoryDB::default();
-        insert_alloc_into_db(&mut db, chain_spec.genesis());
-
-        let block_number = 10;
-
-        // Query the expected beneficiary from ProtocolConfig
-        let expected_beneficiary =
-            query_expected_beneficiary(chain_spec.clone(), &mut db, block_number);
-
-        // Create executor with correct beneficiary
-        let evm_config = create_evm_config(chain_spec.clone());
-
-        let mut block_env = get_mock_block_env();
-        block_env.number = U256::from(block_number);
-        block_env.beneficiary = expected_beneficiary;
-
-        let cfg_env = CfgEnv::new()
-            .with_chain_id(chain_spec.chain_id())
-            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
-        let evm_env = EvmEnv { cfg_env, block_env };
-
-        let mut state = State::builder().with_database(db).build();
-        let evm = evm_config.evm_with_env(&mut state, evm_env);
-
-        let ctx = get_mock_execution_ctx();
-
-        let mut executor = ArcBlockExecutor::new(
-            evm,
-            ctx,
-            chain_spec.as_ref(),
-            evm_config.inner.executor_factory.receipt_builder(),
-        );
-
-        // This should succeed because beneficiary matches
-        let result = executor.apply_pre_execution_changes();
-        assert!(
-            result.is_ok(),
-            "Beneficiary validation should succeed when beneficiary matches"
-        );
-    }
-
-    #[test]
-    fn test_beneficiary_validation_fails_when_mismatched() {
-        // Test that beneficiary validation fails when header beneficiary doesn't match ProtocolConfig
-        let chain_spec = LOCAL_DEV.clone();
-
-        let mut db = InMemoryDB::default();
-        insert_alloc_into_db(&mut db, chain_spec.genesis());
-
-        let evm_config = create_evm_config(chain_spec.clone());
-
-        // Use a wrong beneficiary address
-        let wrong_beneficiary = address!("0000000000000000000000000000000000000bad");
-
-        let mut block_env = get_mock_block_env();
-        block_env.number = U256::from(10);
-        block_env.beneficiary = wrong_beneficiary;
-
-        let cfg_env = CfgEnv::new()
-            .with_chain_id(chain_spec.chain_id())
-            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
-        let evm_env = EvmEnv { cfg_env, block_env };
-
-        let mut state = State::builder().with_database(db).build();
-        let evm = evm_config.evm_with_env(&mut state, evm_env);
-
-        let ctx = get_mock_execution_ctx();
-
-        let mut executor = ArcBlockExecutor::new(
-            evm,
-            ctx,
-            chain_spec.as_ref(),
-            evm_config.inner.executor_factory.receipt_builder(),
-        );
-
-        // This should fail because beneficiary doesn't match
-        let result = executor.apply_pre_execution_changes();
-        assert!(
-            result.is_err(),
-            "Beneficiary validation should fail when beneficiary doesn't match"
-        );
-
-        // Verify the error is returned as a validation error.
-        let err = result.unwrap_err();
-        match err {
-            BlockExecutionError::Validation(validation_err) => {
-                let err_msg = validation_err.to_string();
-                assert!(
-                    err_msg.contains(ERR_BENEFICIARY_MISMATCH),
-                    "Expected validation error containing '{}', got: {}",
-                    ERR_BENEFICIARY_MISMATCH,
-                    err_msg
-                );
-            }
-            other => panic!(
-                "Expected BlockExecutionError::Validation containing '{}', got {:?}",
-                ERR_BENEFICIARY_MISMATCH, other
-            ),
-        }
-    }
-
-    #[test]
-    fn test_validate_expected_beneficiary_allows_zero_expected() {
-        let header_beneficiary = address!("0000000000000000000000000000000000000bad");
-        let expected_beneficiary = Address::ZERO;
-
-        let result = validate_expected_beneficiary(header_beneficiary, expected_beneficiary, 10);
-        assert!(
-            result.is_ok(),
-            "Expected zero beneficiary should allow proposer-selected header beneficiary"
-        );
-    }
-
-    #[test]
-    fn test_validate_expected_beneficiary_rejects_mismatch() {
-        let header_beneficiary = address!("0000000000000000000000000000000000000bad");
-        let expected_beneficiary = address!("0000000000000000000000000000000000000bee");
-
-        let err = validate_expected_beneficiary(header_beneficiary, expected_beneficiary, 10)
-            .expect_err("Mismatched beneficiary should fail");
-        match err {
-            BlockExecutionError::Validation(validation_err) => {
-                let err_msg = validation_err.to_string();
-                assert!(
-                    err_msg.contains(ERR_BENEFICIARY_MISMATCH),
-                    "Expected validation error containing '{}', got: {}",
-                    ERR_BENEFICIARY_MISMATCH,
-                    err_msg
-                );
-            }
-            other => panic!(
-                "Expected BlockExecutionError::Validation containing '{}', got {:?}",
-                ERR_BENEFICIARY_MISMATCH, other
-            ),
-        }
-    }
-
-    #[test]
     fn test_validate_beneficiary_not_blocklisted_rejects_blocklisted_address() {
         let mut db = InMemoryDB::default();
         let blocklisted_beneficiary = address!("0000000000000000000000000000000000000bad");
@@ -1229,7 +1042,7 @@ mod tests {
     #[test]
     fn test_beneficiary_validation_skipped_before_zero5() {
         // Test that beneficiary validation is skipped for blocks before Zero5 hardfork
-        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero4, 0)]);
+        let chain_spec = localdev_with_hardforks(&[(ArcHardfork::Zero4, ForkCondition::Block(0))]);
 
         let mut db = InMemoryDB::default();
         insert_alloc_into_db(&mut db, chain_spec.genesis());
@@ -1269,120 +1082,14 @@ mod tests {
     }
 
     #[test]
-    fn test_beneficiary_validation_continues_when_protocol_config_unavailable() {
-        // Break ProtocolConfig so rewardBeneficiary() cannot be read
-        // Should log error and continue (defensive: avoid halting chain)
-        fn patch_protocol_config_to_invalid_impl(db: &mut InMemoryDB) {
-            use reth_ethereum::evm::revm::primitives::{StorageKey, StorageValue};
-
-            db.replace_account_storage(
-                protocol_config::PROTOCOL_CONFIG_ADDRESS,
-                HashMap::from_iter([(
-                    StorageKey::from_str_radix(
-                        "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
-                        16,
-                    )
-                    .unwrap(),
-                    StorageValue::from(0u64),
-                )]),
-            )
-            .expect("Replace storage");
-        }
-
-        let chain_spec = LOCAL_DEV.clone();
-
-        let mut db = InMemoryDB::default();
-        insert_alloc_into_db(&mut db, chain_spec.genesis());
-        patch_protocol_config_to_invalid_impl(&mut db);
-
-        let evm_config = create_evm_config(chain_spec.clone());
-
-        // Any beneficiary; should continue despite ProtocolConfig call failure
-        let mut block_env = get_mock_block_env();
-        block_env.number = U256::from(10);
-        block_env.beneficiary = address!("0000000000000000000000000000000000000bad");
-
-        let cfg_env = CfgEnv::new()
-            .with_chain_id(chain_spec.chain_id())
-            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
-        let evm_env = EvmEnv { cfg_env, block_env };
-
-        let mut state = State::builder().with_database(db).build();
-        let evm = evm_config.evm_with_env(&mut state, evm_env);
-        let ctx = get_mock_execution_ctx();
-        let mut executor = ArcBlockExecutor::new(
-            evm,
-            ctx,
-            chain_spec.as_ref(),
-            evm_config.inner.executor_factory.receipt_builder(),
-        );
-
-        let result = executor.apply_pre_execution_changes();
-        assert!(
-            result.is_ok(),
-            "Should continue when ProtocolConfig call fails (defensive: avoid chain halt)"
-        );
-    }
-
-    #[test]
-    fn test_beneficiary_validation_skipped_when_zero_address() {
-        // Test that beneficiary validation is skipped when ProtocolConfig returns 0x00
-        // This allows for future proposer-set addresses
-        let chain_spec = LOCAL_DEV.clone();
-
-        let mut db = InMemoryDB::default();
-        insert_alloc_into_db(&mut db, chain_spec.genesis());
-        set_beneficiary_to_zero_address(&mut db);
-
-        let evm_config = create_evm_config(chain_spec.clone());
-
-        // Use any beneficiary - should pass because ProtocolConfig returns 0x00
-        let any_beneficiary = address!("0000000000000000000000000000000000000bad");
-
-        let mut block_env = get_mock_block_env();
-        block_env.number = U256::from(10);
-        block_env.beneficiary = any_beneficiary;
-
-        let cfg_env = CfgEnv::new()
-            .with_chain_id(chain_spec.chain_id())
-            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
-        let evm_env = EvmEnv { cfg_env, block_env };
-
-        let mut state = State::builder().with_database(db).build();
-        let evm = evm_config.evm_with_env(&mut state, evm_env);
-
-        let ctx = get_mock_execution_ctx();
-
-        let mut executor = ArcBlockExecutor::new(
-            evm,
-            ctx,
-            chain_spec.as_ref(),
-            evm_config.inner.executor_factory.receipt_builder(),
-        );
-
-        // This should succeed because validation is skipped for 0x00
-        let result = executor.apply_pre_execution_changes();
-        assert!(
-            result.is_ok(),
-            "Beneficiary validation should be skipped when ProtocolConfig returns 0x00"
-        );
-    }
-
-    #[test]
     fn test_beneficiary_validation_fails_when_proposer_beneficiary_is_blocklisted() {
         let chain_spec = LOCAL_DEV.clone();
 
         let mut db = InMemoryDB::default();
         insert_alloc_into_db(&mut db, chain_spec.genesis());
-        set_beneficiary_to_zero_address(&mut db);
 
         let blocklisted_beneficiary = address!("0000000000000000000000000000000000000bad");
         mark_address_as_blocklisted(&mut db, blocklisted_beneficiary);
-        let expected_beneficiary = query_expected_beneficiary(chain_spec.clone(), &mut db, 10);
-        assert!(
-            expected_beneficiary.is_zero(),
-            "ProtocolConfig.rewardBeneficiary() should be patched to zero for proposer-selected path"
-        );
         let storage_slot = compute_is_blocklisted_storage_slot(blocklisted_beneficiary).into();
         let blocklist_status = <InMemoryDB as revm::Database>::storage(
             &mut db,
@@ -1401,64 +1108,6 @@ mod tests {
         let mut block_env = get_mock_block_env();
         block_env.number = U256::from(10);
         block_env.beneficiary = blocklisted_beneficiary;
-
-        let cfg_env = CfgEnv::new()
-            .with_chain_id(chain_spec.chain_id())
-            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
-        let evm_env = EvmEnv { cfg_env, block_env };
-
-        let mut state = State::builder().with_database(db).build();
-        let evm = evm_config.evm_with_env(&mut state, evm_env);
-        let ctx = get_mock_execution_ctx();
-        let mut executor = ArcBlockExecutor::new(
-            evm,
-            ctx,
-            chain_spec.as_ref(),
-            evm_config.inner.executor_factory.receipt_builder(),
-        );
-
-        let result = executor.apply_pre_execution_changes();
-        match result {
-            Err(BlockExecutionError::Validation(err)) => {
-                let err_msg = err.to_string();
-                assert!(
-                    err_msg.contains(ERR_BLOCKED_ADDRESS),
-                    "Expected validation error containing '{}', got: {}",
-                    ERR_BLOCKED_ADDRESS,
-                    err_msg
-                );
-            }
-            other => panic!(
-                "Expected BlockExecutionError::Validation containing '{}', got: {:?}",
-                ERR_BLOCKED_ADDRESS, other
-            ),
-        }
-    }
-
-    #[test]
-    fn test_beneficiary_validation_fails_when_matching_but_blocklisted() {
-        // Beneficiary matches ProtocolConfig.rewardBeneficiary() (non-zero) but is blocklisted.
-        // The blocklist check is unconditional — even a correctly-set beneficiary must not be blocklisted.
-        let chain_spec = LOCAL_DEV.clone();
-
-        let mut db = InMemoryDB::default();
-        insert_alloc_into_db(&mut db, chain_spec.genesis());
-
-        let block_number = 10;
-        let expected_beneficiary =
-            query_expected_beneficiary(chain_spec.clone(), &mut db, block_number);
-        assert!(
-            !expected_beneficiary.is_zero(),
-            "LOCAL_DEV rewardBeneficiary should be non-zero for this test"
-        );
-
-        mark_address_as_blocklisted(&mut db, expected_beneficiary);
-
-        let evm_config = create_evm_config(chain_spec.clone());
-
-        let mut block_env = get_mock_block_env();
-        block_env.number = U256::from(block_number);
-        block_env.beneficiary = expected_beneficiary;
 
         let cfg_env = CfgEnv::new()
             .with_chain_id(chain_spec.chain_id())
@@ -1546,7 +1195,6 @@ mod tests {
 
         let mut base_db = InMemoryDB::default();
         insert_alloc_into_db(&mut base_db, chain_spec.genesis());
-        set_beneficiary_to_zero_address(&mut base_db);
 
         let db = BlocklistReadFailingDb::new(base_db);
         let evm_config = create_evm_config(chain_spec.clone());

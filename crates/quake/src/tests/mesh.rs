@@ -72,7 +72,7 @@ use crate::testnet::Testnet;
 /// How the test categorizes a node based on the manifest topology.
 /// This determines what mesh tier is acceptable for that node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NodeCategory {
+pub(crate) enum NodeCategory {
     /// Circle-operated validator (direct mesh expected).
     /// Must be `FullyConnected` in strict mode.
     CircleValidator,
@@ -102,7 +102,7 @@ impl fmt::Display for NodeCategory {
 }
 
 /// Categorize a node based on manifest data.
-pub(super) fn categorize_node(
+pub(crate) fn categorize_node(
     node_name: &str,
     manifest_node: &Node,
     testnet: &Testnet,
@@ -139,7 +139,7 @@ pub(super) fn categorize_node(
 /// When external validators are present, circle validators are allowed to be
 /// `MultiHop` because indirect paths to external validators (behind sentries)
 /// are expected and don't indicate a mesh problem.
-pub(super) fn check_strict(
+pub(crate) fn check_strict(
     category: NodeCategory,
     tier: MeshTier,
     has_external_validators: bool,
@@ -152,13 +152,11 @@ pub(super) fn check_strict(
             )),
             _ => Err(format!("expected fully-connected, got {tier}")),
         },
-        NodeCategory::ExternalValidator => {
-            if tier == MeshTier::NotConnected {
-                Err(format!("expected reachable (multi-hop ok), got {tier}"))
-            } else {
-                Ok(format!("{tier}"))
-            }
-        }
+        NodeCategory::ExternalValidator => match tier {
+            MeshTier::NotConnected => Err(format!("expected reachable (multi-hop ok), got {tier}")),
+            MeshTier::MultiHop => Ok(format!("{tier} (ok: behind sentry)")),
+            _ => Ok(format!("{tier}")),
+        },
         NodeCategory::ConsensusParticipant => {
             if tier == MeshTier::NotConnected {
                 Err(format!("expected connected, got {tier}"))
@@ -169,6 +167,8 @@ pub(super) fn check_strict(
         NodeCategory::Excluded => Ok(format!("{tier}")),
     }
 }
+
+const MAX_DUPLICATE_PCT: f64 = 98.0;
 
 /// Run mesh analysis and optionally enforce strict tier expectations.
 ///
@@ -200,6 +200,7 @@ pub(super) async fn run_mesh_checks(
             show_mesh: true,
             show_peers: false,
             show_peers_full: false,
+            show_duplicates: true,
         };
         println!();
         print!("{}", format_report(&analysis, &options));
@@ -269,6 +270,31 @@ pub(super) async fn run_mesh_checks(
             )),
         }
     }
+
+    for node in &nodes_data {
+        let mc = &node.message_counts;
+        if mc.unfiltered == 0 {
+            continue;
+        }
+        let pct = mc.duplicate_pct();
+        let passed = pct <= MAX_DUPLICATE_PCT;
+        let check_name = if label.is_empty() {
+            format!("dup:{}", node.moniker)
+        } else {
+            format!("{label}:dup:{}", node.moniker)
+        };
+        let message = format!(
+            "{pct:.1}% duplicates ({} / {} unfiltered, threshold {MAX_DUPLICATE_PCT:.1}%)",
+            mc.duplicates(),
+            mc.unfiltered,
+        );
+        if passed {
+            checks.push(CheckResult::success(check_name, message));
+        } else {
+            checks.push(CheckResult::failure(check_name, message));
+        }
+    }
+
     Ok(checks)
 }
 
@@ -282,6 +308,7 @@ pub(super) async fn run_mesh_checks(
 ///   - External validators (behind sentries): must not be isolated
 ///   - Sentries and full nodes (consensus enabled): must not be isolated
 ///   - Nodes with consensus disabled or follow mode: skipped
+///   - Duplicate rate must stay under 98%
 #[quake_test(group = "mesh", name = "health")]
 fn health_test<'a>(
     testnet: &'a Testnet,

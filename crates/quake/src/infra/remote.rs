@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+use crate::clean::{MALACHITE_DATA_SUBDIRS, RETH_DATA_SUBDIRS};
 use crate::infra::export::SSH_KEY_FILENAME;
 use crate::infra::terraform::Terraform;
 use crate::infra::{ssm, BuildProfile, InfraData, InfraProvider};
@@ -215,8 +216,24 @@ impl RemoteInfra {
             .map(|node| self.node_private_ip(node).map(String::as_str))
             .collect::<Result<Vec<_>>>()?;
 
-        let pssh_cmd = format!("./pssh.sh \"{cmd}\" {}", node_ips.join(" "));
+        let pssh_cmd = format!("./pssh.sh '{cmd}' {}", node_ips.join(" "));
         self.ssh_cc(&pssh_cmd, false)
+            .wrap_err_with(|| format!("Failed to run '{cmd}' on {nodes:?}"))
+    }
+
+    /// Run the same command on the given nodes in parallel by calling pssh.sh in CC and return its stdout.
+    fn pssh_single_cmd_with_output(&self, nodes: &[&NodeName], cmd: &str) -> Result<String> {
+        if nodes.is_empty() {
+            return Ok("".to_string());
+        }
+
+        let node_ips = nodes
+            .iter()
+            .map(|node| self.node_private_ip(node).map(String::as_str))
+            .collect::<Result<Vec<_>>>()?;
+
+        let pssh_cmd = format!("./pssh.sh '{cmd}' {}", node_ips.join(" "));
+        self.ssh_cc_with_output(&pssh_cmd)
             .wrap_err_with(|| format!("Failed to run '{cmd}' on {nodes:?}"))
     }
 
@@ -455,6 +472,207 @@ impl RemoteInfra {
         info!("✅ Provisioning for remote infrastructure completed");
         Ok(())
     }
+
+    /// Clean Reth data on all remote nodes.
+    pub fn clean_reth_data(&self) {
+        let paths = RETH_DATA_SUBDIRS
+            .map(|s| format!("~/data/reth/{s}"))
+            .join(" ");
+        let cmd = format!("sudo rm -rf {paths}");
+        info!("Removing Reth data on remote nodes...");
+        match self.pssh_single_cmd_with_output(&self.infra_data.node_names(), cmd.as_str()) {
+            Ok(output) => {
+                info!(%output, "✅ Reth data removed on remote nodes.");
+            }
+            Err(err) => {
+                warn!("⚠️ Failed to remove Reth data on remote nodes: {err:#}");
+            }
+        }
+    }
+
+    /// Clean Malachite data on all remote nodes.
+    pub fn clean_malachite_data(&self) {
+        let paths = MALACHITE_DATA_SUBDIRS
+            .map(|s| format!("~/data/malachite/{s}"))
+            .join(" ");
+        let cmd = format!("sudo rm -rf {paths}");
+        info!("Removing Malachite data on remote nodes...");
+        match self.pssh_single_cmd_with_output(&self.infra_data.node_names(), cmd.as_str()) {
+            Ok(output) => {
+                info!(%output, "✅ Malachite data removed on remote nodes.");
+            }
+            Err(err) => {
+                warn!("⚠️ Failed to remove Malachite data on remote nodes: {err:#}");
+            }
+        }
+    }
+
+    fn abs_local_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root_dir.join(path)
+        }
+    }
+
+    /// Copy a file from the CC home directory to a local path.
+    fn scp_from_cc(&self, remote_source: &str, local_dest: &Path) -> Result<()> {
+        shell::scp_from(
+            &self.instance_id(CC_INSTANCE)?,
+            USER_NAME,
+            &self.private_key_path(),
+            &self.root_dir,
+            remote_source,
+            local_dest,
+        )
+    }
+
+    /// Download Prometheus metrics from CC via the query_range REST API.
+    ///
+    /// Runs `download-metrics.sh` on CC, then SCPs the resulting archive to `local_dest`.
+    /// `metric_names` filters which metrics are fetched; empty means all.
+    /// `from`/`to` are Unix timestamps; when omitted the script defaults to epoch→now.
+    pub fn download_metrics(
+        &self,
+        metric_names: &[String],
+        from: Option<i64>,
+        to: Option<i64>,
+        step: Option<&str>,
+        local_dest: &Path,
+    ) -> Result<()> {
+        let mut cmd = String::from("./download-metrics.sh");
+        if let Some(start) = from {
+            cmd.push_str(&format!(" -s {start}"));
+        }
+        if let Some(end) = to {
+            cmd.push_str(&format!(" -e {end}"));
+        }
+        if let Some(s) = step {
+            cmd.push_str(&format!(" -t {s}"));
+        }
+        for name in metric_names {
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+            {
+                return Err(color_eyre::eyre::eyre!(
+                    "Invalid metric name '{name}': must match [a-zA-Z0-9_:]+"
+                ));
+            }
+            cmd.push_str(&format!(" {name}"));
+        }
+
+        info!("📊 Querying Prometheus metrics on CC...");
+        let output = self
+            .ssh_cc_with_output(&cmd)
+            .wrap_err("Failed to collect metrics on CC")?;
+        let last_line = output.lines().last().unwrap_or_default().trim();
+        let result: serde_json::Value = serde_json::from_str(last_line)
+            .wrap_err("Failed to parse download-metrics.sh output")?;
+        let archive = result["archive"]
+            .as_str()
+            .ok_or_else(|| eyre!("missing 'archive' field in download-metrics.sh output"))?;
+        if archive.is_empty() {
+            let errors = result["errors"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_default();
+            return Err(eyre!("download-metrics.sh failed: {errors}"));
+        }
+        if let Some(errors) = result["errors"].as_array() {
+            for err in errors {
+                warn!("metric query failed: {}", err.as_str().unwrap_or("unknown"));
+            }
+        }
+
+        let local_dest_abs = self.abs_local_path(local_dest);
+        info!("⬇️  Downloading metrics archive...");
+        self.scp_from_cc(archive, &local_dest_abs)
+            .wrap_err("Failed to download metrics archive")?;
+
+        if let Err(err) = self.ssh_cc_with_output(&format!("rm ~/{archive}")) {
+            warn!("⚠️ Failed to clean up temp archive on CC: {err:#}");
+        }
+
+        info!(path=%local_dest_abs.display(), "✅ Metrics downloaded");
+        Ok(())
+    }
+
+    /// Download node databases from one or more nodes via CC.
+    ///
+    /// Runs `download-db.sh` on CC, which archives each node's data in parallel and
+    /// bundles them into a single archive. Empty `nodes` slice means all nodes.
+    pub fn download_node_db(
+        &self,
+        nodes: &[NodeName],
+        execution_only: bool,
+        consensus_only: bool,
+        local_dest: &Path,
+    ) -> Result<()> {
+        let target_nodes: Vec<NodeName> = if nodes.is_empty() {
+            self.infra_data
+                .node_names()
+                .into_iter()
+                .map(|s| s.to_owned())
+                .collect()
+        } else {
+            nodes.to_vec()
+        };
+
+        let node_ips: Vec<String> = target_nodes
+            .iter()
+            .map(|n| self.node_private_ip(n).cloned())
+            .collect::<Result<_>>()?;
+
+        let mut cmd = String::from("./download-db.sh");
+        if execution_only {
+            cmd.push_str(" -x");
+        } else if consensus_only {
+            cmd.push_str(" -c");
+        }
+        for ip in &node_ips {
+            cmd.push_str(&format!(" {ip}"));
+        }
+
+        info!(
+            "📦 Archiving node data from {} node(s)...",
+            target_nodes.len()
+        );
+        let output = self
+            .ssh_cc_with_output(&cmd)
+            .wrap_err("Failed to archive node data")?;
+        let last_line = output.lines().last().unwrap_or_default().trim();
+        let result: serde_json::Value =
+            serde_json::from_str(last_line).wrap_err("Failed to parse download-db.sh output")?;
+        let archive = result["archive"]
+            .as_str()
+            .ok_or_else(|| eyre!("missing 'archive' field in download-db.sh output"))?;
+        if let Some(errors) = result["errors"].as_array() {
+            for err in errors {
+                warn!(
+                    "node db download error: {}",
+                    err.as_str().unwrap_or("unknown")
+                );
+            }
+        }
+
+        let local_dest_abs = self.abs_local_path(local_dest);
+        info!("⬇️  Downloading db archive...");
+        self.scp_from_cc(archive, &local_dest_abs)
+            .wrap_err("Failed to download db archive")?;
+
+        if let Err(err) = self.ssh_cc_with_output(&format!("rm ~/{archive}")) {
+            warn!("⚠️ Failed to clean up temp archive on CC: {err:#}");
+        }
+
+        info!(path=%local_dest_abs.display(), "✅ Database downloaded");
+        Ok(())
+    }
 }
 
 impl InfraProvider for RemoteInfra {
@@ -539,5 +757,29 @@ impl InfraProvider for RemoteInfra {
 
     fn restart(&self, containers: &[ContainerName]) -> Result<()> {
         self.exec_on_containers("docker compose restart", containers)
+    }
+
+    /// Start monitoring services on the CC server.
+    fn start_monitoring(&self) -> Result<()> {
+        self.ssh_cc("docker compose -f ~/monitoring/compose.yaml up -d", false)
+            .wrap_err("Failed to start monitoring services on CC")
+    }
+
+    /// Stop monitoring services on the CC server.
+    fn stop_monitoring(&self) -> Result<()> {
+        self.ssh_cc(
+            "docker compose -f ~/monitoring/compose.yaml down --volumes --timeout 5",
+            false,
+        )
+        .wrap_err("Failed to stop monitoring services on CC")
+    }
+
+    /// Remove monitoring data directories on the CC server.
+    fn clean_monitoring_data(&self) -> Result<()> {
+        self.ssh_cc(
+                "sudo rm -rf ~/monitoring/data-prometheus ~/monitoring/data-grafana ~/monitoring/blockscout/db ~/monitoring/blockscout/logs ~/monitoring/blockscout/dets",
+                false,
+            )
+            .wrap_err("Failed to remove monitoring data on CC")
     }
 }

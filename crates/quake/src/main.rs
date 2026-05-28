@@ -14,8 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::unwrap_used
+)]
 
+use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::{Args, Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use color_eyre::eyre::{self, bail, Context, Result};
@@ -26,20 +31,23 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use perturb::Perturbation;
-use testnet::{Testnet, TestnetError};
-
 use crate::infra::export;
 use crate::infra::{BuildProfile, INFRA_DATA_FILENAME};
 use crate::manifest::{generate_manifests, EngineApiConnection};
 use crate::perturb::{PERTURB_MAX_TIME_OFF, PERTURB_MIN_TIME_OFF};
 use crate::valset::ValidatorPowerUpdate;
 
+use perturb::Perturbation;
+use testnet::{Testnet, TestnetError};
+
 mod build;
+mod clean;
+mod cli_version;
 mod genesis;
 mod info;
 mod infra;
 mod latency;
+mod load;
 mod manifest;
 mod mcp;
 mod mesh;
@@ -48,6 +56,7 @@ mod node;
 mod nodekey;
 mod nodes;
 mod perturb;
+mod report;
 mod rpc;
 mod setup;
 mod shell;
@@ -56,6 +65,7 @@ mod tests;
 mod util;
 mod valset;
 mod wait;
+mod web;
 
 const DEFAULT_NUM_EXTRA_PREFUNDED_ACCOUNTS: usize = 100;
 
@@ -168,23 +178,40 @@ enum Commands {
         #[command(subcommand)]
         command: RemoteSubcommand,
     },
+    /// Manage monitoring services (Prometheus, Grafana, Blockscout)
+    Monitoring {
+        #[command(subcommand)]
+        command: MonitoringSubcommand,
+    },
     /// Send transaction load to the testnet (backpressure mode: waits for each
     /// response and only advances the nonce on success).
     /// Use --mix to blend transaction types (e.g., --mix transfer=70,erc20=30).
-    #[command(verbatim_doc_comment)]
+    ///
+    /// If `--targets` is omitted, all manifest nodes are used. Each target may
+    /// be an exact node name or a manifest node group such as `ALL_VALIDATORS`.
+    #[command(
+        verbatim_doc_comment,
+        after_long_help = "Examples:\n  quake load --rate 200 --time 60\n  quake load --targets validator1,ALL_VALIDATORS --rate 200 --time 60\n"
+    )]
     Load {
-        /// Names of the nodes to send transactions to (all nodes if not specified)
-        target_nodes: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        targets: Option<Vec<String>>,
         #[command(flatten)]
         args: SpammerArgs,
     },
     /// Send transaction load to the testnet (fire-and-forget mode: pushes
     /// transactions into a buffer and sends without waiting for responses).
     /// Use --mix to blend transaction types (e.g., --mix transfer=70,erc20=30).
-    #[command(verbatim_doc_comment)]
+    ///
+    /// If `--targets` is omitted, all manifest nodes are used. Each target may
+    /// be an exact node name or a manifest node group such as `ALL_VALIDATORS`.
+    #[command(
+        verbatim_doc_comment,
+        after_long_help = "Examples:\n  quake spam --rate 200 --time 60\n  quake spam --targets validator1,ALL_VALIDATORS --rate 200 --time 60\n"
+    )]
     Spam {
-        /// Names of the nodes to send transactions to (all nodes if not specified)
-        target_nodes: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        targets: Option<Vec<String>>,
         #[command(flatten)]
         args: SpammerArgs,
     },
@@ -210,7 +237,7 @@ enum Commands {
     /// IMPORTANT: Quote patterns to prevent shell expansion, e.g., 'n*:*peer*'
     ///
     /// Examples:
-    ///   quake test                       - Run all tests
+    ///   quake test                       - Run all tests (except excluded groups: validation, health, validator_set, perf)
     ///   quake test probe                 - Run all tests in probe group
     ///   quake test 'n*'                  - Run tests in groups starting with n
     ///   quake test 'n*:*peer*'           - Run tests containing 'peer' in groups starting with n
@@ -266,6 +293,71 @@ enum Commands {
         #[arg(short = 'c', long, default_value_t = 1)]
         count: usize,
     },
+    /// Generate a network testing report (mesh, health, perf, sanity, sync).
+    ///
+    /// Collects metrics from a running testnet, optionally runs sanity phases
+    /// and sync-speed tests, then writes a structured markdown report.
+    ///
+    /// Parameters (via `--set key=value`):
+    ///
+    ///   Key                Default              Description
+    ///   ─────────────────  ───────────────────  ─────────────────────────────────────
+    ///   warmup_s           30                   Seconds before first Prometheus scrape
+    ///   duration_s         60                   Observation window / load duration
+    ///   load_rate          50                   TPS during observation (0 = no load)
+    ///   load_targets       RPC_NODES            Node names and/or [node_groups] selectors (default group)
+    ///   load_mix           transfer=100         Tx type mix
+    ///   block_time_p50_ms  550                  Max p50 block time threshold for validators
+    ///   block_time_p99_ms  1000                 Max p99 block time threshold for validators
+    ///   sanity             true                 Run sanity phases
+    ///   sync_speed         true                 Run sync speed test (destructive)
+    ///   arc_nodes          ARC_NODES group      Sanity target nodes (names and/or [node_groups])
+    ///   snapshot_provider  full-circle-5        Snapshot source node
+    ///   reference          validator-blue       Reference node for tip height
+    ///   sync_nodes         full-quicknode-1     Nodes to sync-test
+    ///   sync_min_bps       7.0                  Min avg blocks/sec to pass
+    ///   sync_timeout_s     180                  Max sync measurement duration
+    ///   sync_downtime_s    120                  Seconds to keep node down
+    ///   store_nodes        (pruned nodes)       Nodes for storage size lookup
+    #[command(verbatim_doc_comment)]
+    Report {
+        /// Output file path for the markdown report
+        #[arg(short = 'o', long, default_value = "/tmp/quake-report.md")]
+        output: PathBuf,
+        /// Pass parameters as key=value pairs (e.g. --set sanity=false)
+        #[clap(long = "set", value_parser = parse_key_value)]
+        params: Vec<(String, String)>,
+    },
+    /// Start a web server to visualize the testnet network topology (local mode only)
+    Web {
+        /// Host/IP address to bind the web server to
+        #[clap(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port for the web server
+        #[clap(long, default_value = "7777")]
+        port: u16,
+        /// Frontend topology poll interval in milliseconds
+        ///
+        /// A WebSocket subscriber polls new block headers to update block
+        /// heights in real-time as blocks arrive. When the chain stalls (no new
+        /// blocks being produced), the WS stream goes silent, and no data
+        /// flows. For that we have the EL peer refresh poller.
+        ///
+        /// CL data (/network-state and /status) is fetched inline during each
+        /// topology refresh request.
+        #[clap(long, default_value = "1000")]
+        refresh_ms: u64,
+        /// EL peer refresh poller interval in milliseconds
+        ///
+        /// Polls admin_peers to update EL peer connection data (who is
+        /// connected, trusted, inbound, static). This runs independently of
+        /// block production, so peer data stays fresh even during chain stalls.
+        #[clap(long, default_value = "1000")]
+        el_refresh_ms: u64,
+        /// Docker container status poller interval in milliseconds
+        #[clap(long, default_value = "1000")]
+        container_refresh_ms: u64,
+    },
     /// Start an MCP (Model Context Protocol) server for AI-assisted testnet management.
     ///
     /// By default uses stdio transport (for Claude Code, Cursor, etc.).
@@ -291,6 +383,12 @@ struct SetupArgs {
     /// Number of extra pre-funded accounts to generate in the genesis file (for sending transaction load)
     #[clap(short = 'e', long, default_value_t = DEFAULT_NUM_EXTRA_PREFUNDED_ACCOUNTS)]
     num_extra_accounts: usize,
+    /// Initial balance for each prefunded account in whole token units (overrides manifest value, default 1_000_000)
+    #[clap(long, value_parser = clap::value_parser!(u64).range(1..))]
+    extra_account_balance: Option<u64>,
+    /// ProtocolConfig blockGasLimit and genesis header gas limit (overrides manifest value, default 30_000_000)
+    #[clap(long, value_parser = clap::value_parser!(u64).range(1..))]
+    block_gas_limit: Option<u64>,
 }
 
 #[derive(Args)]
@@ -307,6 +405,9 @@ struct StartArgs {
     /// Create the testnet in remote infrastructure and start it immediately (no confirmation asked)
     #[clap(long, default_value = "false")]
     remote: bool,
+    /// Whether to start monitoring services (Prometheus, Grafana, cAdvisor, Blockscout)
+    #[clap(short = 'm', long, num_args = 0..=1, default_value_t = true, default_missing_value = "true")]
+    monitoring: bool,
     #[command(flatten)]
     setup_args: SetupArgs,
     #[command(flatten)]
@@ -315,9 +416,10 @@ struct StartArgs {
     infra_args: InfraArgs,
 }
 
-/// EC2 instance size overrides for remote infrastructure.
+/// EC2 instance type and optional root EBS size for remote infrastructure.
 ///
-/// See README "Instance sizing" for details.
+/// See README "Instance sizing" for details. Disk flags apply only when using
+/// `quake remote create` or `quake start --remote` (they are ignored for local testnets).
 #[derive(Args, Debug, Clone)]
 pub(crate) struct InfraArgs {
     /// EC2 instance type for nodes [default: t3.medium].
@@ -342,13 +444,58 @@ pub(crate) struct InfraArgs {
     ///   t3.2xlarge — heavy Blockscout indexing or many nodes (32 GiB RAM)
     #[clap(long, verbatim_doc_comment)]
     cc_size: Option<String>,
+    /// Root EBS volume size for nodes (GiB). Omit to use the AMI default.
+    ///
+    /// Long runs need more than the default root volume when debug logs fill the disk;
+    /// pair with `--node-size` for RAM headroom. When set, must be at least **8** (typical
+    /// lower bound vs AMI snapshot size; AWS may still require a larger minimum for a given AMI).
+    #[clap(long, value_name = "GIB", value_parser = clap::value_parser!(u32).range(crate::manifest::MIN_DISK_GB as i64..))]
+    node_disk_gb: Option<u32>,
+    /// Root EBS volume size for the Control Center (GiB). Omit to use the AMI default.
+    ///
+    /// When set, must be at least **8** (see `--node-disk-gb`).
+    #[clap(long, value_name = "GIB", value_parser = clap::value_parser!(u32).range(crate::manifest::MIN_DISK_GB as i64..))]
+    cc_disk_gb: Option<u32>,
+    /// Root EBS volume type for nodes (e.g. `gp3`, `io2`). Omit to use the Terraform default (`gp3`).
+    ///
+    /// Pair with `--node-volume-iops` for `gp3`/`io1`/`io2`. Validated against AWS-supported types.
+    #[clap(long, value_name = "TYPE")]
+    node_volume_type: Option<String>,
+    /// Provisioned IOPS for the node root EBS volume.
+    ///
+    /// Only meaningful for `gp3`, `io1`, and `io2` volumes. AWS will reject finer-grained
+    /// violations (per-type maxima, volume-size ratio) at apply time.
+    #[clap(long, value_name = "IOPS", value_parser = clap::value_parser!(u32).range(100..=256_000))]
+    node_volume_iops: Option<u32>,
 }
 
 #[derive(Args)]
 struct CleanArgs {
-    /// Also stop monitoring services and remove their data
+    /// Remove all data, including the testnet directory and monitoring services
     #[clap(short = 'a', long, default_value = "false")]
+    #[clap(conflicts_with_all = ["data", "execution_data", "consensus_data"])]
     all: bool,
+    /// Remove only execution and consensus layer data, preserving configuration
+    #[clap(short = 'd', long, default_value = "false")]
+    #[clap(conflicts_with_all = ["execution_data", "consensus_data"])]
+    data: bool,
+    /// Remove only execution layer data, preserving configuration
+    #[clap(short = 'x', long, default_value = "false")]
+    execution_data: bool,
+    /// Remove only consensus layer data, preserving configuration
+    #[clap(short = 'c', long, default_value = "false")]
+    consensus_data: bool,
+}
+
+impl CleanArgs {
+    fn scope(&self) -> clean::Scope {
+        clean::Scope::from_cli_flags(
+            self.all,
+            self.data,
+            self.execution_data,
+            self.consensus_data,
+        )
+    }
 }
 
 #[derive(Debug, Subcommand, PartialEq)]
@@ -418,6 +565,9 @@ pub(crate) enum InfoSubcommand {
         /// Show full peer detail including peer types and scores
         #[clap(long, default_value = "false")]
         peers_full: bool,
+        /// Show duplicate message rates
+        #[clap(long, default_value = "false")]
+        duplicates: bool,
     },
     /// Show performance metrics: block latency and throughput
     Perf {
@@ -427,6 +577,15 @@ pub(crate) enum InfoSubcommand {
         /// Show only throughput metrics (txs/block, block size, gas/block)
         #[clap(long, default_value = "false")]
         throughput_only: bool,
+        /// Use two scrapes and show histogram deltas for the observation window only
+        #[clap(long, default_value = "false")]
+        interval: bool,
+        /// Seconds to wait before the first scrape (interval mode only)
+        #[clap(long, default_value = "30")]
+        warmup_seconds: u64,
+        /// Seconds between first and second scrape (interval mode only)
+        #[clap(long, default_value = "60")]
+        observation_seconds: u64,
     },
     /// Show Malachite CL store.db table statistics (record counts, height ranges)
     Store {
@@ -498,23 +657,16 @@ pub(crate) enum RemoteSubcommand {
         /// Command to run on the node or CC server; if not provided, will open an interactive shell
         command: Vec<String>,
     },
-    /// Send transaction load to the nodes by running `quake load` from the Control Center
-    /// (backpressure mode).
+    /// [Deprecated: use `quake load` directly — it now works for both local and remote testnets]
     ///
-    /// It accepts the same arguments as the `load` command.
-    ///
-    /// Examples:
-    ///   Local network:   `./quake load -- validator1 validator2 -r 200 -t 60 --pools`
-    ///   Remote network:  `./quake remote load -- validator1 validator2 -r 200 -t 60 --pools`
+    /// Send transaction load to the nodes by running `quake load` from the Control
+    /// Center (backpressure mode).
     #[command(verbatim_doc_comment)]
     Load { args: Vec<String> },
+    /// [Deprecated: use `quake spam` directly — it now works for both local and remote testnets]
+    ///
     /// Send transaction load to the nodes by running `quake spam` from the Control Center
     /// (fire-and-forget mode).
-    ///
-    /// It accepts the same arguments as the `spam` command.
-    /// Example:
-    ///   Local network:   `./quake spam -- validator1 validator2 -r 200 -t 60 --pools`
-    ///   Remote network:  `./quake remote spam -- validator1 validator2 -r 200 -t 60 --pools`
     #[command(verbatim_doc_comment)]
     Spam { args: Vec<String> },
     /// Export a JSON file with everything needed for another user to access this remote testnet
@@ -529,6 +681,103 @@ pub(crate) enum RemoteSubcommand {
     Import {
         /// Path to the JSON file created by `quake remote export`
         path: PathBuf,
+    },
+    /// Download metrics or database data from remote infrastructure
+    Download {
+        #[clap(subcommand)]
+        command: DownloadSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MonitoringSubcommand {
+    /// Start monitoring services
+    Start,
+    /// Stop monitoring services
+    Stop,
+    /// Stop monitoring services and clean monitoring data
+    Clean,
+}
+
+/// A datetime accepted by `--from`/`--to` flags, converted to a Unix timestamp.
+///
+/// Accepted formats (timezone-naive values are treated as UTC):
+///   `2024-01-15T10:30:00Z`, `2024-01-15T10:30:00+05:00` (RFC 3339)
+///   `2024-01-15T10:30:00`, `2024-01-15 10:30:00` (naive datetime, UTC assumed)
+///   `2024-01-15` (date only, start of day UTC)
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CliTimestamp(i64);
+
+impl CliTimestamp {
+    pub(crate) fn unix_secs(self) -> i64 {
+        self.0
+    }
+}
+
+impl std::str::FromStr for CliTimestamp {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Ok(CliTimestamp(dt.timestamp()));
+        }
+        for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+            if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+                return Ok(CliTimestamp(Utc.from_utc_datetime(&ndt).timestamp()));
+            }
+        }
+        if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            let ndt = nd.and_hms_opt(0, 0, 0).expect("valid HMS");
+            return Ok(CliTimestamp(Utc.from_utc_datetime(&ndt).timestamp()));
+        }
+        Err(format!(
+            "invalid datetime '{s}'; expected RFC 3339 or one of: \
+             YYYY-MM-DDTHH:MM:SS, YYYY-MM-DD HH:MM:SS, YYYY-MM-DD"
+        ))
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum DownloadSubcommand {
+    /// Download Prometheus metrics from the Control Center.
+    ///
+    /// SSHes to CC and queries the Prometheus query_range API — no local SSM tunnel required.
+    /// Downloads all metrics by default; pass metric names after -- to filter.
+    /// Without --from/--to, start defaults to headStats.minTime (Prometheus head block only, ~2h max).
+    Metrics {
+        /// Start of the time range (default: headStats.minTime from Prometheus, covering the current head block; e.g. 2024-01-15T10:30:00Z or 2024-01-15)
+        #[clap(long)]
+        from: Option<CliTimestamp>,
+        /// End of the time range (default: now; e.g. 2024-01-15T10:30:00Z or 2024-01-15)
+        #[clap(long)]
+        to: Option<CliTimestamp>,
+        /// Query resolution — interval between data points (e.g. 30s, 1m, 5m).
+        /// Defaults to ceil((end-start)/10000) to stay within Prometheus' 11,000-point limit.
+        #[clap(long)]
+        step: Option<String>,
+        /// Metric names to download (all metrics if not specified)
+        #[clap(last = true)]
+        metric_names: Vec<String>,
+        /// Output file path (default: ./quake-metrics-<timestamp>.tar.gz)
+        #[clap(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
+    /// Download node databases from one or more remote validators.
+    ///
+    /// Defaults to all nodes in the manifest. Pass node names after -- to restrict.
+    Db {
+        /// Node names to download from (default: all nodes in manifest)
+        #[clap(last = true)]
+        nodes: Vec<String>,
+        /// Download only execution layer (Reth) data
+        #[clap(long, conflicts_with = "consensus_only")]
+        execution_only: bool,
+        /// Download only consensus layer (Malachite) data
+        #[clap(long)]
+        consensus_only: bool,
+        /// Output file path (default: ./quake-db-<timestamp>.tar.gz)
+        #[clap(short = 'o', long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -545,22 +794,20 @@ pub(crate) enum SSMSubcommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+
     let cli = Cli::parse();
 
-    // Initialize tracing
     let level = cli.verbosity.tracing_level_filter();
     let filter = EnvFilter::builder()
         .with_default_directive(level.into())
         .from_env()?
         .add_directive("hyper_util::client=info".parse()?)
         .add_directive("arc_node_consensus_cli::new=info".parse()?);
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_ansi(std::io::stdout().is_terminal())
+    tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .context("Failed to set tracing subscriber")?;
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
 
     tracing::info!(
         version = arc_version::GIT_VERSION,
@@ -583,6 +830,7 @@ async fn main() -> Result<()> {
             );
         }
         export::import_shared_testnet(path)?;
+        return Ok(());
     }
 
     // Force the use of remote mode on certain sub-commands
@@ -635,7 +883,13 @@ async fn main() -> Result<()> {
             let rpc = args.rpc || rpc_manifest;
             testnet
                 .with_seed(cli.seed)
-                .setup(args.force, rpc, args.num_extra_accounts)
+                .setup(
+                    args.force,
+                    rpc,
+                    args.num_extra_accounts,
+                    args.extra_account_balance,
+                    args.block_gas_limit,
+                )
                 .await?;
         }
         Commands::Build { args } => {
@@ -653,17 +907,19 @@ async fn main() -> Result<()> {
                 rpc_manifest,
             )
             .await?;
-            testnet.start(start_args.nodes_or_containers).await?
+            testnet
+                .start(start_args.nodes_or_containers, start_args.monitoring)
+                .await?
         }
         Commands::Stop {
             nodes_or_containers,
         } => testnet.stop(nodes_or_containers).await?,
-        Commands::Clean { clean_args } => testnet.clean(clean_args.all).await?,
+        Commands::Clean { clean_args } => testnet.clean(clean_args.scope()).await?,
         Commands::Restart {
             clean_args,
             start_args,
         } => {
-            testnet.clean(clean_args.all).await?;
+            testnet.clean(clean_args.scope()).await?;
             pre_start(
                 &mut testnet,
                 &start_args,
@@ -672,7 +928,9 @@ async fn main() -> Result<()> {
                 rpc_manifest,
             )
             .await?;
-            testnet.start(start_args.nodes_or_containers).await?;
+            testnet
+                .start(start_args.nodes_or_containers, start_args.monitoring)
+                .await?;
         }
         Commands::Perturb {
             action,
@@ -687,21 +945,28 @@ async fn main() -> Result<()> {
         Commands::Logs { names, follow } => testnet.logs(names, follow).await?,
         Commands::Info { command } => testnet.info(command).await?,
         Commands::Remote { command } => testnet.remote(command).await?,
-        Commands::Load { target_nodes, args } => {
-            if testnet.is_remote() {
-                bail!("Remote infrastructure does not support the `load` command. Please run `remote load` instead.");
-            }
-            let config = args.to_config(cli.verbosity.is_silent(), false);
-            config.validate()?;
-            testnet.load(target_nodes, &config).await?;
+        Commands::Monitoring { command } => testnet.monitoring(command).await?,
+        Commands::Load { targets, args } => {
+            let target_nodes = targets.unwrap_or_default();
+            load::run(
+                &testnet,
+                target_nodes,
+                &args,
+                false,
+                cli.verbosity.is_silent(),
+            )
+            .await?;
         }
-        Commands::Spam { target_nodes, args } => {
-            if testnet.is_remote() {
-                bail!("Remote infrastructure does not support the `spam` command. Please run `remote spam` instead.");
-            }
-            let config = args.to_config(cli.verbosity.is_silent(), true);
-            config.validate()?;
-            testnet.load(target_nodes, &config).await?;
+        Commands::Spam { targets, args } => {
+            let target_nodes = targets.unwrap_or_default();
+            load::run(
+                &testnet,
+                target_nodes,
+                &args,
+                true,
+                cli.verbosity.is_silent(),
+            )
+            .await?;
         }
         Commands::ValSet { updates } => testnet.valset_update(updates).await?,
         Commands::Test {
@@ -714,6 +979,10 @@ async fn main() -> Result<()> {
             testnet
                 .run_tests(&spec, dry_run, rpc_timeout, &params)
                 .await?
+        }
+        Commands::Report { output, params } => {
+            let params = crate::tests::TestParams::from(params);
+            report::run_report(&testnet, &params, &output).await?
         }
         Commands::Wait { command } => match command {
             WaitSubcommand::Height {
@@ -743,6 +1012,26 @@ async fn main() -> Result<()> {
                     .await?
             }
         },
+        Commands::Web {
+            host,
+            port,
+            refresh_ms,
+            el_refresh_ms,
+            container_refresh_ms,
+        } => {
+            if !testnet.is_local() {
+                bail!("Web server is currently only supported in local mode.");
+            }
+            crate::web::run_server(
+                testnet,
+                host,
+                port,
+                refresh_ms,
+                el_refresh_ms,
+                container_refresh_ms,
+            )
+            .await?;
+        }
         Commands::Mcp { http, port } => {
             crate::mcp::run_server(testnet, http, port).await?;
         }
@@ -776,14 +1065,64 @@ async fn pre_start(
     seed: Option<u64>,
     rpc_manifest: bool,
 ) -> Result<()> {
+    // Warn if sizing fields are set in the manifest but we're running locally — they are ignored.
+    if !args.remote {
+        let m = &testnet.manifest;
+        if m.node_size.is_some()
+            || m.cc_size.is_some()
+            || m.node_disk_gb.is_some()
+            || m.cc_disk_gb.is_some()
+            || m.node_volume_type.is_some()
+            || m.node_volume_iops.is_some()
+        {
+            warn!(
+                "Manifest sets remote-only infrastructure fields (node_size/cc_size/\
+                 node_disk_gb/cc_disk_gb/node_volume_type/node_volume_iops), but these \
+                 are only applied when creating remote infrastructure (--remote). They \
+                 are ignored in local mode."
+            );
+        }
+    }
+
     // Create remote infrastructure, if requested and not already created
     if args.remote && !testnet.dir.join(INFRA_DATA_FILENAME).exists() {
         info!("Creating remote infrastructure...");
+        let node_size = args
+            .infra_args
+            .node_size
+            .as_deref()
+            .or(testnet.manifest.node_size.as_deref());
+        let cc_size = args
+            .infra_args
+            .cc_size
+            .as_deref()
+            .or(testnet.manifest.cc_size.as_deref());
+        let node_disk_gb = args
+            .infra_args
+            .node_disk_gb
+            .or(testnet.manifest.node_disk_gb);
+        let cc_disk_gb = args.infra_args.cc_disk_gb.or(testnet.manifest.cc_disk_gb);
+        let node_volume_type = args
+            .infra_args
+            .node_volume_type
+            .as_deref()
+            .or(testnet.manifest.node_volume_type.as_deref());
+        let node_volume_iops = args
+            .infra_args
+            .node_volume_iops
+            .or(testnet.manifest.node_volume_iops);
+        // CLI overrides can mix freely with manifest fields, so re-validate
+        // the merged pair before reaching Terraform.
+        crate::manifest::validate_node_volume(node_volume_type, node_volume_iops)?;
         testnet.remote_infra()?.terraform.create(
             false,
             true,
-            args.infra_args.node_size.as_deref(),
-            args.infra_args.cc_size.as_deref(),
+            node_size,
+            cc_size,
+            node_disk_gb,
+            cc_disk_gb,
+            node_volume_type,
+            node_volume_iops,
         )?;
 
         // Reload testnet with the recently created infra files
@@ -800,7 +1139,13 @@ async fn pre_start(
         warn!("Testnet not set up: {err}; Running setup...");
         testnet
             .with_seed(seed)
-            .setup(setup_args.force, rpc, setup_args.num_extra_accounts)
+            .setup(
+                setup_args.force,
+                rpc,
+                setup_args.num_extra_accounts,
+                setup_args.extra_account_balance,
+                setup_args.block_gas_limit,
+            )
             .await?;
     }
 
@@ -813,4 +1158,51 @@ async fn pre_start(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::error::ErrorKind;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_command_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_parses_load_targets() {
+        let cli = Cli::try_parse_from([
+            "quake",
+            "load",
+            "--rate",
+            "42",
+            "--targets",
+            "validator1,ALL_VALIDATORS",
+        ])
+        .expect("parsing load with --targets");
+
+        match cli.command {
+            Commands::Load { targets, args } => {
+                assert_eq!(
+                    targets,
+                    Some(vec!["validator1".to_string(), "ALL_VALIDATORS".to_string(),])
+                );
+                assert_eq!(args.rate, 42);
+            }
+            _ => panic!("expected load command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_positional_load_targets() {
+        let err = match Cli::try_parse_from(["quake", "load", "validator1"]) {
+            Ok(_) => panic!("positional load targets must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("validator1"));
+    }
 }

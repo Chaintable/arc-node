@@ -18,9 +18,17 @@ import fs from 'fs'
 import { z } from 'zod'
 import { parseEther, parseGwei, toHex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
-import { createBuilderContext, buildGenesis, GenesisConfig, schemaGenesisConfig } from '../../scripts/genesis'
+import {
+  createBuilderContext,
+  buildGenesis,
+  GenesisConfig,
+  schemaGenesisConfig,
+  localdevFeeRecipient,
+} from '../../scripts/genesis'
 import { bigintReplacer } from '../../scripts/genesis/types'
 import { LocalDevAccountCreator } from '../../scripts/genesis/AccountCreator'
+
+const UINT64_MAX = (1n << 64n) - 1n
 
 // localBuilderOptionsSchema defines the options to customize the localdev genesis.
 export const localBuilderOptionsSchema = LocalDevAccountCreator.optionsSchema.and(
@@ -29,6 +37,8 @@ export const localBuilderOptionsSchema = LocalDevAccountCreator.optionsSchema.an
     outputGenesisConfig: z.string().optional(),
     validatorNames: z.array(z.string()).min(1).optional(),
     hardforks: schemaGenesisConfig.shape.hardforks,
+    extraAccountBalance: z.bigint().optional(),
+    blockGasLimit: z.bigint().optional(),
   }),
 )
 
@@ -37,7 +47,7 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
     network: 'localdev',
     chainId: 1337,
   })
-  const { outputControllersConfig, outputGenesisConfig, validatorNames, hardforks, ...accountOptions } = options
+  const { outputControllersConfig, outputGenesisConfig, validatorNames, hardforks, extraAccountBalance, blockGasLimit, ...accountOptions } = options
   const accountCreator = new LocalDevAccountCreator(accountOptions)
 
   // Default account for hardhat environment.
@@ -73,6 +83,7 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
 
   const config: GenesisConfig = {
     timestamp: 1763620028n,
+    coinbase: localdevFeeRecipient,
     hardforks: {
       zero3Block: 0,
       ...hardforks,
@@ -83,7 +94,7 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
       .concat([one.address])
       .concat(controllers.map((x) => x.address))
       .concat(accountCreator.extraPrefundAccounts().map((x) => x.address))
-      .map((address) => ({ address: address, balance: parseEther('1000000') })),
+      .map((address) => ({ address: address, balance: extraAccountBalance !== undefined ? parseEther(extraAccountBalance.toString()) : parseEther('1000000') })),
 
     NativeFiatToken: {
       proxy: { admin: proxyAdmin.address },
@@ -103,14 +114,13 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
       owner: admin.address,
       controller: admin.address,
       pauser: admin.address,
-      beneficiary: proxyAdmin.address,
       feeParams: {
         alpha: 20n, // 20%
         kRate: 200n, // 2%
         inverseElasticityMultiplier: 5000n, // 50%
         minBaseFee: 1n,
         maxBaseFee: parseGwei('1000'),
-        blockGasLimit: 30_000_000n,
+        blockGasLimit: blockGasLimit ?? 30_000_000n,
       },
       consensusParams: {
         timeoutProposeMs: 3000n,
@@ -135,12 +145,13 @@ const build = async (options: z.infer<typeof localBuilderOptionsSchema>) => {
       PermissionedValidatorManager: {
         proxy: { admin: proxyAdmin.address },
         owner: admin.address,
+        pauser: admin.address,
         validatorRegisterers: [admin.address, operator.address],
-        controllers: controllers.map((account) => account.address),
       },
-      validators: validators.map((x) => ({
+      validators: validators.map((x, i) => ({
         publicKey: x.publicKey,
         votingPower: x.votingPower,
+        controllers: [{ address: controllers[i].address, votingPowerLimit: UINT64_MAX }],
       })),
     },
     GasGuzzler: true,
