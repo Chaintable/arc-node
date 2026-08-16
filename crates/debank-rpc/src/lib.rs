@@ -16,6 +16,7 @@
 
 pub mod debank_trace;
 pub mod erc20_handle;
+mod event_inspector;
 pub mod multi_call;
 pub mod pre;
 pub mod state_diff_db;

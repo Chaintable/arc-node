@@ -33,7 +33,7 @@ OFF=https://rpc.testnet.arc.network
 | genesis | block 0 | section 11.1 |
 | 空块 | tx count == 0 | section 11.2 |
 | 标准交易块 | 含 ≥3 笔 EIP-1559 tx | section 3-7 主测 |
-| EIP-2930 tx 块 | tx 含 access list | 3.2 类型覆盖 |
+| EIP-2930 tx 块 | canonical tx 含 access list | 3.2 类型覆盖；BlockFile 当前不承载 access list |
 | Legacy tx 块 | tx type=0x0 | 3.2 类型覆盖 |
 | EIP-7702 tx 块（可选） | tx type=0x4，链上若有 | 3.2 类型覆盖 |
 | Revert tx 块 | receipt status=0x0，revert 前无 EVM log | 6.1, 6.6 |
@@ -58,13 +58,13 @@ OFF=https://rpc.testnet.arc.network
 | 7. storage_contracts | 4 | – | – | – | pending |
 | 8. state_diff (RLP) | 14 | – | – | – | pending |
 | 9. header | 18 | – | – | – | pending |
-| 10. validation_hash | 4 | – | – | – | pending |
+| 10. validation / determinism | 7 | – | – | – | pending |
 | 11. 特殊区块 | 11 | – | – | – | pending |
 | 12. background-tracer 兼容 | 4 | – | – | – | pending |
 | 13. 批量回归 | 5 | – | – | – | pending |
 | 14. pre_traceMany | 8 | – | – | – | pending |
 | 15. eth_multiCall | 11 | – | – | – | pending |
-| **合计** | **141** | – | – | – | pending |
+| **合计** | **144** | – | – | – | pending |
 
 ### Trace 类型覆盖
 
@@ -84,7 +84,7 @@ OFF=https://rpc.testnet.arc.network
 4. **USDC 作 native**：`eth_getBalance` 返回 18-dec native USDC。`block_file.txs[*].value` 单位是 native wei（18-dec），消费方按 USDC 解读。
 5. **`Header` 字段集**：Arc 用 alloy-consensus 1.7.3，无 `block_access_list_hash` / `slot_number`（Tempo 2.0.4 才有），section 9 不要列这两项。
 6. **AA tx 不存在**：`DebankTransaction.calls` / `fee_token` / `fee_payer_signature` 在 JSON 中始终为 `null`（保留 schema 兼容 background-tracer Go 消费方，D3）。section 3 不测 AA 路径。
-7. **NCA precompile emit log（D20）**：Arc 的 `NATIVE_COIN_AUTHORITY` (`0x1800...0000`) 在每笔 native USDC 操作时直接 emit log 到 receipt，绕过 EVM call frame。inspector 抓不到，需要从 `ExecutionResult::Success.logs[N..]` 或 receipt 补回——与 Tempo handler-level fee log 同机制。所以 events 公式与 Tempo 完全一致：`events + sum(revert_tx_receipt_logs) == total_receipt_logs`（revert tx 的 receipt 只剩 NCA log，inspector 抓的 revert 前 logs 进 error_events 但 receipt 中被回滚）。
+7. **Arc 直接写 journal 的 event**：Zero5+ native value transfer 和 SELFDESTRUCT 会绕过 Solidity `LOG*` opcode，NCA/custom precompile 还可能没有可见 call-trace node。`trace_debankBlock` 使用本地 event inspector 保存完整 `Log.address/topics/data`、frame 和 emission order；成功 event 必须逐项等于 `ExecutionResult.logs` 和 receipt logs。禁止再用 `exec_logs[N..]`、按内容匹配或统一挂到 root 的 fallback。EIP-7708 event emitter 固定为 `0xfffffffffffffffffffffffffffffffffffffffe`。
 8. **Arc base fee 写在 parent extraData**：与 RPC 输出无关，不在 debankBlock 中暴露。
 9. **5 个自定义 precompile `0x1800...0000-0004`**：调用它们的 trace 显示 to_addr = precompile 地址；per-trace `self_storage_change=false`（与 Tempo TIP-20 同因——precompile 不走 SSTORE opcode），block 级 `storage_contracts` 不受影响。section 7.3-7.4 验证。
 
@@ -125,7 +125,7 @@ OFF=https://rpc.testnet.arc.network
 |---|---|---|---|---|
 | 3.1.1 | id | string | receipt.transactionHash | pending |
 | 3.1.2 | from_addr | string(address) | receipt.from | pending |
-| 3.1.3 | to_addr | string(address) | tx.to | pending |
+| 3.1.3 | to_addr | string(address) | CALL 用 receipt.to；CREATE 用 receipt.contractAddress（成功和失败都不能写零地址） | pending |
 | 3.1.4 | gas_limit | number | tx.gas | pending |
 | 3.1.5 | gas_price | number | receipt.effectiveGasPrice | pending |
 | 3.1.6 | gas_used | number | receipt.gasUsed | pending |
@@ -136,16 +136,16 @@ OFF=https://rpc.testnet.arc.network
 | 3.1.11 | nonce | number | tx.nonce | pending |
 | 3.1.12 | idx | number | receipt.transactionIndex, 从 0 递增 | pending |
 | 3.1.13 | value | string(hex U256) | tx.value | pending |
-| 3.1.14 | access_list | array 或 null | tx.accessList (EIP-2930/1559) | pending |
+| 3.1.14 | access_list | null 或字段缺失 | 当前基础 BlockFile schema 不承载 EIP-2930/1559 access list；精确 warmup 另列 TODO | pending |
 
 ### 3.2 tx 类型覆盖
 
 | # | 测试项 | 验证内容 | 状态 |
 |---|---|---|---|
 | 3.2.1 | Legacy tx (type=0x0) | gas_price>0, max_fee_per_gas=gas_price, max_priority_fee_per_gas=0 | pending |
-| 3.2.2 | EIP-2930 tx (type=0x1) | access_list 非空 | pending（链上若有） |
+| 3.2.2 | EIP-2930 tx (type=0x1) | gas/status/input 等基础字段正确；记录 access list 未承载的已知限制 | pending（链上若有） |
 | 3.2.3 | EIP-1559 tx (type=0x2) | max_fee_per_gas>0, max_priority_fee_per_gas≥0 | pending |
-| 3.2.4 | EIP-7702 tx (type=0x4) | 若链上存在，验证 access_list / authorizationList | pending（链上若有） |
+| 3.2.4 | EIP-7702 tx (type=0x4) | 若链上存在，基础字段正确；记录 access list / authorizationList 未承载的已知限制 | pending（链上若有） |
 | 3.2.5 | 成功 tx | status=true | pending |
 | 3.2.6 | Revert tx | status=false | pending |
 | 3.2.7 | txs 数量 | 与 eth_getBlockByNumber.transactions 数量一致 | pending |
@@ -196,7 +196,8 @@ OFF=https://rpc.testnet.arc.network
 | 4.2.3 | staticcall 类型 | type="call", call_type="staticcall" | pending |
 | 4.2.4 | create 类型 | type="create", call_type="", to_addr=新地址 | pending |
 | 4.2.5 | 深层嵌套 | trace_address 至少 ≥3 层 | pending |
-| 4.2.6 | storage_change 传播 | 子 trace 有 SSTORE → 父 storage_change=true | pending |
+| 4.2.6 | storage_change 传播 | 子 frame 成功执行 SSTORE → 父 storage_change=true；即使祖先随后 revert 也保留执行信号 | pending |
+| 4.2.7 | CREATE2 类型 | 高层 type="create"、call_type=""；CREATE2 不使用非标准 type="create2" | pending |
 
 ### 4.3 ID 计算 & 唯一性
 
@@ -226,7 +227,7 @@ OFF=https://rpc.testnet.arc.network
 | 5.1.3 | selector | string(hex, topic[0]) | receipt.logs[].topics[0] | pending |
 | 5.1.4 | topics | array[string] | receipt.logs[].topics[1:] | pending |
 | 5.1.5 | data | string(hex) | receipt.logs[].data | pending |
-| 5.1.6 | parent_trace_id | string | 必须指向同区块内真实 trace id；event 的 parent trace.to_addr == event.contract_id | pending |
+| 5.1.6 | parent_trace_id | string | 必须指向实际产生 event 的可见 trace；EIP-7708 emitter 与执行地址不同，不能用 to_addr 推导 | pending |
 | 5.1.7 | pos_in_parent_trace | number | 同 parent 下 positions 无重复且按序 | pending |
 | 5.1.8 | idx | number | 区块内全局 log index，从 0 递增 | pending |
 
@@ -234,9 +235,9 @@ OFF=https://rpc.testnet.arc.network
 
 | # | 测试项 | 验证内容 | 状态 |
 |---|---|---|---|
-| 5.2.1 | `events + sum(revert_tx.receipt.logs.length) == total_receipt_logs` | Tempo 公式（D20 修正 6.6 表述）：成功 tx 的 events 含 NCA log；revert tx 的 receipt 只有 NCA log，inspector 抓的 revert 前 EVM logs 进 error_events 但 receipt 中被回滚 | **PASS** (97==97 on 0x2813738; 101/101 on 100-block sample) |
-| 5.2.2 | 无重复 idx | events + error_events 排序后 unique == 总数 | pending |
-| 5.2.3 | idx 连续 | 排序后等于 `[0, 1, ..., N-1]` | pending |
+| 5.2.1 | success events 等于 receipt logs | 按 block/tx emission order 逐项比较 address/topics/data，数量与内容都相同 | pending |
+| 5.2.2 | success event idx 唯一 | events 的 idx 无重复；error_events 不参与，因为协议规定其 idx=0 | pending |
+| 5.2.3 | success event idx 连续 | events 的 idx 等于 `[0, 1, ..., N-1]`；所有 error_events.idx=0 | pending |
 | 5.2.4 | 多 tx 跨 tx 连续 | tx0 idx=[0..a], tx1 idx=[a+1..b]，无间隔无重叠 | pending |
 
 ---
@@ -250,7 +251,7 @@ OFF=https://rpc.testnet.arc.network
 | 6.3 | error_traces 字段完整 | 与 traces[0] 同 18 个字段 | pending |
 | 6.4 | error_events 字段完整 | 与 events[0] 同 8 个字段 | pending |
 | 6.5 | traces + error_traces = trace_transaction 总数 | per-tx 验证 | pending |
-| 6.6 | events + sum(revert_tx.receipt.logs) = receipt logs 总数 | per-block 验证（Tempo 同公式，含 D20 NCA log 补回） | **PASS** (100/100 sample) |
+| 6.6 | success events = receipt logs | per-block 逐项验证；error_events 是 reverted frame 的执行记录，不属于 receipt | pending |
 | 6.7 | error 字段非空 | error_traces 中 error 字段 == "Reverted" 或类似非空字符串 | pending |
 | 6.8 | revert tx with EVM events 行为 | revert 前 emit 的 EVM events → 全部出现在 error_events（inspector 捕获）。receipt 中这些 log 被回滚不存在。Arc：`error_events == inspector_captured_events`（无 fee log 修正） | pending |
 | 6.9 | 内部 revert（try/catch） | 成功 tx 中失败的子调用 traces 进 error_traces，其余进 traces；与 reth-x 行为一致 | pending |
@@ -355,14 +356,17 @@ OFF=https://rpc.testnet.arc.network
 
 ---
 
-## 10. validation_hash
+## 10. validation_hash 与确定性
 
 | # | 测试项 | 验证 | 状态 |
 |---|---|---|---|
 | 10.1 | 类型 | jq `type == "number"` | pending |
 | 10.2 | 非零 | ≠ 0 | pending |
-| 10.3 | 算法 | SHA1(所有 id 拼接) 取末 6 hex chars 转十进制 — 与代码对照 | pending |
+| 10.3 | 算法 | 对每个 id 求 SHA1 并按整数求和，取十进制和的末 6 位 — 与代码对照 | pending |
 | 10.4 | 幂等 | 同 block 调两次返回相同 validation_hash | pending |
+| 10.5 | BlockFile 确定性 | 同 block 重放两次，将 `process_start_timestamp` 归一化后逐字段相同 | pending |
+| 10.6 | StateDiff RLP 确定性 | 同 block 重放两次，`state_diff` 原始 bytes 完全相同 | pending |
+| 10.7 | 集合排序 | `storage_contracts`、account/code/storage diff 外层及每个 storage slots 内层均按协议字段升序 | pending |
 
 ---
 
@@ -374,9 +378,9 @@ OFF=https://rpc.testnet.arc.network
 | 11.2 | 空区块 | 任一 tx 数为 0 的块：txs=[], traces=[], events=[], state_diff 仅含 base fee 相关 storage（若 SYSTEM_ACCOUNTING 触发） | pending |
 | 11.3 | Base fee 计算块 | 检查相邻 5 块的 `baseFeePerGas` 变化平滑（EWMA） | pending |
 | 11.4 | 多 tx 区块 | 检查 txs[].idx 严格递增 [0,1,2,...] | pending |
-| 11.5 | CREATE 区块 | traces 含 type="create"; state_diff.new_codes ≥1 | pending |
+| 11.5 | CREATE 区块 | root trace type="create"；tx.to_addr 等于 receipt.contractAddress；state_diff.new_codes ≥1；成功/失败 CREATE 都覆盖 | pending |
 | 11.6 | 自定义 precompile 调用块 | trace 5 个 `0x1800...` precompile 之一被调用的块：traces 含 to_addr in {NCA, NCC, SYSACCT, CALLFROM, PQ}；输出 result 非空 | pending |
-| 11.7 | USDC native 转账块 | EOA→EOA native USDC 转账：traces 顶层 type="call" value > 0；events 含统一 Transfer log（contract_id = `0x3600...0000`） | pending |
+| 11.7 | USDC native 转账块 | EOA→EOA native USDC 转账：traces 顶层 type="call" value > 0；events 含统一 Transfer log（contract_id = `0xfffffffffffffffffffffffffffffffffffffffe`） | pending |
 | 11.8 | USDC ERC-20 转账块 | 调用 `0x3600...0000.transfer(...)`：traces 含 to_addr=USDC 合约；events 含 Transfer log；两种接口产生的 events 等价 | pending |
 | 11.9 | 不存在的区块 | `trace_debankBlock("0xffffffff")` → JSON-RPC error，message 含 "not found" | pending |
 | 11.10 | 最新区块 | `trace_debankBlock("latest")` → 当前链头，height 与 eth_blockNumber 一致 | pending |
@@ -403,9 +407,9 @@ OFF=https://rpc.testnet.arc.network
 |---|---|---|---|
 | 13.1 | tx 数量一致 | 200 blocks | pending |
 | 13.2 | block hash 一致 | 200 blocks | pending |
-| 13.3 | event idx 全局递增无重复 | 200 blocks | pending |
+| 13.3 | event idx 语义 | success events 按 block-global receipt order 从 0 连续递增；所有 error_events.idx=0 | pending |
 | 13.4 | trace 数量一致（per-tx vs trace_transaction） | 200 blocks, 估 ~500 txs | pending |
-| 13.5 | events + sum(revert_tx_receipt_logs) == total_receipt_logs | 200 blocks | **PASS** (100/100 sample after D20 fix) |
+| 13.5 | success events 的 address/topics/data 按顺序逐项等于所有 receipt logs；error_events 单独验证 frame/position | 200 blocks | pending |
 
 ---
 
@@ -482,8 +486,9 @@ OFF=https://rpc.testnet.arc.network
 | `eth_multiCall` not found | EL `--http.api` 含 `eth`（默认）即可 |
 | 老块查 null | mdbx archive 同步状态：`eth_syncing` |
 | 大块性能慢 | 单块 > 5s：检查 `parallel_requests` / inspector 配置 |
-| events 与 receipt.logs 数量不一致 | Arc 应严格 events+error_events == receipt.logs，若不等则代码侧异常 |
-| validation_hash 跨次调用不一致 | 算法或 trace 顺序不确定，必须排查 |
+| success events 与 receipt.logs 不一致 | 检查 event inspector 的 journal/callback 去重、hidden precompile frame 和 emitter address；禁止按数量补尾 |
+| validation_hash 相同但响应不同 | validation_hash 不覆盖 storage_contracts/state_diff；归一化 process_start_timestamp 后逐字段比较，并单独比较 RLP bytes |
+| validation_hash 跨次调用不一致 | trace/event 顺序或 ID 不确定，必须排查 |
 
 ---
 

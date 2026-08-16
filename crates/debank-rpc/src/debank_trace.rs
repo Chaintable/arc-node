@@ -9,19 +9,21 @@
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{
-    hex, keccak256, Address, BlockHash, BlockNumber, Bytes, B256 as H256, U256,
+    hex, keccak256, Address, BlockHash, BlockNumber, Bytes, Log, B256 as H256, U256,
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
 use reth_revm::db::{AccountState, Cache};
 use revm::DatabaseRef;
 use revm_inspectors::tracing::{
-    types::{CallKind, CallLog, CallTraceNode, TraceMemberOrder},
+    types::{CallKind, CallTraceNode},
     CallTraceArena,
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as Sha1Digest, Sha1};
 use std::str::FromStr;
+
+use crate::event_inspector::{CapturedEvents, CapturedMember};
 
 // ---------------------------------------------------------------------------
 // State diff types (RLP-encoded for S3 storage)
@@ -338,19 +340,7 @@ pub(crate) fn fmt_error_msg(res: revm::interpreter::InstructionResult) -> Option
 impl From<&CallTraceNode> for DebankTrace {
     fn from(call_trace: &CallTraceNode) -> Self {
         let trace = &call_trace.trace;
-        let call_create_type = match trace.kind {
-            CallKind::Call
-            | CallKind::StaticCall
-            | CallKind::CallCode
-            | CallKind::DelegateCall
-            | CallKind::AuthCall => "call".to_string(),
-            CallKind::Create => "create".to_string(),
-            CallKind::Create2 => "create2".to_string(),
-        };
-        let mut call_type = String::new();
-        if call_create_type == "call" {
-            call_type = trace.kind.to_string().to_lowercase();
-        }
+        let (call_create_type, call_type) = debank_call_types(trace.kind);
         let error = trace.status.and_then(fmt_error_msg);
         let mut debank_trace = Self {
             from_addr: trace.caller,
@@ -360,8 +350,8 @@ impl From<&CallTraceNode> for DebankTrace {
             value: trace.value,
             gas_used: trace.gas_used,
             output: trace.output.clone(),
-            call_create_type,
-            call_type,
+            call_create_type: call_create_type.to_string(),
+            call_type: call_type.to_string(),
             subtraces: call_trace.children.len(),
             error: error.unwrap_or_default(),
             ..Default::default()
@@ -377,26 +367,34 @@ impl From<&CallTraceNode> for DebankTrace {
     }
 }
 
-impl From<&CallLog> for DebankEvent {
-    fn from(log: &CallLog) -> Self {
+fn debank_call_types(kind: CallKind) -> (&'static str, &'static str) {
+    match kind {
+        CallKind::Call => ("call", "call"),
+        CallKind::StaticCall => ("call", "staticcall"),
+        CallKind::CallCode => ("call", "callcode"),
+        CallKind::DelegateCall => ("call", "delegatecall"),
+        CallKind::AuthCall => ("call", "authcall"),
+        CallKind::Create | CallKind::Create2 => ("create", ""),
+    }
+}
+
+impl From<&Log> for DebankEvent {
+    fn from(log: &Log) -> Self {
         let selector = log
-            .raw_log
             .topics()
             .first()
             .map(|h| h.to_string())
             .unwrap_or_default();
-        let topics = if log.raw_log.topics().len() > 1 {
-            log.raw_log.topics()[1..]
-                .iter()
-                .map(|h| h.to_string())
-                .collect()
+        let topics = if log.topics().len() > 1 {
+            log.topics()[1..].iter().map(|h| h.to_string()).collect()
         } else {
             vec![]
         };
         Self {
+            contract_id: log.address,
             selector,
             topics,
-            data: log.raw_log.data.clone(),
+            data: log.data.data.clone(),
             ..Default::default()
         }
     }
@@ -411,12 +409,13 @@ impl From<&CallLog> for DebankEvent {
 #[allow(clippy::large_enum_variant)]
 enum DebankTraceOrLog {
     Trace(DebankTraceNode),
-    Log(DebankEvent),
+    Log { event: DebankEvent, success: bool },
 }
 
 struct DebankTraceNode {
     trace: DebankTrace,
     children: Vec<DebankTraceOrLog>,
+    frame_success: bool,
     success: bool,
 }
 
@@ -425,15 +424,31 @@ fn build_trace_node(
     tx_id: String,
     parent_trace_id: String,
     pos_in_parent_trace: usize,
-    node: &CallTraceNode,
+    node_id: usize,
     nodes: &[CallTraceNode],
+    captured: &CapturedEvents,
+    visible: &[bool],
     parent_success: bool,
     trace_address: Vec<usize>,
     log_index: &mut usize,
-) -> DebankTraceNode {
+) -> Result<DebankTraceNode, String> {
+    let node = nodes
+        .get(node_id)
+        .ok_or_else(|| format!("missing trace node {node_id}"))?;
+    let frame = captured
+        .frames
+        .get(node_id)
+        .ok_or_else(|| format!("missing captured frame {node_id}"))?;
+    if node.trace.success != frame.success {
+        return Err(format!(
+            "trace and event inspectors disagree on frame {node_id} success"
+        ));
+    }
+
     let mut debank_node = DebankTraceNode {
         trace: node.into(),
         children: Vec::new(),
+        frame_success: node.trace.success,
         success: node.trace.success && parent_success,
     };
     debank_node.trace.trace_address = trace_address.clone();
@@ -443,66 +458,30 @@ fn build_trace_node(
     debank_node.trace.id = debank_node.trace.debank_id();
 
     let id = debank_node.trace.id.clone();
-    let contract_id = node.execution_address();
+    let mut next_trace_index = 0;
+    append_captured_members(
+        &mut debank_node,
+        node_id,
+        &tx_id,
+        &id,
+        nodes,
+        captured,
+        visible,
+        parent_success,
+        &trace_address,
+        &mut next_trace_index,
+        log_index,
+    )?;
+    debank_node.trace.subtraces = debank_node
+        .children
+        .iter()
+        .filter(|child| matches!(child, DebankTraceOrLog::Trace(_)))
+        .count();
 
-    let mut child_trace_address = Vec::new();
-    for pos in &node.ordering {
-        match pos {
-            TraceMemberOrder::Call(i) => {
-                let child_node = &nodes[node.children[*i]];
-                let mut ta = trace_address.clone();
-                ta.push(*i);
-                child_trace_address = ta.clone();
-                let child_trace = build_trace_node(
-                    tx_id.clone(),
-                    id.clone(),
-                    debank_node.children.len(),
-                    child_node,
-                    nodes,
-                    parent_success && debank_node.success,
-                    ta,
-                    log_index,
-                );
-                if child_trace.trace.storage_change && child_node.trace.success {
-                    debank_node.trace.storage_change = true;
-                }
-                debank_node
-                    .children
-                    .push(DebankTraceOrLog::Trace(child_trace));
-            }
-            TraceMemberOrder::Log(i) => {
-                let mut child_event: DebankEvent = (&node.logs[*i]).into();
-                child_event.pos_in_parent_trace = debank_node.children.len();
-                child_event.contract_id = contract_id;
-                child_event.parent_trace_id = id.clone();
-                child_event.id = child_event.debank_id();
-                child_event.idx = *log_index;
-                // Always increment log_index regardless of trace success,
-                // because final success/error classification is based on
-                // receipt status (not CallTraceArena success). See trace_block.rs.
-                *log_index += 1;
-                debank_node
-                    .children
-                    .push(DebankTraceOrLog::Log(child_event));
-            }
-            _ => {}
-        }
-    }
     // selfdestruct handling
     if node.is_selfdestruct() {
-        // Build trace_address for selfdestruct: parent's trace_address + next child index.
-        // child_trace_address tracks the last child call's address, but if there are no
-        // child calls it stays empty. Fall back to parent trace_address + child count.
-        let selfdestruct_ta = if child_trace_address.is_empty() {
-            let mut ta = trace_address;
-            ta.push(node.children.len());
-            ta
-        } else {
-            if let Some(last) = child_trace_address.last_mut() {
-                *last += 1;
-            }
-            child_trace_address
-        };
+        let mut selfdestruct_ta = trace_address;
+        selfdestruct_ta.push(next_trace_index);
         debank_node.trace.subtraces += 1;
         let mut selfdestruct_trace = DebankTrace {
             from_addr: node.trace.selfdestruct_address.unwrap_or_default(),
@@ -524,10 +503,104 @@ fn build_trace_node(
             .push(DebankTraceOrLog::Trace(DebankTraceNode {
                 trace: selfdestruct_trace,
                 children: vec![],
-                success: parent_success && debank_node.success,
+                frame_success: debank_node.frame_success,
+                success: debank_node.success,
             }));
     }
-    debank_node
+    Ok(debank_node)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_captured_members(
+    debank_node: &mut DebankTraceNode,
+    frame_id: usize,
+    tx_id: &str,
+    parent_trace_id: &str,
+    nodes: &[CallTraceNode],
+    captured: &CapturedEvents,
+    visible: &[bool],
+    parent_success: bool,
+    trace_address: &[usize],
+    next_trace_index: &mut usize,
+    log_index: &mut usize,
+) -> Result<(), String> {
+    let frame = captured
+        .frames
+        .get(frame_id)
+        .ok_or_else(|| format!("missing captured frame {frame_id}"))?;
+    let frame_success = parent_success && frame.success;
+
+    for member in &frame.members {
+        match member {
+            CapturedMember::Call(child_id) => {
+                if visible.get(*child_id).copied().unwrap_or(false) {
+                    let mut child_trace_address = trace_address.to_vec();
+                    child_trace_address.push(*next_trace_index);
+                    *next_trace_index += 1;
+                    let child_trace = build_trace_node(
+                        tx_id.to_string(),
+                        parent_trace_id.to_string(),
+                        debank_node.children.len(),
+                        *child_id,
+                        nodes,
+                        captured,
+                        visible,
+                        frame_success,
+                        child_trace_address,
+                        log_index,
+                    )?;
+                    // `storage_change` describes what this frame executed. Keep
+                    // propagating a successful child's SSTORE even if an ancestor
+                    // later reverts the transaction.
+                    if child_trace.trace.storage_change && child_trace.frame_success {
+                        debank_node.trace.storage_change = true;
+                    }
+                    debank_node
+                        .children
+                        .push(DebankTraceOrLog::Trace(child_trace));
+                } else {
+                    append_captured_members(
+                        debank_node,
+                        *child_id,
+                        tx_id,
+                        parent_trace_id,
+                        nodes,
+                        captured,
+                        visible,
+                        frame_success,
+                        trace_address,
+                        next_trace_index,
+                        log_index,
+                    )?;
+                }
+            }
+            CapturedMember::Event(event_id) => {
+                let captured_event = captured
+                    .events
+                    .get(*event_id)
+                    .ok_or_else(|| format!("missing captured event {event_id}"))?;
+                if captured_event.frame != frame_id {
+                    return Err(format!(
+                        "captured event {event_id} belongs to frame {}, expected {frame_id}",
+                        captured_event.frame
+                    ));
+                }
+                let mut event: DebankEvent = (&captured_event.log).into();
+                event.parent_trace_id = parent_trace_id.to_string();
+                event.pos_in_parent_trace = debank_node.children.len();
+                event.id = event.debank_id();
+                if frame_success {
+                    event.idx = *log_index;
+                    *log_index += 1;
+                }
+                debank_node.children.push(DebankTraceOrLog::Log {
+                    event,
+                    success: frame_success,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn finish_build_traces(
@@ -548,11 +621,11 @@ fn finish_build_traces(
                 trace.trace.parent_trace_id = node.trace.id.clone();
                 finish_build_traces(trace, traces, error_traces, events, error_events);
             }
-            DebankTraceOrLog::Log(log) => {
-                if node.success {
-                    events.push(log.clone());
+            DebankTraceOrLog::Log { event, success } => {
+                if *success {
+                    events.push(event.clone());
                 } else {
-                    error_events.push(log.clone());
+                    error_events.push(event.clone());
                 }
             }
         }
@@ -562,30 +635,45 @@ fn finish_build_traces(
 /// Build DeBank traces and events from a revm `CallTraceArena`.
 ///
 /// Returns `(traces, error_traces, events, error_events)`.
-pub fn build_debank_traces(
+pub(crate) type DebankTraceResult = (
+    Vec<DebankTrace>,
+    Vec<DebankTrace>,
+    Vec<DebankEvent>,
+    Vec<DebankEvent>,
+);
+
+pub(crate) fn build_debank_traces(
     tx_id: H256,
     traces: CallTraceArena,
+    captured: CapturedEvents,
     log_index: &std::cell::RefCell<usize>,
-) -> (
-    Vec<DebankTrace>,
-    Vec<DebankTrace>,
-    Vec<DebankEvent>,
-    Vec<DebankEvent>,
-) {
+) -> Result<DebankTraceResult, String> {
     let nodes = traces.into_nodes();
+    captured.validate(nodes.len())?;
     if nodes.is_empty() {
-        return (vec![], vec![], vec![], vec![]);
+        return Ok((vec![], vec![], vec![], vec![]));
+    }
+    let mut visible = vec![false; nodes.len()];
+    visible[0] = true;
+    for node in &nodes {
+        for child in &node.children {
+            if let Some(is_visible) = visible.get_mut(*child) {
+                *is_visible = true;
+            }
+        }
     }
     let mut top = build_trace_node(
         tx_id.to_string(),
         String::new(),
         0,
-        &nodes[0],
+        0,
         &nodes,
+        &captured,
+        &visible,
         true,
         vec![],
         &mut log_index.borrow_mut(),
-    );
+    )?;
     let mut traces = vec![];
     let mut error_traces = vec![];
     let mut events = vec![];
@@ -597,7 +685,7 @@ pub fn build_debank_traces(
         &mut events,
         &mut error_events,
     );
-    (traces, error_traces, events, error_events)
+    Ok((traces, error_traces, events, error_events))
 }
 
 // ---------------------------------------------------------------------------
@@ -605,12 +693,14 @@ pub fn build_debank_traces(
 // ---------------------------------------------------------------------------
 
 pub fn get_storage_contracts_from_cache(cache: &Cache) -> Vec<Address> {
-    cache
+    let mut storage_contracts: Vec<_> = cache
         .accounts
         .iter()
         .filter(|(_, account)| !account.storage.is_empty())
         .map(|(address, _)| *address)
-        .collect()
+        .collect();
+    storage_contracts.sort_unstable();
+    storage_contracts
 }
 
 pub fn get_storage_diffs_from_cache<DB: DatabaseRef>(cache: Cache, pre_db: DB) -> BlockStorageDiff {
@@ -663,14 +753,32 @@ pub fn get_storage_diffs_from_cache<DB: DatabaseRef>(cache: Cache, pre_db: DB) -
         }
     }
 
-    BlockStorageDiff {
+    let mut state_diff = BlockStorageDiff {
         hash: H256::ZERO,
         parent_hash: H256::ZERO,
         new_accounts,
         deleted_accounts,
         storage_diffs,
         new_codes,
+    };
+    sort_block_storage_diff(&mut state_diff);
+    state_diff
+}
+
+fn sort_block_storage_diff(state_diff: &mut BlockStorageDiff) {
+    state_diff
+        .new_accounts
+        .sort_unstable_by_key(|account| account.address);
+    state_diff.deleted_accounts.sort_unstable();
+    for account in &mut state_diff.storage_diffs {
+        account.diffs.sort_unstable_by_key(|diff| diff.index);
     }
+    state_diff
+        .storage_diffs
+        .sort_unstable_by_key(|account| account.address);
+    state_diff
+        .new_codes
+        .sort_unstable_by_key(|code| code.code_hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -678,12 +786,14 @@ pub fn get_storage_diffs_from_cache<DB: DatabaseRef>(cache: Cache, pre_db: DB) -
 // ---------------------------------------------------------------------------
 
 pub fn get_storage_contracts_from_genesis(genesis: &alloy_genesis::Genesis) -> Vec<Address> {
-    genesis
+    let mut storage_contracts: Vec<_> = genesis
         .alloc
         .iter()
         .filter(|(_, account)| account.storage.is_some())
         .map(|(address, _)| *address)
-        .collect()
+        .collect();
+    storage_contracts.sort_unstable();
+    storage_contracts
 }
 
 impl From<&alloy_genesis::Genesis> for BlockStorageDiff {
@@ -728,14 +838,16 @@ impl From<&alloy_genesis::Genesis> for BlockStorageDiff {
             }
         }
 
-        Self {
+        let mut state_diff = Self {
             hash: H256::ZERO,
             parent_hash: alloy_consensus::constants::EMPTY_ROOT_HASH,
             new_accounts,
             deleted_accounts: vec![],
             storage_diffs,
             new_codes,
-        }
+        };
+        sort_block_storage_diff(&mut state_diff);
+        state_diff
     }
 }
 
@@ -841,6 +953,93 @@ pub fn build_genesis_txs_and_traces(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_and_create2_use_the_protocol_create_type() {
+        assert_eq!(debank_call_types(CallKind::Create), ("create", ""));
+        assert_eq!(debank_call_types(CallKind::Create2), ("create", ""));
+        assert_eq!(
+            debank_call_types(CallKind::DelegateCall),
+            ("call", "delegatecall")
+        );
+    }
+
+    #[test]
+    fn state_diff_sorting_is_stable_at_every_level() {
+        let account_1 = H256::repeat_byte(0x11);
+        let account_2 = H256::repeat_byte(0x22);
+        let slot_1 = H256::repeat_byte(0x33);
+        let slot_2 = H256::repeat_byte(0x44);
+        let code_1 = H256::repeat_byte(0x55);
+        let code_2 = H256::repeat_byte(0x66);
+
+        let mut forward = BlockStorageDiff {
+            new_accounts: vec![
+                NewAccount {
+                    address: account_2,
+                    balance: U256::from(2),
+                    nonce: 2,
+                    code_hash: code_2,
+                },
+                NewAccount {
+                    address: account_1,
+                    balance: U256::from(1),
+                    nonce: 1,
+                    code_hash: code_1,
+                },
+            ],
+            deleted_accounts: vec![account_2, account_1],
+            storage_diffs: vec![
+                AccountStorageDiff {
+                    address: account_2,
+                    diffs: vec![
+                        IndexValuePair {
+                            index: slot_2,
+                            value: U256::from(2),
+                        },
+                        IndexValuePair {
+                            index: slot_1,
+                            value: U256::from(1),
+                        },
+                    ],
+                },
+                AccountStorageDiff {
+                    address: account_1,
+                    diffs: vec![],
+                },
+            ],
+            new_codes: vec![
+                NewCode {
+                    code_hash: code_2,
+                    code: Bytes::from_static(&[0x02]),
+                },
+                NewCode {
+                    code_hash: code_1,
+                    code: Bytes::from_static(&[0x01]),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut reverse = forward.clone();
+        reverse.new_accounts.reverse();
+        reverse.deleted_accounts.reverse();
+        reverse.storage_diffs.reverse();
+        for account in &mut reverse.storage_diffs {
+            account.diffs.reverse();
+        }
+        reverse.new_codes.reverse();
+
+        sort_block_storage_diff(&mut forward);
+        sort_block_storage_diff(&mut reverse);
+
+        assert_eq!(forward, reverse);
+        assert_eq!(alloy_rlp::encode(&forward), alloy_rlp::encode(&reverse));
+        assert_eq!(forward.new_accounts[0].address, account_1);
+        assert_eq!(forward.deleted_accounts[0], account_1);
+        assert_eq!(forward.storage_diffs[0].address, account_1);
+        assert_eq!(forward.storage_diffs[1].diffs[0].index, slot_1);
+        assert_eq!(forward.new_codes[0].code_hash, code_1);
+    }
 
     #[test]
     fn test_debank_tx_aa_fields_serialization() {

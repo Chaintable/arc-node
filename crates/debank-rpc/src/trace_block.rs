@@ -5,11 +5,12 @@
 
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction};
 use alloy_eips::BlockId;
-use alloy_primitives::B256;
+use alloy_evm::block::{OnStateHook, StateChangeSource};
+use alloy_primitives::{Address, Bytes, Log, B256};
 use alloy_rpc_types_eth::Header;
 use jsonrpsee::core::RpcResult;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_evm::ConfigureEvm;
+use reth_evm::{execute::BlockExecutor, ConfigureEvm, Evm};
 use reth_primitives_traits::BlockBody;
 use reth_provider::ChainSpecProvider;
 use reth_revm::{database::StateProviderDatabase, State};
@@ -20,12 +21,76 @@ use reth_rpc_eth_api::{
     EthApiTypes,
 };
 use reth_rpc_eth_types::{cache::db::StateProviderTraitObjWrapper, EthApiError};
-use revm::bytecode::opcode::OpCode;
-use revm::DatabaseCommit;
+use revm::{bytecode::opcode::OpCode, database::InMemoryDB, DatabaseCommit};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::debank_trace::*;
-use crate::state_diff_db::StateDiffTraceDB;
+use crate::event_inspector::ArcEventInspector;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TxExecutionOutcome {
+    success: bool,
+    gas_used: u64,
+    output: Option<Bytes>,
+    created_address: Option<Address>,
+    logs: Vec<Log>,
+}
+
+#[derive(Clone, Default)]
+struct StateDiffAccumulator(Arc<Mutex<InMemoryDB>>);
+
+impl StateDiffAccumulator {
+    fn cache(&self) -> reth_revm::db::Cache {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cache
+            .clone()
+    }
+}
+
+impl OnStateHook for StateDiffAccumulator {
+    fn on_state(&mut self, _source: StateChangeSource, state: &revm::state::EvmState) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .commit(state.clone());
+    }
+}
+
+impl TxExecutionOutcome {
+    fn from_result<H>(result: &revm::context::result::ExecutionResult<H>) -> Self {
+        Self {
+            success: result.is_success(),
+            gas_used: result.gas_used(),
+            output: result.output().cloned(),
+            created_address: result.created_address(),
+            logs: result.logs().to_vec(),
+        }
+    }
+}
+
+fn new_debank_inspector() -> (TracingInspector, ArcEventInspector) {
+    let mut config = TracingInspectorConfig::default_parity()
+        .set_steps(true)
+        .set_record_logs(true)
+        .set_exclude_precompile_calls(true);
+    config.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
+    (TracingInspector::new(config), ArcEventInspector::default())
+}
+
+fn receipt_logs<T: serde::Serialize>(receipt: &T) -> Result<Vec<Log>, EthApiError> {
+    let value = serde_json::to_value(receipt)
+        .map_err(|err| EthApiError::EvmCustom(format!("failed to serialize receipt: {err}")))?;
+    let logs = value
+        .get("logs")
+        .cloned()
+        .ok_or_else(|| EthApiError::EvmCustom("receipt is missing logs".to_string()))?;
+    let logs: Vec<alloy_rpc_types_eth::Log> = serde_json::from_value(logs)
+        .map_err(|err| EthApiError::EvmCustom(format!("failed to decode receipt logs: {err}")))?;
+    Ok(logs.into_iter().map(|log| log.inner).collect())
+}
 
 /// `trace` namespace API implementation for `debankBlock`.
 #[derive(Clone)]
@@ -134,6 +199,15 @@ where
         };
 
         let block_txs = block.body().transactions();
+        if receipts.len() != block_txs.len() {
+            return Err(EthApiError::EvmCustom(format!(
+                "block {} has {} transactions but {} receipts",
+                block.number(),
+                block_txs.len(),
+                receipts.len(),
+            ))
+            .into());
+        }
         let mut debank_txs: Vec<DebankTransaction> = Vec::with_capacity(block_txs.len());
 
         for index in 0..block_txs.len() {
@@ -147,7 +221,7 @@ where
             let dtx = DebankTransaction {
                 id: receipt.transaction_hash().to_string(),
                 from: receipt.from(),
-                to: receipt.to().unwrap_or_default(),
+                to: debank_transaction_target(receipt.to(), receipt.contract_address()),
                 gas_limit: tx.gas_limit(),
                 gas_price: receipt.effective_gas_price(),
                 gas_used: receipt.gas_used(),
@@ -167,42 +241,13 @@ where
         // Per-tx receipt status drives the failed-tx classification below.
         let tx_statuses: Vec<bool> = receipts.iter().map(|r| r.status()).collect();
 
-        // Per-tx receipt logs — needed for the precompile-emitted log
-        // reconciliation below (D20). `ReceiptResponse` trait does not expose
-        // logs(); serde-deserialize each receipt's logs into `alloy_rpc_types_eth::Log`
-        // (a stable type) and convert to `DebankEvent` placeholders. Final
-        // contract_id / selector / topics / data are reused as-is; `idx` is
-        // re-assigned at the attach site so it lines up with block-global order.
-        let receipt_logs_per_tx: Vec<Vec<DebankEvent>> = receipts
+        // `ReceiptResponse` does not expose logs directly. Decode its stable RPC
+        // representation once and retain the complete consensus logs for exact
+        // comparison with both execution passes and the event inspector.
+        let receipt_logs_per_tx: Vec<Vec<Log>> = receipts
             .iter()
-            .map(|receipt| {
-                let logs: Vec<alloy_rpc_types_eth::Log> = serde_json::to_value(receipt)
-                    .ok()
-                    .and_then(|v| v.get("logs").cloned())
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default();
-                logs.iter()
-                    .enumerate()
-                    .map(|(log_idx, log)| {
-                        let selector = log
-                            .topics()
-                            .first()
-                            .map(|h| h.to_string())
-                            .unwrap_or_default();
-                        let topics: Vec<String> =
-                            log.topics().iter().skip(1).map(|h| h.to_string()).collect();
-                        DebankEvent {
-                            contract_id: log.address(),
-                            selector,
-                            topics,
-                            data: log.data().data.clone(),
-                            idx: log_idx,
-                            ..Default::default()
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
+            .map(receipt_logs)
+            .collect::<Result<_, _>>()?;
 
         let parent_hash = block.parent_hash();
         let parent_block = self.eth_api.recovered_block(parent_hash.into()).await?;
@@ -234,179 +279,154 @@ where
         let (traces_result, state_diff, change_addresses) = self
             .eth_api
             .spawn_blocking_io_fut(move |eth_api| async move {
-                // Two independent state providers from the same parent block:
-                // pre_db for diff comparison, db for tx execution
-                let state1 = eth_api.state_at_block_id(parent_block_id).await?;
-                let state2 = eth_api.state_at_block_id(parent_block_id).await?;
+                // Three independent views of the same parent state: one for
+                // comparing the final diff, one for canonical block execution,
+                // and one for trace replay.
+                let pre_state = eth_api.state_at_block_id(parent_block_id).await?;
+                let state_pass_provider = eth_api.state_at_block_id(parent_block_id).await?;
+                let trace_pass_provider = eth_api.state_at_block_id(parent_block_id).await?;
 
                 let pre_db = State::builder()
                     .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
-                        state1,
+                        pre_state,
                     )))
                     .build();
-                let cache_db = State::builder()
-                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
-                        state2,
-                    )))
-                    .build();
-                let mut diff_db = StateDiffTraceDB::new(cache_db);
 
-                let log_index = std::cell::RefCell::new(0usize);
-                // (traces, error_traces, events, error_events)
-                type PerTxResult = (
-                    Vec<DebankTrace>,
-                    Vec<DebankTrace>,
-                    Vec<DebankEvent>,
-                    Vec<DebankEvent>,
-                );
-                let mut all_results: Vec<PerTxResult> = Vec::new();
+                // State pass: execute the complete block through ArcBlockExecutor,
+                // including pre- and post-execution hooks. The executor commits
+                // into its outer State cache, so capture every state change through
+                // its hook instead of wrapping the underlying provider DB.
+                let captured_diff = StateDiffAccumulator::default();
+                let mut canonical_outcomes = Vec::with_capacity(tx_hashes.len());
+                {
+                    let mut state_db = State::builder()
+                        .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
+                            state_pass_provider,
+                        )))
+                        .build();
+                    let mut executor = eth_api
+                        .evm_config()
+                        .executor_for_block(&mut state_db, block.sealed_block())
+                        .map_err(|err| EthApiError::EvmCustom(err.to_string()))?;
+                    executor.set_state_hook(Some(Box::new(captured_diff.clone())));
 
-                for (idx, tx) in block.transactions_recovered().enumerate() {
-                    let tx_hash = tx_hashes[idx];
-
-                    // D6: keep `exclude_precompile_calls(true)`. Arc's `0x1800...`
-                    // custom precompiles are injected via reth's precompile lookup,
-                    // not via `warm_addresses()`, so they are not affected.
-                    let mut trace_cfg = TracingInspectorConfig::default_parity()
-                        .set_steps(true)
-                        .set_record_logs(true)
-                        .set_exclude_precompile_calls(true);
-                    trace_cfg.record_opcodes_filter =
-                        Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-                    let mut inspector = TracingInspector::new(trace_cfg);
-
-                    let tx_env = eth_api.evm_config().tx_env(tx);
-
-                    let revm::context::result::ResultAndState {
-                        result: exec_result,
-                        state,
-                    } = eth_api.inspect(&mut diff_db, evm_env.clone(), tx_env, &mut inspector)?;
-                    diff_db.commit(state);
-
-                    // `ExecutionResult::into_logs()` returns `Vec<Log>` for
-                    // `Success`, empty for `Revert`/`Halt` (revm 34). Used below
-                    // to recover precompile-emitted logs the inspector missed.
-                    let exec_logs = exec_result.into_logs();
-
-                    let arena = inspector.into_traces();
-                    let (traces, error_traces, events, error_events) =
-                        build_debank_traces(tx_hash, arena, &log_index);
-
-                    // D19 (reverted; restored as D20): reconcile against receipt logs
-                    // to recover Arc NCA precompile-emitted logs that bypass EVM call
-                    // frames (same problem class as Tempo's TempoEvmHandler fee logs —
-                    // the inspector cannot capture them).
-                    //
-                    // For successful txs: `exec_logs` (from `ExecutionResult::Success`)
-                    // contains all logs including precompile-emitted ones. Extra logs
-                    // beyond what the inspector captured are the precompile entries.
-                    //
-                    // For reverted txs: `ExecutionResult::Revert` has NO logs
-                    // (`exec_logs` is empty). ALL receipt logs are precompile-emitted
-                    // (EVM logs would have been reverted and never enter the receipt).
-                    // Use receipt logs directly — do NOT compare with
-                    // `evm_event_count`, since the inspector may have captured N
-                    // error_events from pre-revert emits, and receipt_log_count
-                    // (precompile only) < N would cause log loss.
-                    let evm_event_count = events.len() + error_events.len();
-                    let tx_reverted = !tx_statuses_clone.get(idx).copied().unwrap_or(true);
-                    let receipt_logs = receipt_logs_per_tx.get(idx).cloned().unwrap_or_default();
-
-                    all_results.push((traces, error_traces, events, error_events));
-
-                    // Determine extra-log source: exec_logs for success, receipt
-                    // for revert. Use block-global log_index for idx (not tx-local).
-                    let extra_log_source: Vec<DebankEvent> = if tx_reverted {
-                        // Revert path: all receipt logs are precompile-emitted
-                        receipt_logs
-                            .iter()
-                            .map(|rl| {
-                                let current_idx = *log_index.borrow();
-                                *log_index.borrow_mut() += 1;
-                                DebankEvent {
-                                    contract_id: rl.contract_id,
-                                    selector: rl.selector.clone(),
-                                    topics: rl.topics.clone(),
-                                    data: rl.data.clone(),
-                                    idx: current_idx,
-                                    ..Default::default()
-                                }
+                    executor
+                        .apply_pre_execution_changes()
+                        .map_err(EthApiError::from)?;
+                    for tx in block.transactions_recovered() {
+                        executor
+                            .execute_transaction_with_result_closure(tx, |result| {
+                                canonical_outcomes.push(TxExecutionOutcome::from_result(result));
                             })
-                            .collect()
-                    } else if exec_logs.len() > evm_event_count {
-                        // Success path: use exec_logs beyond inspector-captured events
-                        exec_logs[evm_event_count..]
-                            .iter()
-                            .map(|log| {
-                                let selector = log
-                                    .topics()
-                                    .first()
-                                    .map(|h| h.to_string())
-                                    .unwrap_or_default();
-                                let topics = if log.topics().len() > 1 {
-                                    log.topics()[1..].iter().map(|h| h.to_string()).collect()
-                                } else {
-                                    vec![]
-                                };
-                                let current_idx = *log_index.borrow();
-                                *log_index.borrow_mut() += 1;
-                                DebankEvent {
-                                    contract_id: log.address,
-                                    selector,
-                                    topics,
-                                    data: log.data.data.clone(),
-                                    idx: current_idx,
-                                    ..Default::default()
-                                }
-                            })
-                            .collect()
-                    } else {
-                        vec![]
-                    };
-
-                    if !extra_log_source.is_empty() {
-                        // Safe: just pushed to `all_results` above, so it's non-empty.
-                        let last = all_results
-                            .last()
-                            .expect("all_results pushed in the line above");
-                        let root_trace_id = last
-                            .0
-                            .first()
-                            .or(last.1.first())
-                            .map(|t| t.id.clone())
-                            .unwrap_or_default();
-                        // Compute base pos from root trace's subtraces + all events
-                        // already attached to it, to avoid pos collision with EVM events.
-                        let root_subtraces = last
-                            .0
-                            .first()
-                            .or(last.1.first())
-                            .map(|t| t.subtraces)
-                            .unwrap_or(0);
-                        let existing_events_on_root = last
-                            .2
-                            .iter()
-                            .chain(last.3.iter())
-                            .filter(|e| e.parent_trace_id == root_trace_id)
-                            .count();
-                        let mut extra_pos = root_subtraces + existing_events_on_root;
-
-                        for mut extra_event in extra_log_source {
-                            extra_event.parent_trace_id = root_trace_id.clone();
-                            extra_event.pos_in_parent_trace = extra_pos;
-                            extra_event.id = extra_event.debank_id();
-                            all_results
-                                .last_mut()
-                                .expect("all_results pushed earlier in this iteration")
-                                .2
-                                .push(extra_event);
-                            extra_pos += 1;
+                            .map_err(EthApiError::from)?;
+                    }
+                    let execution_result = executor
+                        .apply_post_execution_changes()
+                        .map_err(EthApiError::from)?;
+                    if execution_result.gas_used != block.gas_used()
+                        || execution_result.receipts.len() != receipts.len()
+                    {
+                        return Err(EthApiError::EvmCustom(format!(
+                            "canonical replay mismatch for block {}: gas {}/{}, receipts {}/{}",
+                            block.number(),
+                            execution_result.gas_used,
+                            block.gas_used(),
+                            execution_result.receipts.len(),
+                            receipts.len(),
+                        ))
+                        .into());
+                    }
+                    for (idx, outcome) in canonical_outcomes.iter().enumerate() {
+                        let receipt = receipts.get(idx).ok_or_else(|| {
+                            EthApiError::EvmCustom(format!(
+                                "missing receipt {idx} for block {}",
+                                block.number()
+                            ))
+                        })?;
+                        if outcome.success != tx_statuses_clone.get(idx).copied().unwrap_or(false)
+                            || outcome.gas_used != receipt.gas_used()
+                            || outcome.logs
+                                != receipt_logs_per_tx.get(idx).cloned().unwrap_or_default()
+                        {
+                            return Err(EthApiError::EvmCustom(format!(
+                                "canonical replay differs from receipt {idx} for block {}",
+                                block.number()
+                            ))
+                            .into());
                         }
                     }
                 }
 
-                let change_addresses = get_storage_contracts_from_cache(&diff_db.diff.cache);
-                let state_diff = get_storage_diffs_from_cache(diff_db.diff.cache, pre_db);
+                let captured_cache = captured_diff.cache();
+                let change_addresses = get_storage_contracts_from_cache(&captured_cache);
+                let state_diff = get_storage_diffs_from_cache(captured_cache, pre_db);
+
+                let mut trace_db = State::builder()
+                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
+                        trace_pass_provider,
+                    )))
+                    .build();
+                let evm_config = eth_api.evm_config();
+                let trace_context = evm_config
+                    .context_for_block(block.sealed_block())
+                    .map_err(|err| EthApiError::EvmCustom(err.to_string()))?;
+                let trace_evm = evm_config.evm_with_env_and_inspector(
+                    &mut trace_db,
+                    evm_env,
+                    new_debank_inspector(),
+                );
+                let mut trace_executor = evm_config.create_executor(trace_evm, trace_context);
+                trace_executor
+                    .apply_pre_execution_changes()
+                    .map_err(EthApiError::from)?;
+                // Pre-execution system calls are block-level state changes, not
+                // transaction traces. Start the first transaction with a fresh arena.
+                *trace_executor.evm_mut().inspector_mut() = new_debank_inspector();
+
+                let log_index = std::cell::RefCell::new(0usize);
+                // (traces, error_traces, events, error_events)
+                let mut all_results: Vec<DebankTraceResult> = Vec::new();
+
+                for (idx, tx) in block.transactions_recovered().enumerate() {
+                    let tx_hash = tx_hashes[idx];
+                    let mut trace_outcome = None;
+                    trace_executor
+                        .execute_transaction_with_result_closure(tx, |result| {
+                            trace_outcome = Some(TxExecutionOutcome::from_result(result));
+                        })
+                        .map_err(EthApiError::from)?;
+                    let trace_outcome = trace_outcome.ok_or_else(|| {
+                        EthApiError::EvmCustom(format!(
+                            "missing trace result for transaction {tx_hash}"
+                        ))
+                    })?;
+                    if canonical_outcomes.get(idx) != Some(&trace_outcome) {
+                        return Err(EthApiError::EvmCustom(format!(
+                            "state and trace replay differ for transaction {tx_hash}"
+                        ))
+                        .into());
+                    }
+
+                    let exec_logs = trace_outcome.logs;
+                    let (tracing_inspector, event_inspector) = std::mem::replace(
+                        trace_executor.evm_mut().inspector_mut(),
+                        new_debank_inspector(),
+                    );
+                    let arena = tracing_inspector.into_traces();
+                    let captured_events = event_inspector.into_captured();
+                    if captured_events.successful_logs() != exec_logs {
+                        return Err(EthApiError::EvmCustom(format!(
+                            "event inspector logs differ from execution for transaction {tx_hash}"
+                        ))
+                        .into());
+                    }
+                    let (traces, error_traces, events, error_events) =
+                        build_debank_traces(tx_hash, arena, captured_events, &log_index)
+                            .map_err(EthApiError::EvmCustom)?;
+
+                    all_results.push((traces, error_traces, events, error_events));
+                }
+
                 Ok((all_results, state_diff, change_addresses))
             })
             .await?;
@@ -449,35 +469,11 @@ where
                 // Tx failed: all traces/events go to error lists
                 error_trace.extend(trace);
                 error_event.extend(event);
+                for event in &mut error_event {
+                    event.idx = 0;
+                }
                 block_file.error_traces.extend(error_trace);
                 block_file.error_events.extend(error_event);
-            }
-        }
-
-        // Reassign event idx to ensure block-global continuity (no gaps).
-        // build_debank_traces always increments log_index, but classification
-        // may split events between events/error_events, leaving gaps in idx.
-        // Sort by current idx (preserves original per-block order) and
-        // reassign [0, 1, 2, ...] sequentially.
-        let mut idx_map: Vec<(usize, bool, usize)> = block_file
-            .events
-            .iter()
-            .enumerate()
-            .map(|(pos, e)| (e.idx, false, pos))
-            .chain(
-                block_file
-                    .error_events
-                    .iter()
-                    .enumerate()
-                    .map(|(pos, e)| (e.idx, true, pos)),
-            )
-            .collect();
-        idx_map.sort_by_key(|(old_idx, _, _)| *old_idx);
-        for (new_idx, (_, is_error, pos)) in idx_map.into_iter().enumerate() {
-            if is_error {
-                block_file.error_events[pos].idx = new_idx;
-            } else {
-                block_file.events[pos].idx = new_idx;
             }
         }
 
@@ -494,6 +490,13 @@ where
             validation_hash,
         })
     }
+}
+
+fn debank_transaction_target(
+    recipient: Option<alloy_primitives::Address>,
+    contract_address: Option<alloy_primitives::Address>,
+) -> alloy_primitives::Address {
+    recipient.or(contract_address).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -524,5 +527,70 @@ where
 impl<Eth> std::fmt::Debug for DebankTraceBlock<Eth> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DebankTraceBlock").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_evm::block::{StateChangePostBlockSource, StateChangePreBlockSource};
+    use alloy_primitives::{Address, U256};
+    use revm::state::{Account, AccountInfo, EvmState, EvmStorageSlot};
+
+    fn state_change(address: Address, balance: u64, slots: &[(u64, u64, u64)]) -> EvmState {
+        let mut account = Account::from(AccountInfo {
+            balance: U256::from(balance),
+            ..Default::default()
+        });
+        account.mark_touch();
+        for (key, old, new) in slots {
+            account.storage.insert(
+                U256::from(*key),
+                EvmStorageSlot::new_changed(U256::from(*old), U256::from(*new), 0),
+            );
+        }
+        let mut state = EvmState::default();
+        state.insert(address, account);
+        state
+    }
+
+    #[test]
+    fn transaction_target_uses_created_address_for_create() {
+        let created = Address::repeat_byte(0x11);
+        assert_eq!(debank_transaction_target(None, Some(created)), created);
+    }
+
+    #[test]
+    fn transaction_target_prefers_recipient_for_call() {
+        let recipient = Address::repeat_byte(0x22);
+        let unexpected_contract = Address::repeat_byte(0x33);
+        assert_eq!(
+            debank_transaction_target(Some(recipient), Some(unexpected_contract)),
+            recipient
+        );
+    }
+
+    #[test]
+    fn state_diff_accumulator_merges_pre_transaction_and_post_changes() {
+        let address = Address::repeat_byte(0x11);
+        let mut accumulator = StateDiffAccumulator::default();
+        accumulator.on_state(
+            StateChangeSource::PreBlock(StateChangePreBlockSource::BlockHashesContract),
+            &state_change(address, 1, &[(0, 0, 1)]),
+        );
+        accumulator.on_state(
+            StateChangeSource::Transaction(0),
+            &state_change(address, 2, &[(1, 0, 2)]),
+        );
+        accumulator.on_state(
+            StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements),
+            &state_change(address, 3, &[(0, 1, 3)]),
+        );
+
+        let cache = accumulator.cache();
+        let account = cache.accounts.get(&address).unwrap();
+        assert_eq!(account.info.balance, U256::from(3));
+        assert_eq!(account.storage.get(&U256::from(0)), Some(&U256::from(3)));
+        assert_eq!(account.storage.get(&U256::from(1)), Some(&U256::from(2)));
     }
 }
