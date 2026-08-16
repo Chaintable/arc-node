@@ -1,16 +1,16 @@
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockId;
 use alloy_primitives::B256;
-use alloy_rpc_types_eth::{BlockOverrides, Log, TransactionInfo, state::StateOverride};
+use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides, Log, TransactionInfo};
 use jsonrpsee::core::RpcResult;
 use reth_evm::EvmEnvFor;
 use reth_rpc_convert::RpcTxReq;
 use reth_rpc_eth_api::{
-    EthApiTypes,
     helpers::{EthTransactions, TraceExt},
+    EthApiTypes,
 };
 use reth_rpc_eth_types::{EthApiError, StateCacheDb};
-use revm::{DatabaseCommit, context::result::ResultAndState};
+use revm::{context::result::ResultAndState, DatabaseCommit};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 use crate::types::{PreError, PreErrorCode, PreResult};

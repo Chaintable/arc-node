@@ -2,11 +2,11 @@
 //!
 //! Ported from reth-x `crates/rpc/rpc-eth-types/src/cache/db.rs`.
 
-use alloy_primitives::{Address, B256, U256, map::HashMap};
+use alloy_primitives::{map::HashMap, Address, B256, U256};
 use revm::{
-    Database, DatabaseCommit, DatabaseRef,
     database::InMemoryDB,
     state::{Account, AccountInfo, Bytecode},
+    Database, DatabaseCommit, DatabaseRef,
 };
 
 /// A database that wraps an external database and an in-memory diff database.

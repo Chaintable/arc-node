@@ -1,13 +1,13 @@
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockId;
-use alloy_rpc_types_eth::{BlockOverrides, TransactionRequest, state::StateOverride};
+use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides, TransactionRequest};
 use jsonrpsee::core::RpcResult;
 use reth_rpc_convert::RpcTxReq;
-use reth_rpc_eth_api::{EthApiTypes, helpers::EthCall};
+use reth_rpc_eth_api::{helpers::EthCall, EthApiTypes};
 use reth_rpc_eth_types::EthApiError;
 use revm::context::result::ExecutionResult;
 
-use crate::erc20_handle::{NATIVE_TOKEN_ADDRESS, eth_erc20_handle};
+use crate::erc20_handle::{eth_erc20_handle, NATIVE_TOKEN_ADDRESS};
 use crate::types::{MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult};
 
 /// `eth_multiCall` API implementation.
@@ -102,7 +102,9 @@ where
                     let execute_result = eth_api.transact(&mut db, current_evm_env, prepared_tx)?;
 
                     let mut res = match execute_result.result {
-                        ExecutionResult::Success { output, gas_used, .. } => SingleCallResult {
+                        ExecutionResult::Success {
+                            output, gas_used, ..
+                        } => SingleCallResult {
                             code: MultiCallErrorCode::Success as i32,
                             err: String::new(),
                             from_cache: false,
@@ -110,7 +112,9 @@ where
                             gas_used: gas_used as i64,
                             time_cost: 0.0,
                         },
-                        ExecutionResult::Revert { output, gas_used, .. } => SingleCallResult {
+                        ExecutionResult::Revert {
+                            output, gas_used, ..
+                        } => SingleCallResult {
                             code: MultiCallErrorCode::EVMReverted as i32,
                             err: alloy_sol_types::decode_revert_reason(&output)
                                 .unwrap_or_else(|| "Reason Unknown".to_string()),
@@ -119,7 +123,9 @@ where
                             gas_used: gas_used as i64,
                             time_cost: 0.0,
                         },
-                        ExecutionResult::Halt { reason, gas_used, .. } => SingleCallResult {
+                        ExecutionResult::Halt {
+                            reason, gas_used, ..
+                        } => SingleCallResult {
                             code: MultiCallErrorCode::EVMCancelled as i32,
                             err: format!("Halted: {reason:?}"),
                             from_cache: false,

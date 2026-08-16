@@ -3,7 +3,7 @@
 //! Replays all transactions in a block, collecting DeBank-format traces, events,
 //! and state diffs for consumption by background-tracer → S3/Kafka → leafage-evm.
 
-use alloy_consensus::{BlockHeader, Transaction, transaction::TxHashRef};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction};
 use alloy_eips::BlockId;
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::Header;
@@ -12,16 +12,16 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::BlockBody;
 use reth_provider::ChainSpecProvider;
-use reth_revm::{State, database::StateProviderDatabase};
+use reth_revm::{database::StateProviderDatabase, State};
 use reth_rpc_eth_api::{
-    EthApiTypes,
     helpers::{
         EthBlocks, EthTransactions, LoadBlock, LoadReceipt, LoadState, SpawnBlocking, TraceExt,
     },
+    EthApiTypes,
 };
-use reth_rpc_eth_types::{EthApiError, cache::db::StateProviderTraitObjWrapper};
-use revm::DatabaseCommit;
+use reth_rpc_eth_types::{cache::db::StateProviderTraitObjWrapper, EthApiError};
 use revm::bytecode::opcode::OpCode;
+use revm::DatabaseCommit;
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
 
 use crate::debank_trace::*;

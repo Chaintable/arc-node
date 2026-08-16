@@ -389,3 +389,35 @@ and `csv = "1.4"` adjacent to `crunchy`/`deranged`; we had inserted
 `debank-rpc = ...` between them. Combined all three in alphabetical order:
 `criterion`, `crunchy`, `csv`, `debank-rpc`, `deranged`.
 
+## 2026-08-16 — upstream v0.7.3 merge
+
+### D22. No pipeline code or deployment override required [decided]
+
+Merged official stable release `v0.7.3` into `debank`. The merge had no
+source conflicts. The Reth, revm, revm-inspectors, Alloy, and jsonrpsee
+versions used by `debank-rpc` are unchanged, and all 20 crate tests pass.
+
+The operator-facing RPC changes introduced since `v0.7.1` do not require a
+pipeline adaptation:
+
+- `--arc.rpc.max-batch-entries` defaults to 100. `background-tracer` calls
+  `trace_debankBlock` once per JSON-RPC request; its concurrent task buffer is
+  not a JSON-RPC batch. The default therefore does not limit block tracing.
+- `--rpc.gascap` defaults to 30,000,000. `trace_debankBlock` replays the
+  canonical block directly and does not use the outer `eth_call` gas cap.
+  `pre_traceMany` and `eth_multiCall` do use the call environment, but Arc
+  mainnet's block gas limit is also 30,000,000 and neither method is used by
+  the current block-ingestion path. Do not raise the cap by default.
+- Rejection of replay-unprotected transaction submission and the enabled
+  invalid-transaction list affect write/payload-builder paths, not the
+  read-only DeBank RPC methods.
+- Zero7/Zero8 execution changes are selected through `evm_env_at(block_id)`.
+  Arc mainnet does not currently activate those forks, so the response schema
+  remains unchanged; when a mainnet activation is announced, repeat the
+  trace/receipt/log-root regression on post-fork blocks.
+
+Before release, run the three custom RPCs against the existing Arc mainnet
+archive snapshot. For `trace_debankBlock`, compare block hash, transaction
+count, receipt/log coverage, and root fields with the canonical block RPC.
+Also confirm a 100-entry JSON-RPC batch succeeds and a 101-entry batch is
+rejected, without changing the default limit.

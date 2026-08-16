@@ -173,6 +173,7 @@ precompile!(run_system_accounting, precompile_input, hardfork_flags; {
                 SYSTEM_ACCOUNTING_ADDRESS,
                 &precompile_input,
                 &gas_counter,
+                hardfork_flags,
             )?;
 
             // Update storage
@@ -376,8 +377,14 @@ mod tests {
     };
     use serde_with::NoneAsEmptyString;
 
-    fn call_system_accounting(
-        ctx: &mut Context,
+    fn call_system_accounting<DB: revm::database_interface::Database + std::fmt::Debug>(
+        ctx: &mut revm::context::Context<
+            revm::context::BlockEnv,
+            revm::context::TxEnv,
+            revm::context::CfgEnv,
+            DB,
+            revm::context::Journal<DB>,
+        >,
         inputs: &CallInputs,
         hardfork_flags: ArcHardforkFlags,
     ) -> Result<Option<InterpreterResult>, String> {
@@ -625,31 +632,103 @@ mod tests {
         }
     }
 
-    #[test]
-    fn store_gas_values_table_tests() {
-        struct StoreCase {
-            name: &'static str,
-            caller: Address,
-            calldata: Bytes,
-            gas_limit: u64,
-            /// If set, overrides `gas_limit` when Zero6 is active. Needed when
-            /// the Zero6 early-revert penalty pushes required gas above the
-            /// Zero5 limit.
-            zero6_gas_limit: Option<u64>,
-            expected_result: InstructionResult,
-            expected_revert_str: Option<&'static str>,
-            return_data: Option<Bytes>,
-            gas_used: u64,
-            /// If set, overrides `gas_used` for pre-Zero5 hardforks (fixed
-            /// SSTORE cost vs. EIP-2929/EIP-2200 warm/cold pricing).
-            pre_zero5_gas_used: Option<u64>,
-            /// If set, overrides `gas_used` when Zero6 is active (auth reverts
-            /// charge `PRECOMPILE_EARLY_REVERT_GAS_PENALTY`).
-            zero6_gas_used: Option<u64>,
-            target_address: Address,
-            bytecode_address: Address,
+    struct StoreCase {
+        name: &'static str,
+        caller: Address,
+        calldata: Bytes,
+        gas_limit: u64,
+        /// If set, overrides `gas_limit` when Zero6 is active. Needed when
+        /// the Zero6 early-revert penalty pushes required gas above the
+        /// Zero5 limit.
+        zero6_gas_limit: Option<u64>,
+        expected_result: InstructionResult,
+        expected_revert_str: Option<&'static str>,
+        return_data: Option<Bytes>,
+        gas_used: u64,
+        /// If set, overrides `gas_used` for pre-Zero5 hardforks (fixed
+        /// SSTORE cost vs. EIP-2929/EIP-2200 warm/cold pricing).
+        pre_zero5_gas_used: Option<u64>,
+        /// If set, overrides `gas_used` when Zero6 is active (auth reverts
+        /// charge `PRECOMPILE_EARLY_REVERT_GAS_PENALTY`).
+        zero6_gas_used: Option<u64>,
+        target_address: Address,
+        bytecode_address: Address,
+    }
+
+    /// Resolves the expected gas used for a `StoreCase` under the given hardfork flags.
+    fn expected_store_gas_used(tc: &StoreCase, hardfork_flags: ArcHardforkFlags) -> u64 {
+        let base = if hardfork_flags.is_active(ArcHardfork::Zero6) {
+            tc.zero6_gas_used.unwrap_or(tc.gas_used)
+        } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
+            tc.gas_used
+        } else {
+            tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
+        };
+        // Zero8: a delegatecall rejection charges the uniform early-revert penalty.
+        if hardfork_flags.is_active(ArcHardfork::Zero8)
+            && tc.expected_revert_str == Some(ERR_DELEGATE_CALL_NOT_ALLOWED)
+        {
+            base.saturating_add(PRECOMPILE_EARLY_REVERT_GAS_PENALTY)
+        } else {
+            base
+        }
+    }
+
+    /// Runs one `StoreCase` under a single hardfork combination and asserts the outcome.
+    /// Non-cumulative combinations (Zero6 without Zero5) are skipped.
+    fn run_store_gas_values_case(tc: &StoreCase, hardfork_flags: ArcHardforkFlags) {
+        if hardfork_flags.is_active(ArcHardfork::Zero6)
+            && !hardfork_flags.is_active(ArcHardfork::Zero5)
+        {
+            return;
         }
 
+        let tc_name = format!("{} (hardfork_flags: {:?})", tc.name, hardfork_flags);
+
+        let gas_limit = if hardfork_flags.is_active(ArcHardfork::Zero6) {
+            tc.zero6_gas_limit.unwrap_or(tc.gas_limit)
+        } else {
+            tc.gas_limit
+        };
+        let expected_gas_used = expected_store_gas_used(tc, hardfork_flags);
+
+        let mut ctx = Context::mainnet();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("Unable to load system accounting account");
+
+        let inputs = CallInputs {
+            scheme: CallScheme::Call,
+            target_address: tc.target_address,
+            bytecode_address: tc.bytecode_address,
+            known_bytecode: None,
+            caller: tc.caller,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(tc.calldata.clone()),
+            gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        let res = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(res.result, tc.expected_result, "{tc_name}");
+
+        if let Some(expected_revert_str) = tc.expected_revert_str {
+            let reason = bytes_to_revert_message(res.output.as_ref()).expect("revert reason");
+            assert_eq!(reason, expected_revert_str, "{tc_name}");
+        }
+
+        if let Some(expected_return) = &tc.return_data {
+            assert_eq!(res.output, *expected_return, "{tc_name}");
+        }
+
+        assert_eq!(res.gas.used(), expected_gas_used, "{tc_name}");
+    }
+
+    #[test]
+    fn store_gas_values_table_tests() {
         let bn_ok = 1024u64;
         let val_ok = GasValues {
             gasUsed: 11,
@@ -810,68 +889,75 @@ mod tests {
 
         for tc in cases {
             for hardfork_flags in ArcHardforkFlags::all_combinations() {
-                // ZeroX hardforks are cumulative; Zero6 implies Zero5.
-                if hardfork_flags.is_active(ArcHardfork::Zero6)
-                    && !hardfork_flags.is_active(ArcHardfork::Zero5)
-                {
-                    continue;
-                }
-
-                let tc_name = format!("{} (hardfork_flags: {:?})", tc.name, hardfork_flags);
-
-                let gas_limit = if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    tc.zero6_gas_limit.unwrap_or(tc.gas_limit)
-                } else {
-                    tc.gas_limit
-                };
-
-                let expected_gas_used = if hardfork_flags.is_active(ArcHardfork::Zero6) {
-                    tc.zero6_gas_used.unwrap_or(tc.gas_used)
-                } else if hardfork_flags.is_active(ArcHardfork::Zero5) {
-                    tc.gas_used
-                } else {
-                    tc.pre_zero5_gas_used.unwrap_or(tc.gas_used)
-                };
-
-                let mut ctx = Context::mainnet();
-                ctx.journal_mut()
-                    .load_account(SYSTEM_ACCOUNTING_ADDRESS)
-                    .expect("Unable to load system accounting account");
-
-                let inputs = CallInputs {
-                    scheme: CallScheme::Call,
-                    target_address: tc.target_address,
-                    bytecode_address: tc.bytecode_address,
-                    known_bytecode: None,
-                    caller: tc.caller,
-                    value: CallValue::Transfer(U256::ZERO),
-                    input: CallInput::Bytes(tc.calldata.clone()),
-                    gas_limit,
-                    is_static: false,
-                    return_memory_offset: 0..0,
-                };
-
-                let res = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
-                    .unwrap()
-                    .unwrap();
-                // Check result
-                assert_eq!(res.result, tc.expected_result, "{tc_name}");
-
-                // Revert string
-                if let Some(expected_revert_str) = tc.expected_revert_str {
-                    let reason =
-                        bytes_to_revert_message(res.output.as_ref()).expect("revert reason");
-                    assert_eq!(reason, expected_revert_str, "{tc_name}");
-                }
-
-                // Return data
-                if let Some(expected_return) = &tc.return_data {
-                    assert_eq!(res.output, *expected_return, "{tc_name}");
-                }
-                // Gas used
-                assert_eq!(res.gas.used(), expected_gas_used, "{tc_name}");
+                run_store_gas_values_case(tc, hardfork_flags);
             }
         }
+    }
+
+    /// A delegatecall into a stateful precompile is rejected by `check_delegatecall`.
+    /// Under Zero8 the rejection charges the uniform 200-gas early-revert penalty;
+    /// before Zero8 it reverts with no penalty.
+    #[test]
+    fn delegatecall_charges_early_revert_penalty_only_under_zero8() {
+        let calldata = ISystemAccounting::storeGasValuesCall {
+            blockNumber: 1,
+            gasValues: GasValues {
+                gasUsed: 1,
+                gasUsedSmoothed: 2,
+                nextBaseFee: 3,
+            },
+        }
+        .abi_encode();
+
+        let gas_used_for = |hardfork_flags: ArcHardforkFlags| -> u64 {
+            let mut ctx = Context::mainnet();
+            ctx.journal_mut()
+                .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+                .expect("load system accounting account");
+            let inputs = CallInputs {
+                scheme: CallScheme::Call,
+                target_address: SYSTEM_ACCOUNTING_ADDRESS,
+                // bytecode_address != precompile address => delegatecall shape.
+                bytecode_address: address!("0x0000000000000000000000000000000000000123"),
+                known_bytecode: None,
+                caller: ARC_SYSTEM_CALLER,
+                value: CallValue::Transfer(U256::ZERO),
+                input: CallInput::Bytes(calldata.clone().into()),
+                gas_limit: 1_000_000,
+                is_static: false,
+                return_memory_offset: 0..0,
+            };
+            let res = call_system_accounting(&mut ctx, &inputs, hardfork_flags)
+                .unwrap()
+                .unwrap();
+            assert_eq!(res.result, InstructionResult::Revert);
+            assert_eq!(
+                bytes_to_revert_message(res.output.as_ref()).expect("revert reason"),
+                ERR_DELEGATE_CALL_NOT_ALLOWED,
+            );
+            res.gas.used()
+        };
+
+        let pre_zero8 = gas_used_for(ArcHardforkFlags::with(&[
+            ArcHardfork::Zero5,
+            ArcHardfork::Zero6,
+            ArcHardfork::Zero7,
+        ]));
+        let zero8 = gas_used_for(ArcHardforkFlags::with(&[
+            ArcHardfork::Zero5,
+            ArcHardfork::Zero6,
+            ArcHardfork::Zero7,
+            ArcHardfork::Zero8,
+        ]));
+
+        assert_eq!(
+            pre_zero8, 0,
+            "pre-Zero8 delegatecall rejection charges no penalty"
+        );
+        assert_eq!(
+            zero8, PRECOMPILE_EARLY_REVERT_GAS_PENALTY,
+            "Zero8 delegatecall rejection charges the 200-gas early-revert penalty",
+        );
     }
 
     #[test]
@@ -1016,6 +1102,181 @@ mod tests {
             .unwrap();
         assert_eq!(res.result, InstructionResult::Return);
         assert_eq!(res.gas.used(), happy_gas);
+    }
+
+    /// Under Zero6, `read()` probes slot warmth with `sload(key, true)`.
+    /// When the slot is cold the probe returns `ColdLoadSkipped` and the
+    /// helper must charge `COLD_SLOAD_COST` (2100) *before* retrying with
+    /// the real DB load.
+    ///
+    /// This test gives exactly `COLD_SLOAD_COST - 1` gas so the charge
+    /// fails before the retry I/O. A bug that deferred the charge would
+    /// succeed at this gas level (warm cost = 100 < 2099).
+    ///
+    /// Uses `TrackingDB` to prove zero storage reads occur before the OOG.
+    #[test]
+    fn read_cold_slot_oog_before_retry() {
+        use crate::helpers::test_utils::TrackingDB;
+        use revm_interpreter::gas::COLD_SLOAD_COST;
+
+        let zero6_flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+
+        let calldata: Bytes = ISystemAccounting::getGasValuesCall { blockNumber: 42 }
+            .abi_encode()
+            .into();
+        let make_inputs = |gas_limit: u64| CallInputs {
+            scheme: CallScheme::Call,
+            target_address: SYSTEM_ACCOUNTING_ADDRESS,
+            bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
+            known_bytecode: None,
+            caller: ARC_SYSTEM_CALLER,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(calldata.clone()),
+            gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        // Gas = COLD_SLOAD_COST - 1: must OOG at the cold charge, zero DB reads.
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(COLD_SLOAD_COST - 1), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::PrecompileOOG,
+            "cold read must OOG when gas < COLD_SLOAD_COST"
+        );
+        assert_eq!(
+            storage_reads.get(),
+            0,
+            "OOG must occur before any storage DB read"
+        );
+
+        // Gas = COLD_SLOAD_COST: must succeed (slot is cold, value is zero).
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(COLD_SLOAD_COST), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::Return,
+            "cold read must succeed at exactly COLD_SLOAD_COST"
+        );
+        assert_eq!(res.gas.used(), COLD_SLOAD_COST);
+        assert!(
+            storage_reads.get() > 0,
+            "success path must hit the DB for the real sload"
+        );
+    }
+
+    /// Under Zero6, `write()` probes slot warmth with `sload(key, true)`.
+    /// When the slot is cold the probe returns `ColdLoadSkipped` and the
+    /// helper charges `COLD_SLOAD_COST` before retrying. This test verifies
+    /// that the cold charge + sstore base cost are both applied correctly
+    /// on a cold slot by testing at the exact boundary.
+    ///
+    /// For a 0→non-zero write: total = COLD_SLOAD_COST (2100) + SSTORE_SET
+    /// (20000) = 22100. Gas at 22099 must OOG; gas at 22100 must succeed.
+    /// The EIP-2200 sentry (CALL_STIPEND=2300) is below COLD_SLOAD_COST, so
+    /// it never gates the cold-load charge for 0→non-zero writes.
+    ///
+    /// Uses `TrackingDB` to prove zero storage reads occur before the OOG.
+    #[test]
+    fn write_cold_slot_oog_at_base_cost_boundary() {
+        use crate::helpers::test_utils::TrackingDB;
+        use revm_interpreter::gas::COLD_SLOAD_COST;
+
+        let zero6_flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5, ArcHardfork::Zero6]);
+        // 0→non-zero base cost is SSTORE_SET (20000); total = COLD_SLOAD_COST + 20000
+        let exact_cost = COLD_SLOAD_COST + 20000;
+
+        let calldata: Bytes = ISystemAccounting::storeGasValuesCall {
+            blockNumber: 99,
+            gasValues: GasValues {
+                gasUsed: 1,
+                gasUsedSmoothed: 2,
+                nextBaseFee: 3,
+            },
+        }
+        .abi_encode()
+        .into();
+        let make_inputs = |gas_limit: u64| CallInputs {
+            scheme: CallScheme::Call,
+            target_address: SYSTEM_ACCOUNTING_ADDRESS,
+            bytecode_address: SYSTEM_ACCOUNTING_ADDRESS,
+            known_bytecode: None,
+            caller: ARC_SYSTEM_CALLER,
+            value: CallValue::Transfer(U256::ZERO),
+            input: CallInput::Bytes(calldata.clone()),
+            gas_limit,
+            is_static: false,
+            return_memory_offset: 0..0,
+        };
+
+        // Gas = COLD_SLOAD_COST - 1: OOG at the cold charge, before the sload DB read.
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(COLD_SLOAD_COST - 1), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::PrecompileOOG,
+            "cold write must OOG when gas < COLD_SLOAD_COST"
+        );
+        assert_eq!(
+            storage_reads.get(),
+            0,
+            "OOG at cold charge must occur before any storage DB read"
+        );
+
+        // One gas short of full cost: OOG at sstore base cost, after the sload
+        // (whose gas was already charged).
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(exact_cost - 1), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::PrecompileOOG,
+            "cold write one gas short of sstore must OOG"
+        );
+        assert_eq!(
+            storage_reads.get(),
+            1,
+            "sload DB read happens after cold charge was paid"
+        );
+
+        // Exact cost: must succeed.
+        let (mut ctx, storage_reads) = TrackingDB::context();
+        ctx.journal_mut()
+            .load_account(SYSTEM_ACCOUNTING_ADDRESS)
+            .expect("load");
+        let res = call_system_accounting(&mut ctx, &make_inputs(exact_cost), zero6_flags)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            res.result,
+            InstructionResult::Return,
+            "cold write at exact cost must succeed"
+        );
+        assert_eq!(res.gas.used(), exact_cost);
+        assert!(
+            storage_reads.get() > 0,
+            "success path must hit the DB for the real sload"
+        );
     }
 
     #[test]
