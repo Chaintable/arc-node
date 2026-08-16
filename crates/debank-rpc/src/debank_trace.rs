@@ -9,15 +9,15 @@
 
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{
-    Address, B256 as H256, BlockHash, BlockNumber, Bytes, U256, hex, keccak256,
+    hex, keccak256, Address, BlockHash, BlockNumber, Bytes, B256 as H256, U256,
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
 use reth_revm::db::{AccountState, Cache};
 use revm::DatabaseRef;
 use revm_inspectors::tracing::{
-    CallTraceArena,
     types::{CallKind, CallLog, CallTraceNode, TraceMemberOrder},
+    CallTraceArena,
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as Sha1Digest, Sha1};

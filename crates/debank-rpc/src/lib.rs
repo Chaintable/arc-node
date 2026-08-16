@@ -30,7 +30,7 @@ pub use trace_block::DebankTraceBlock;
 pub use types::{MultiCallResp, PreResult};
 
 use alloy_eips::BlockId;
-use alloy_rpc_types_eth::{BlockOverrides, state::StateOverride};
+use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides};
 use jsonrpsee::core::RpcResult;
 
 /// RPC trait for `pre` namespace.

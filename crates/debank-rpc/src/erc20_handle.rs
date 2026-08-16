@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, Bytes, U256};
-use alloy_sol_types::{SolType, sol_data};
+use alloy_sol_types::{sol_data, SolType};
 use revm::DatabaseRef;
 
 use crate::types::{MultiCallErrorCode, SingleCallResult};
