@@ -63,11 +63,9 @@ Port from Tempo's revm 36 form back to Arc's revm 34:
 | AA root-trace classification fix (CallTraceArena `success` unreliable) | Remove merge-back logic | Arc has no AA wrapper traces |
 | TempoEvm handler / TIP-20 fee Transfer comments | Remove | Arc uses stock EIP-1559 path |
 
-### D6. `exclude_precompile_calls = true` [decided, deferred verification]
+### D6. `exclude_precompile_calls = false` [decided]
 
-Keep at `true`. Arc's custom precompiles at `0x1800...` segment are injected via reth's precompile lookup, not via `warm_addresses()` — same pattern Tempo uses for TIP-20.
-
-**Open verification:** confirm during Phase 2 that Arc's precompile registration does not put `0x1800...` addresses into `warm_addresses()`. If it does, this setting would hide their traces.
+Keep standard precompile frames. Tempo's `true` setting was introduced to match Parity `trace_transaction`; Arc's official Reth `debug_*` callTracer uses `false`, and the canonical pipeline producer also retains these frames. Arc's dynamic precompiles and CallFrom trace override are verified separately.
 
 ### D7. `unwrap_used = "deny"` workspace lint [decided]
 

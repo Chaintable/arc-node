@@ -36,7 +36,7 @@ Open items, listed by priority/phase. Subagents append here during execution; us
 - [ ] `background-tracer` sidecar integration for Arc: configure Kafka topics + S3 bucket layout (per `~/code/task_tempo/docs/generic-node.md` deployment section)
 - [ ] `leafage-evm` pipeline ingestion config for Arc
 - [ ] Performance benchmarks (target Tempo's 12ms / call baseline)
-- [ ] Verify `exclude_precompile_calls=true` doesn't hide Arc's `0x1800...` custom precompile traces (see notes D6)
+- [x] Set `exclude_precompile_calls=false` to match the canonical pipeline producer and Arc `debug_*` callTracer (see notes D6)
 - [ ] Verify genesis handling on Arc — does Arc inject synthetic genesis txs? (see notes D8)
 
 ## Phase 1 polish (do before Task 10 commit)

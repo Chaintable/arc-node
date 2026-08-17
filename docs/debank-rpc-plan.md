@@ -58,7 +58,7 @@ Listed per file in the corresponding Phase 2 tasks. Summary:
 | Revert-tx fee log reconstruction via `serde_json::from_value::<Vec<Log>>(receipt.logs)` | Arc has no handler-emitted fee logs; revert tx receipts have only EVM-captured logs | Remove the receipt-replay branch entirely |
 | AA tx (type=0x76) `to_addr` / `input` unpacking from receipt | Arc has no AA tx type | Use `tx.to()` / `tx.input()` directly from the standard alloy `Transaction` trait |
 | AA root-trace classification fix (CallTraceArena `success` unreliable) | Arc has no AA wrapper traces | Use `CallTraceNode.trace.success` directly; final classification still governed by `receipt.status` |
-| `exclude_precompile_calls=true` discussion re: TIP-20 / FeeManager | Arc's precompiles at `0x1800...` segment, but they're injected via reth's `set_precompile_lookup` like Tempo's — same warm_addresses behavior; setting stays `true` | No code change; document in plan only |
+| `exclude_precompile_calls=true` inherited from Tempo | Tempo used Parity `trace_transaction` semantics, while the canonical pipeline producer and Arc `debug_*` callTracer retain standard precompile frames | Set `false`; Arc's dynamic precompile behavior remains covered separately |
 
 ## Native token sentinel (`0xeeee…`) behavior
 
@@ -726,9 +726,9 @@ Expected match clusters (Tempo source line refs):
 
 Search for any `ExecutionResult::Halt { gas, .. }` or `ExecutionResult::Revert { gas, output, logs }` style destructuring. Convert to revm 34 form: `gas_used: u64` field; no `logs` on Halt/Revert. Drop any code reading logs from Halt/Revert.
 
-- [ ] **Step 4: Verify `exclude_precompile_calls=true` remains appropriate**
+- [x] **Step 4: Retain standard precompile call frames**
 
-The `TracingInspectorConfig::default_parity().set_exclude_precompile_calls(true)` (or equivalent) call should stay `true`. Arc's custom precompiles at `0x1800...` segment are injected via reth's `set_precompile_lookup` like Tempo's TIP-20; they don't appear in `warm_addresses()`. Add a one-line comment if the original Tempo comment is too Tempo-specific.
+Use `TracingInspectorConfig::default_parity().set_exclude_precompile_calls(false)`. Tempo's `true` setting matched Parity `trace_transaction`, but Arc's official Reth `debug_*` callTracer and the canonical pipeline producer retain standard precompile frames. Arc's custom precompiles and CallFrom trace override remain covered by their own tests.
 
 - [ ] **Step 5: Add module declaration, re-export, and trait to lib.rs**
 

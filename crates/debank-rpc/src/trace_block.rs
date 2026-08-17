@@ -75,7 +75,7 @@ fn new_debank_inspector() -> (TracingInspector, ArcEventInspector) {
     let mut config = TracingInspectorConfig::default_parity()
         .set_steps(true)
         .set_record_logs(true)
-        .set_exclude_precompile_calls(true);
+        .set_exclude_precompile_calls(false);
     config.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
     (TracingInspector::new(config), ArcEventInspector::default())
 }
@@ -558,6 +558,12 @@ mod tests {
     fn transaction_target_uses_created_address_for_create() {
         let created = Address::repeat_byte(0x11);
         assert_eq!(debank_transaction_target(None, Some(created)), created);
+    }
+
+    #[test]
+    fn debank_inspector_keeps_precompile_calls() {
+        let (inspector, _) = new_debank_inspector();
+        assert!(!inspector.config().exclude_precompile_calls);
     }
 
     #[test]
