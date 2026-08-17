@@ -534,8 +534,14 @@ impl<Eth> std::fmt::Debug for DebankTraceBlock<Eth> {
 mod tests {
     use super::*;
     use alloy_evm::block::{StateChangePostBlockSource, StateChangePreBlockSource};
-    use alloy_primitives::{Address, U256};
-    use revm::state::{Account, AccountInfo, EvmState, EvmStorageSlot};
+    use alloy_primitives::{Address, TxKind, U256};
+    use revm::{
+        context::TxEnv,
+        inspector::InspectorEvmTr,
+        primitives::hardfork::SpecId,
+        state::{Account, AccountInfo, Bytecode, EvmState, EvmStorageSlot},
+        InspectEvm, MainBuilder, MainContext,
+    };
 
     fn state_change(address: Address, balance: u64, slots: &[(u64, u64, u64)]) -> EvmState {
         let mut account = Account::from(AccountInfo {
@@ -561,9 +567,51 @@ mod tests {
     }
 
     #[test]
-    fn debank_inspector_keeps_precompile_calls() {
-        let (inspector, _) = new_debank_inspector();
-        assert!(!inspector.config().exclude_precompile_calls);
+    fn debank_inspector_attaches_standard_precompile_to_call_tree() {
+        let caller = Address::repeat_byte(0xaa);
+        let contract = Address::repeat_byte(0xbb);
+        let ecrecover = Address::with_last_byte(1);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(1_000_000_000u64),
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(
+            contract,
+            AccountInfo {
+                // STATICCALL ecrecover with 128 zero bytes of input, then discard the result.
+                code: Some(Bytecode::new_legacy(Bytes::from_static(&[
+                    0x60, 0x20, 0x60, 0x00, 0x60, 0x80, 0x60, 0x00, 0x60, 0x01, 0x61, 0xff, 0xff,
+                    0xfa, 0x50, 0x00,
+                ]))),
+                ..Default::default()
+            },
+        );
+
+        let mut evm = revm::Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::CANCUN)
+            .with_db(db)
+            .build_mainnet_with_inspector(new_debank_inspector());
+        let result = evm
+            .inspect_tx(TxEnv {
+                caller,
+                kind: TxKind::Call(contract),
+                gas_limit: 1_000_000,
+                gas_price: 0,
+                ..Default::default()
+            })
+            .expect("precompile fixture should execute");
+        assert!(result.result.is_success());
+
+        let (_, inspectors) = evm.ctx_inspector();
+        let nodes = inspectors.0.traces().nodes();
+        assert!(nodes[0]
+            .children
+            .iter()
+            .any(|&child| nodes[child].trace.address == ecrecover));
     }
 
     #[test]
