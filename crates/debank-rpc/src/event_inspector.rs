@@ -497,6 +497,7 @@ mod tests {
         };
         arena.nodes_mut().push(CallTraceNode {
             parent: Some(0),
+            children: vec![2],
             idx: 1,
             trace: CallTrace {
                 success: true,
@@ -518,6 +519,85 @@ mod tests {
                     immediate_bytes: None,
                     decoded: None,
                 }],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        arena.nodes_mut().push(CallTraceNode {
+            parent: Some(1),
+            idx: 2,
+            trace: CallTrace {
+                success: false,
+                status: Some(InstructionResult::OutOfGas),
+                kind: CallKind::Call,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let captured = CapturedEvents {
+            frames: vec![
+                CapturedFrame {
+                    parent: None,
+                    members: vec![CapturedMember::Call(1)],
+                    success: false,
+                },
+                CapturedFrame {
+                    parent: Some(0),
+                    members: vec![CapturedMember::Call(2)],
+                    success: true,
+                },
+                CapturedFrame {
+                    parent: Some(1),
+                    members: vec![],
+                    success: false,
+                },
+            ],
+            events: vec![],
+            valid: true,
+        };
+
+        let (traces, error_traces, events, error_events) = build_debank_traces(
+            B256::repeat_byte(0xaa),
+            arena,
+            captured,
+            &std::cell::RefCell::new(0),
+        )
+        .unwrap();
+
+        assert!(traces.is_empty());
+        assert!(events.is_empty());
+        assert!(error_events.is_empty());
+        assert_eq!(error_traces.len(), 3);
+        assert_eq!(error_traces[0].error, "Reverted");
+        assert_eq!(error_traces[1].error, "parent call failed");
+        assert_eq!(error_traces[2].error, "Out of gas");
+        assert!(error_traces[0].storage_change);
+        assert!(error_traces[1].self_storage_change);
+    }
+
+    #[test]
+    fn selfdestruct_under_failed_parent_has_parent_error() {
+        let refund_target = Address::repeat_byte(0x22);
+        let mut arena = CallTraceArena::default();
+        arena.nodes_mut()[0] = CallTraceNode {
+            children: vec![1],
+            trace: CallTrace {
+                success: false,
+                status: Some(InstructionResult::Revert),
+                kind: CallKind::Call,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        arena.nodes_mut().push(CallTraceNode {
+            parent: Some(0),
+            idx: 1,
+            trace: CallTrace {
+                success: true,
+                status: Some(InstructionResult::SelfDestruct),
+                kind: CallKind::Call,
+                selfdestruct_address: Some(Address::repeat_byte(0x11)),
+                selfdestruct_refund_target: Some(refund_target),
                 ..Default::default()
             },
             ..Default::default()
@@ -550,8 +630,12 @@ mod tests {
         assert!(traces.is_empty());
         assert!(events.is_empty());
         assert!(error_events.is_empty());
-        assert_eq!(error_traces.len(), 2);
-        assert!(error_traces[0].storage_change);
-        assert!(error_traces[1].self_storage_change);
+        assert_eq!(error_traces.len(), 3);
+        let suicide = error_traces
+            .iter()
+            .find(|trace| trace.call_create_type == "suicide")
+            .unwrap();
+        assert_eq!(suicide.to_addr, refund_target);
+        assert_eq!(suicide.error, "parent call failed");
     }
 }

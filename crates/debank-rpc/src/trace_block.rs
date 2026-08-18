@@ -5,7 +5,6 @@
 
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction};
 use alloy_eips::BlockId;
-use alloy_evm::block::{OnStateHook, StateChangeSource};
 use alloy_primitives::{Address, Bytes, Log, B256};
 use alloy_rpc_types_eth::Header;
 use jsonrpsee::core::RpcResult;
@@ -21,9 +20,8 @@ use reth_rpc_eth_api::{
     EthApiTypes,
 };
 use reth_rpc_eth_types::{cache::db::StateProviderTraitObjWrapper, EthApiError};
-use revm::{bytecode::opcode::OpCode, database::InMemoryDB, DatabaseCommit};
+use revm::{bytecode::opcode::OpCode, database::states::bundle_state::BundleRetention};
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::debank_trace::*;
 use crate::event_inspector::ArcEventInspector;
@@ -35,28 +33,6 @@ struct TxExecutionOutcome {
     output: Option<Bytes>,
     created_address: Option<Address>,
     logs: Vec<Log>,
-}
-
-#[derive(Clone, Default)]
-struct StateDiffAccumulator(Arc<Mutex<InMemoryDB>>);
-
-impl StateDiffAccumulator {
-    fn cache(&self) -> reth_revm::db::Cache {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .cache
-            .clone()
-    }
-}
-
-impl OnStateHook for StateDiffAccumulator {
-    fn on_state(&mut self, _source: StateChangeSource, state: &revm::state::EvmState) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .commit(state.clone());
-    }
 }
 
 impl TxExecutionOutcome {
@@ -275,6 +251,7 @@ where
 
         let parent_block_id = BlockId::hash(parent_hash);
         let tx_statuses_clone = tx_statuses.clone();
+        let block_number = block.number();
 
         let (traces_result, state_diff, change_addresses) = self
             .eth_api
@@ -293,22 +270,20 @@ where
                     .build();
 
                 // State pass: execute the complete block through ArcBlockExecutor,
-                // including pre- and post-execution hooks. The executor commits
-                // into its outer State cache, so capture every state change through
-                // its hook instead of wrapping the underlying provider DB.
-                let captured_diff = StateDiffAccumulator::default();
+                // including pre- and post-execution changes. Bundle updates preserve
+                // the canonical EIP-161 and net-storage-change semantics applied by State.
                 let mut canonical_outcomes = Vec::with_capacity(tx_hashes.len());
-                {
+                let bundle = {
                     let mut state_db = State::builder()
                         .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
                             state_pass_provider,
                         )))
+                        .with_bundle_update()
                         .build();
                     let mut executor = eth_api
                         .evm_config()
                         .executor_for_block(&mut state_db, block.sealed_block())
                         .map_err(|err| EthApiError::EvmCustom(err.to_string()))?;
-                    executor.set_state_hook(Some(Box::new(captured_diff.clone())));
 
                     executor
                         .apply_pre_execution_changes()
@@ -320,9 +295,7 @@ where
                             })
                             .map_err(EthApiError::from)?;
                     }
-                    let execution_result = executor
-                        .apply_post_execution_changes()
-                        .map_err(EthApiError::from)?;
+                    let (evm, execution_result) = executor.finish().map_err(EthApiError::from)?;
                     if execution_result.gas_used != block.gas_used()
                         || execution_result.receipts.len() != receipts.len()
                     {
@@ -355,11 +328,13 @@ where
                             .into());
                         }
                     }
-                }
+                    let (state_db, _) = evm.finish();
+                    state_db.merge_transitions(BundleRetention::PlainState);
+                    state_db.take_bundle()
+                };
 
-                let captured_cache = captured_diff.cache();
-                let change_addresses = get_storage_contracts_from_cache(&captured_cache);
-                let state_diff = get_storage_diffs_from_cache(captured_cache, pre_db);
+                let change_addresses = get_storage_contracts_from_bundle(&bundle);
+                let state_diff = get_storage_diffs_from_bundle(bundle, pre_db);
 
                 let mut trace_db = State::builder()
                     .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(
@@ -431,50 +406,34 @@ where
             })
             .await?;
 
-        // Assemble block file.
-        // D18: Classification uses per-node success from build_debank_traces, with
-        // receipt status as override. The `root_misclassified` AA merge branch is
-        // kept structurally identical to Tempo so the two ports stay diff-friendly,
-        // even though Arc has no AA wrapper traces and the branch never fires.
-        //
-        // 1. Successful tx, root trace correctly classified (in traces):
-        //    Keep per-node classification. Internal revert sub-calls
-        //    (try/catch) stay in error lists. Matches reth-x behavior.
-        //
-        // 2. Successful tx, root trace misclassified (in error_traces):
-        //    AA-only path (dead on Arc) — `CallTraceArena` marks the handler
-        //    wrapper and its children as success=false even though the tx
-        //    succeeds. The arena's success flags are unreliable for the
-        //    entire tree, so merge all error_traces/events into success lists.
-        //
-        // 3. Failed tx: all traces/events go to error lists.
-        for (idx, (mut trace, mut error_trace, mut event, mut error_event)) in
-            traces_result.into_iter().enumerate()
+        // Assemble the block file without rewriting inspector classifications.
+        // Arc has no Tempo AA wrapper transactions, so a receipt/root mismatch
+        // indicates an inspector regression and must fail instead of moving traces
+        // between success and error buckets.
+        for (idx, (trace, error_trace, event, error_event)) in traces_result.into_iter().enumerate()
         {
-            let tx_success = tx_statuses.get(idx).copied().unwrap_or(true);
-            if tx_success {
-                let root_misclassified = error_trace.iter().any(|t| t.trace_address.is_empty());
-                if root_misclassified {
-                    // AA tx: arena success flags unreliable, merge all
-                    trace.extend(error_trace);
-                    event.extend(error_event);
-                } else {
-                    // Normal tx: keep per-node classification (try/catch)
-                    block_file.error_traces.extend(error_trace);
-                    block_file.error_events.extend(error_event);
-                }
-                block_file.traces.extend(trace);
-                block_file.events.extend(event);
-            } else {
-                // Tx failed: all traces/events go to error lists
-                error_trace.extend(trace);
-                error_event.extend(event);
-                for event in &mut error_event {
-                    event.idx = 0;
-                }
-                block_file.error_traces.extend(error_trace);
-                block_file.error_events.extend(error_event);
-            }
+            let tx_success = tx_statuses.get(idx).copied().ok_or_else(|| {
+                EthApiError::EvmCustom(format!(
+                    "missing receipt status for transaction {idx} in block {block_number}"
+                ))
+            })?;
+            validate_transaction_classification(
+                tx_success,
+                &trace,
+                &error_trace,
+                &event,
+                &error_event,
+            )
+            .map_err(|error| {
+                EthApiError::EvmCustom(format!(
+                    "invalid trace classification for transaction {idx} in block {}: {error}",
+                    block_number
+                ))
+            })?;
+            block_file.traces.extend(trace);
+            block_file.error_traces.extend(error_trace);
+            block_file.events.extend(event);
+            block_file.error_events.extend(error_event);
         }
 
         let mut state_diff = state_diff;
@@ -490,6 +449,42 @@ where
             validation_hash,
         })
     }
+}
+
+fn validate_transaction_classification(
+    tx_success: bool,
+    traces: &[DebankTrace],
+    error_traces: &[DebankTrace],
+    events: &[DebankEvent],
+    error_events: &[DebankEvent],
+) -> Result<(), &'static str> {
+    if traces.iter().any(|trace| !trace.error.is_empty()) {
+        return Err("successful trace has an error");
+    }
+    if error_traces.iter().any(|trace| trace.error.is_empty()) {
+        return Err("error trace has no error");
+    }
+    if error_events.iter().any(|event| event.idx != 0) {
+        return Err("error event has a non-zero index");
+    }
+
+    let success_roots = traces
+        .iter()
+        .filter(|trace| trace.parent_trace_id.is_empty())
+        .count();
+    let error_roots = error_traces
+        .iter()
+        .filter(|trace| trace.parent_trace_id.is_empty())
+        .count();
+    if tx_success {
+        if success_roots != 1 || error_roots != 0 {
+            return Err("successful receipt does not have exactly one successful root trace");
+        }
+    } else if success_roots != 0 || error_roots != 1 || !traces.is_empty() || !events.is_empty() {
+        return Err("failed receipt has successful traces or events");
+    }
+
+    Ok(())
 }
 
 fn debank_transaction_target(
@@ -533,14 +528,14 @@ impl<Eth> std::fmt::Debug for DebankTraceBlock<Eth> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_evm::block::{StateChangePostBlockSource, StateChangePreBlockSource};
     use alloy_primitives::{Address, TxKind, U256};
     use revm::{
         context::TxEnv,
+        database::{EmptyDB, InMemoryDB},
         inspector::InspectorEvmTr,
         primitives::hardfork::SpecId,
         state::{Account, AccountInfo, Bytecode, EvmState, EvmStorageSlot},
-        InspectEvm, MainBuilder, MainContext,
+        DatabaseCommit, InspectEvm, MainBuilder, MainContext,
     };
 
     fn state_change(address: Address, balance: u64, slots: &[(u64, u64, u64)]) -> EvmState {
@@ -564,6 +559,86 @@ mod tests {
     fn transaction_target_uses_created_address_for_create() {
         let created = Address::repeat_byte(0x11);
         assert_eq!(debank_transaction_target(None, Some(created)), created);
+    }
+
+    #[test]
+    fn trace_classification_rejects_receipt_or_error_mismatches() {
+        let success_root = DebankTrace::default();
+        let internal_error = DebankTrace {
+            parent_trace_id: "root".to_string(),
+            error: "Reverted".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_transaction_classification(
+            true,
+            std::slice::from_ref(&success_root),
+            std::slice::from_ref(&internal_error),
+            &[],
+            &[DebankEvent::default()]
+        )
+        .is_ok());
+
+        let error_root = DebankTrace {
+            error: "Reverted".to_string(),
+            ..Default::default()
+        };
+        let parent_failed_child = DebankTrace {
+            parent_trace_id: "root".to_string(),
+            error: "parent call failed".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_transaction_classification(
+            false,
+            &[],
+            &[error_root.clone(), parent_failed_child],
+            &[],
+            &[]
+        )
+        .is_ok());
+        assert!(validate_transaction_classification(
+            true,
+            &[],
+            std::slice::from_ref(&error_root),
+            &[],
+            &[]
+        )
+        .is_err());
+        assert!(validate_transaction_classification(
+            false,
+            std::slice::from_ref(&success_root),
+            &[],
+            &[],
+            &[]
+        )
+        .is_err());
+        assert!(validate_transaction_classification(
+            false,
+            &[],
+            &[DebankTrace::default()],
+            &[],
+            &[]
+        )
+        .is_err());
+        let success_with_error = DebankTrace {
+            error: "Reverted".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            validate_transaction_classification(true, &[success_with_error], &[], &[], &[])
+                .is_err()
+        );
+        let nonzero_error_event = DebankEvent {
+            idx: 1,
+            ..Default::default()
+        };
+        assert!(validate_transaction_classification(
+            true,
+            &[success_root],
+            &[internal_error],
+            &[],
+            &[nonzero_error_event]
+        )
+        .is_err());
     }
 
     #[test]
@@ -625,26 +700,53 @@ mod tests {
     }
 
     #[test]
-    fn state_diff_accumulator_merges_pre_transaction_and_post_changes() {
+    fn canonical_bundle_merges_pre_transaction_and_post_changes() {
         let address = Address::repeat_byte(0x11);
-        let mut accumulator = StateDiffAccumulator::default();
-        accumulator.on_state(
-            StateChangeSource::PreBlock(StateChangePreBlockSource::BlockHashesContract),
-            &state_change(address, 1, &[(0, 0, 1)]),
-        );
-        accumulator.on_state(
-            StateChangeSource::Transaction(0),
-            &state_change(address, 2, &[(1, 0, 2)]),
-        );
-        accumulator.on_state(
-            StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements),
-            &state_change(address, 3, &[(0, 1, 3)]),
-        );
+        let mut state = State::builder()
+            .with_database(EmptyDB::default())
+            .with_bundle_update()
+            .build();
+        state.insert_not_existing(address);
+        state.commit(state_change(address, 1, &[(0, 0, 1)]));
+        state.commit(state_change(address, 2, &[(1, 0, 2)]));
+        state.commit(state_change(address, 3, &[(0, 1, 3)]));
+        state.merge_transitions(BundleRetention::PlainState);
 
-        let cache = accumulator.cache();
-        let account = cache.accounts.get(&address).unwrap();
-        assert_eq!(account.info.balance, U256::from(3));
-        assert_eq!(account.storage.get(&U256::from(0)), Some(&U256::from(3)));
-        assert_eq!(account.storage.get(&U256::from(1)), Some(&U256::from(2)));
+        let bundle = state.take_bundle();
+        let account = bundle.state.get(&address).unwrap();
+        assert_eq!(account.info.as_ref().unwrap().balance, U256::from(3));
+        assert_eq!(
+            account.storage.get(&U256::from(0)).unwrap().present_value,
+            U256::from(3)
+        );
+        assert_eq!(
+            account.storage.get(&U256::from(1)).unwrap().present_value,
+            U256::from(2)
+        );
+    }
+
+    #[test]
+    fn canonical_bundle_omits_storage_restored_to_parent_value() {
+        let address = Address::repeat_byte(0x11);
+        let mut state = State::builder()
+            .with_database(EmptyDB::default())
+            .with_bundle_update()
+            .build();
+        state.insert_account(
+            address,
+            AccountInfo {
+                balance: U256::from(1),
+                ..Default::default()
+            },
+        );
+        state.commit(state_change(address, 1, &[(0, 0, 7)]));
+        state.commit(state_change(address, 1, &[(0, 7, 0)]));
+        state.merge_transitions(BundleRetention::PlainState);
+
+        let diff = get_storage_diffs_from_bundle(state.take_bundle(), EmptyDB::default());
+        assert!(diff.new_accounts.is_empty());
+        assert!(diff.deleted_accounts.is_empty());
+        assert!(diff.storage_diffs.is_empty());
+        assert!(diff.new_codes.is_empty());
     }
 }

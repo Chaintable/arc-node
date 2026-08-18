@@ -13,8 +13,7 @@ use alloy_primitives::{
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
-use reth_revm::db::{AccountState, Cache};
-use revm::DatabaseRef;
+use revm::{database::BundleState, DatabaseRef};
 use revm_inspectors::tracing::{
     types::{CallKind, CallTraceNode},
     CallTraceArena,
@@ -412,6 +411,8 @@ enum DebankTraceOrLog {
     Log { event: DebankEvent, success: bool },
 }
 
+const PARENT_CALL_FAILED_ERROR: &str = "parent call failed";
+
 struct DebankTraceNode {
     trace: DebankTrace,
     children: Vec<DebankTraceOrLog>,
@@ -445,8 +446,12 @@ fn build_trace_node(
         ));
     }
 
+    let mut trace: DebankTrace = node.into();
+    if !parent_success && trace.error.is_empty() {
+        trace.error = PARENT_CALL_FAILED_ERROR.to_string();
+    }
     let mut debank_node = DebankTraceNode {
-        trace: node.into(),
+        trace,
         children: Vec::new(),
         frame_success: node.trace.success,
         success: node.trace.success && parent_success,
@@ -497,6 +502,9 @@ fn build_trace_node(
             call_create_type: "suicide".to_string(),
             ..Default::default()
         };
+        if debank_node.frame_success && !debank_node.success {
+            selfdestruct_trace.error = PARENT_CALL_FAILED_ERROR.to_string();
+        }
         selfdestruct_trace.id = selfdestruct_trace.debank_id();
         debank_node
             .children
@@ -689,12 +697,12 @@ pub(crate) fn build_debank_traces(
 }
 
 // ---------------------------------------------------------------------------
-// State diff extraction from execution cache
+// State diff extraction from the canonical execution bundle
 // ---------------------------------------------------------------------------
 
-pub fn get_storage_contracts_from_cache(cache: &Cache) -> Vec<Address> {
-    let mut storage_contracts: Vec<_> = cache
-        .accounts
+pub fn get_storage_contracts_from_bundle(bundle: &BundleState) -> Vec<Address> {
+    let mut storage_contracts: Vec<_> = bundle
+        .state
         .iter()
         .filter(|(_, account)| !account.storage.is_empty())
         .map(|(address, _)| *address)
@@ -703,32 +711,35 @@ pub fn get_storage_contracts_from_cache(cache: &Cache) -> Vec<Address> {
     storage_contracts
 }
 
-pub fn get_storage_diffs_from_cache<DB: DatabaseRef>(cache: Cache, pre_db: DB) -> BlockStorageDiff {
+pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
+    bundle: BundleState,
+    pre_db: DB,
+) -> BlockStorageDiff {
     let mut new_accounts = Vec::new();
     let mut deleted_accounts = Vec::new();
     let mut storage_diffs = Vec::new();
     let mut new_codes = Vec::new();
 
-    for (address, db_account) in cache.accounts {
-        if db_account.account_state == AccountState::NotExisting {
+    for (address, account) in bundle.state {
+        let Some(info) = account.info else {
             deleted_accounts.push(keccak256(address.0));
             continue;
-        }
+        };
 
         new_accounts.push(NewAccount {
             address: keccak256(address.0),
-            balance: db_account.info.balance,
-            nonce: db_account.info.nonce,
-            code_hash: db_account.info.code_hash,
+            balance: info.balance,
+            nonce: info.nonce,
+            code_hash: info.code_hash,
         });
 
-        if !db_account.storage.is_empty() {
-            let diffs: Vec<IndexValuePair> = db_account
+        if !account.storage.is_empty() {
+            let diffs: Vec<IndexValuePair> = account
                 .storage
                 .into_iter()
-                .map(|(key, value)| IndexValuePair {
+                .map(|(key, slot)| IndexValuePair {
                     index: keccak256::<[u8; 32]>(key.to_be_bytes()),
-                    value,
+                    value: slot.present_value,
                 })
                 .collect();
             if !diffs.is_empty() {
@@ -739,8 +750,8 @@ pub fn get_storage_diffs_from_cache<DB: DatabaseRef>(cache: Cache, pre_db: DB) -
             }
         }
 
-        if let Some(code) = db_account.info.code {
-            let code_hash = db_account.info.code_hash;
+        if let Some(code) = info.code {
+            let code_hash = info.code_hash;
             if let Ok(Some(account)) = pre_db.basic_ref(address)
                 && account.code_hash == code_hash
             {
@@ -953,6 +964,11 @@ pub fn build_genesis_txs_and_traces(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm::{
+        database::{states::bundle_state::BundleRetention, EmptyDB},
+        state::{Account, AccountInfo},
+        DatabaseCommit,
+    };
 
     #[test]
     fn create_and_create2_use_the_protocol_create_type() {
@@ -962,6 +978,53 @@ mod tests {
             debank_call_types(CallKind::DelegateCall),
             ("call", "delegatecall")
         );
+    }
+
+    #[test]
+    fn state_diff_omits_touched_empty_nonexistent_account() {
+        let address = Address::repeat_byte(0x11);
+        let mut account = Account::new_not_existing(0);
+        account.mark_touch();
+        let mut changes = revm::state::EvmState::default();
+        changes.insert(address, account);
+
+        let mut state = reth_revm::State::builder()
+            .with_database(EmptyDB::default())
+            .with_bundle_update()
+            .build();
+        state.insert_not_existing(address);
+        state.commit(changes);
+        state.merge_transitions(BundleRetention::PlainState);
+        let diff = get_storage_diffs_from_bundle(state.take_bundle(), EmptyDB::default());
+
+        assert!(diff.new_accounts.is_empty());
+        assert!(diff.deleted_accounts.is_empty());
+        assert!(diff.storage_diffs.is_empty());
+        assert!(diff.new_codes.is_empty());
+    }
+
+    #[test]
+    fn state_diff_deletes_touched_existing_empty_account() {
+        let address = Address::repeat_byte(0x22);
+        let info = AccountInfo::default();
+        let mut account = Account::from(info.clone());
+        account.mark_touch();
+        let mut changes = revm::state::EvmState::default();
+        changes.insert(address, account);
+
+        let mut state = reth_revm::State::builder()
+            .with_database(EmptyDB::default())
+            .with_bundle_update()
+            .build();
+        state.insert_account(address, info);
+        state.commit(changes);
+        state.merge_transitions(BundleRetention::PlainState);
+        let diff = get_storage_diffs_from_bundle(state.take_bundle(), EmptyDB::default());
+
+        assert!(diff.new_accounts.is_empty());
+        assert_eq!(diff.deleted_accounts, vec![keccak256(address)]);
+        assert!(diff.storage_diffs.is_empty());
+        assert!(diff.new_codes.is_empty());
     }
 
     #[test]
