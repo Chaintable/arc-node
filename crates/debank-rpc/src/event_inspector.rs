@@ -223,13 +223,265 @@ mod tests {
         CallTraceArena,
     };
 
-    use crate::debank_trace::build_debank_traces;
+    use crate::debank_trace::{build_debank_traces, DebankTrace};
 
     fn log(byte: u8) -> Log {
         Log {
             address: Address::repeat_byte(byte),
             data: LogData::empty(),
         }
+    }
+
+    fn call_node(
+        idx: usize,
+        parent: Option<usize>,
+        address: Address,
+        success: bool,
+        status: InstructionResult,
+        children: Vec<usize>,
+    ) -> CallTraceNode {
+        CallTraceNode {
+            parent,
+            children,
+            idx,
+            trace: CallTrace {
+                success,
+                status: Some(status),
+                kind: CallKind::Call,
+                address,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn call_arena(nodes: Vec<CallTraceNode>) -> CallTraceArena {
+        let mut arena = CallTraceArena::default();
+        *arena.nodes_mut() = nodes;
+        arena
+    }
+
+    fn trace_for_address(traces: &[DebankTrace], address: Address) -> &DebankTrace {
+        traces
+            .iter()
+            .find(|trace| trace.to_addr == address)
+            .unwrap()
+    }
+
+    #[test]
+    fn failed_subtree_does_not_taint_successful_sibling() {
+        let arena = call_arena(vec![
+            call_node(
+                0,
+                None,
+                Address::repeat_byte(1),
+                true,
+                InstructionResult::Stop,
+                vec![1, 4],
+            ),
+            call_node(
+                1,
+                Some(0),
+                Address::repeat_byte(2),
+                false,
+                InstructionResult::Revert,
+                vec![2, 3],
+            ),
+            call_node(
+                2,
+                Some(1),
+                Address::repeat_byte(3),
+                true,
+                InstructionResult::Stop,
+                vec![],
+            ),
+            call_node(
+                3,
+                Some(1),
+                Address::repeat_byte(4),
+                false,
+                InstructionResult::OutOfGas,
+                vec![],
+            ),
+            call_node(
+                4,
+                Some(0),
+                Address::repeat_byte(5),
+                true,
+                InstructionResult::Stop,
+                vec![],
+            ),
+        ]);
+        let logs = [log(2), log(3), log(5)];
+        let captured = CapturedEvents {
+            frames: vec![
+                CapturedFrame {
+                    parent: None,
+                    members: vec![CapturedMember::Call(1), CapturedMember::Call(4)],
+                    success: true,
+                },
+                CapturedFrame {
+                    parent: Some(0),
+                    members: vec![
+                        CapturedMember::Event(0),
+                        CapturedMember::Call(2),
+                        CapturedMember::Call(3),
+                    ],
+                    success: false,
+                },
+                CapturedFrame {
+                    parent: Some(1),
+                    members: vec![CapturedMember::Event(1)],
+                    success: true,
+                },
+                CapturedFrame {
+                    parent: Some(1),
+                    members: vec![],
+                    success: false,
+                },
+                CapturedFrame {
+                    parent: Some(0),
+                    members: vec![CapturedMember::Event(2)],
+                    success: true,
+                },
+            ],
+            events: logs
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(event, log)| CapturedEvent {
+                    frame: [1, 2, 4][event],
+                    log,
+                })
+                .collect(),
+            valid: true,
+        };
+
+        let (traces, error_traces, events, error_events) = build_debank_traces(
+            B256::repeat_byte(0xaa),
+            arena,
+            captured,
+            &std::cell::RefCell::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(traces.len(), 2);
+        assert!(trace_for_address(&traces, Address::repeat_byte(1))
+            .error
+            .is_empty());
+        assert!(trace_for_address(&traces, Address::repeat_byte(5))
+            .error
+            .is_empty());
+        assert_eq!(error_traces.len(), 3);
+        assert_eq!(
+            trace_for_address(&error_traces, Address::repeat_byte(2)).error,
+            "Reverted"
+        );
+        assert_eq!(
+            trace_for_address(&error_traces, Address::repeat_byte(3)).error,
+            "parent call failed"
+        );
+        assert_eq!(
+            trace_for_address(&error_traces, Address::repeat_byte(4)).error,
+            "Out of gas"
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].contract_id, logs[2].address);
+        assert_eq!(
+            events[0].parent_trace_id,
+            trace_for_address(&traces, Address::repeat_byte(5)).id
+        );
+        assert_eq!(events[0].idx, 0);
+        assert_eq!(error_events.len(), 2);
+        assert_eq!(error_events[0].contract_id, logs[0].address);
+        assert_eq!(
+            error_events[0].parent_trace_id,
+            trace_for_address(&error_traces, Address::repeat_byte(2)).id
+        );
+        assert_eq!(error_events[1].contract_id, logs[1].address);
+        assert_eq!(
+            error_events[1].parent_trace_id,
+            trace_for_address(&error_traces, Address::repeat_byte(3)).id
+        );
+        assert!(error_events.iter().all(|event| event.idx == 0));
+    }
+
+    // Defensive coverage for any arena node that is not attached to its parent. Standard
+    // precompiles are attached in the current Arc configuration, so this shape is synthetic.
+    #[test]
+    fn hidden_failed_frame_taints_visible_descendant() {
+        let root = call_node(
+            0,
+            None,
+            Address::repeat_byte(1),
+            true,
+            InstructionResult::Stop,
+            vec![],
+        );
+        let mut hidden = call_node(
+            1,
+            Some(0),
+            Address::repeat_byte(2),
+            false,
+            InstructionResult::Revert,
+            vec![2],
+        );
+        hidden.trace.maybe_precompile = Some(true);
+        let descendant = call_node(
+            2,
+            Some(1),
+            Address::repeat_byte(3),
+            true,
+            InstructionResult::Stop,
+            vec![],
+        );
+        let arena = call_arena(vec![root, hidden, descendant]);
+        let descendant_log = log(3);
+        let captured = CapturedEvents {
+            frames: vec![
+                CapturedFrame {
+                    parent: None,
+                    members: vec![CapturedMember::Call(1)],
+                    success: true,
+                },
+                CapturedFrame {
+                    parent: Some(0),
+                    members: vec![CapturedMember::Call(2)],
+                    success: false,
+                },
+                CapturedFrame {
+                    parent: Some(1),
+                    members: vec![CapturedMember::Event(0)],
+                    success: true,
+                },
+            ],
+            events: vec![CapturedEvent {
+                frame: 2,
+                log: descendant_log.clone(),
+            }],
+            valid: true,
+        };
+
+        let (traces, error_traces, events, error_events) = build_debank_traces(
+            B256::repeat_byte(0xaa),
+            arena,
+            captured,
+            &std::cell::RefCell::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].to_addr, Address::repeat_byte(1));
+        assert_eq!(error_traces.len(), 1);
+        assert_eq!(error_traces[0].to_addr, Address::repeat_byte(3));
+        assert_eq!(error_traces[0].error, "parent call failed");
+        assert_eq!(error_traces[0].trace_address, vec![0]);
+        assert_eq!(error_traces[0].parent_trace_id, traces[0].id);
+        assert!(events.is_empty());
+        assert_eq!(error_events.len(), 1);
+        assert_eq!(error_events[0].contract_id, descendant_log.address);
+        assert_eq!(error_events[0].parent_trace_id, error_traces[0].id);
+        assert_eq!(error_events[0].idx, 0);
     }
 
     #[test]
