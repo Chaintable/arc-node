@@ -40,6 +40,7 @@ pub struct ArcSetup {
     addresses_denylist_config: Option<AddressesDenylistConfig>,
     invalid_tx_list_config: Option<InvalidTxListConfig>,
     rpc_gas_cap: Option<u64>,
+    legacy_state_root_task_enabled: bool,
 }
 
 impl Default for ArcSetup {
@@ -58,6 +59,7 @@ impl ArcSetup {
             addresses_denylist_config: None,
             invalid_tx_list_config: None,
             rpc_gas_cap: None,
+            legacy_state_root_task_enabled: false,
         }
     }
 
@@ -93,6 +95,16 @@ impl ArcSetup {
         self
     }
 
+    /// Uses Reth's synchronous state-root path.
+    ///
+    /// In-process tests that repeatedly request state proofs can use this to
+    /// avoid nested proof-worker pools. The default remains the production
+    /// asynchronous path.
+    pub fn with_legacy_state_root_task_enabled(mut self) -> Self {
+        self.legacy_state_root_task_enabled = true;
+        self
+    }
+
     /// Applies the setup to create the test environment.
     ///
     /// This creates a single Arc node and initializes the environment with
@@ -106,8 +118,13 @@ impl ArcSetup {
             arc_node.invalid_tx_list_cfg = cfg;
         }
 
-        let (node, wallet, genesis_block) =
-            Self::launch_node(self.chain_spec, arc_node, self.rpc_gas_cap).await?;
+        let (node, wallet, genesis_block) = Self::launch_node(
+            self.chain_spec,
+            arc_node,
+            self.rpc_gas_cap,
+            self.legacy_state_root_task_enabled,
+        )
+        .await?;
 
         env.set_node(node);
         env.set_wallet(wallet);
@@ -120,6 +137,7 @@ impl ArcSetup {
         chain_spec: Arc<ArcChainSpec>,
         arc_node: ArcNode,
         rpc_gas_cap: Option<u64>,
+        legacy_state_root_task_enabled: bool,
     ) -> eyre::Result<(
         NodeHelperType<ArcNode>,
         reth_e2e_test_utils::wallet::Wallet,
@@ -137,8 +155,9 @@ impl ArcSetup {
             },
             ..NetworkArgs::default()
         };
-        let tree_config =
-            reth_node_api::TreeConfig::default().with_cross_block_cache_size(1024 * 1024);
+        let tree_config = reth_node_api::TreeConfig::default()
+            .with_cross_block_cache_size(1024 * 1024)
+            .with_legacy_state_root(legacy_state_root_task_enabled);
         let mut rpc_args = RpcServerArgs::default()
             .with_unused_ports()
             .with_http()
@@ -146,10 +165,11 @@ impl ArcSetup {
         if let Some(cap) = rpc_gas_cap {
             rpc_args.rpc_gas_cap = cap;
         }
-        let node_config = NodeConfig::new(chain_spec.clone())
+        let mut node_config = NodeConfig::new(chain_spec.clone())
             .with_network(network_config)
             .with_unused_ports()
             .with_rpc(rpc_args);
+        node_config.engine.legacy_state_root_task_enabled = legacy_state_root_task_enabled;
 
         let NodeHandle {
             node,
