@@ -65,23 +65,49 @@ if [[ "${1:-}" == "--self-test-provenance" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--self-test-capture-set" ]]; then
+  python3 "$repo_root/scripts/fixtures/build_leafage_a1b_fixtures.py" \
+    --self-test-capture-set
+  exit 0
+fi
+
 if [[ $# -ne 0 ]]; then
-  echo "usage: $0 [--self-test-panic-detection|--self-test-provenance]" >&2
+  echo "usage: $0 [--self-test-panic-detection|--self-test-provenance|--self-test-capture-set]" >&2
   exit 2
 fi
 
+panic_detection_self_test
+python3 "$repo_root/scripts/fixtures/build_leafage_a1b_fixtures.py" \
+  --self-test-provenance
+python3 "$repo_root/scripts/fixtures/build_leafage_a1b_fixtures.py" \
+  --self-test-capture-set
+
 format_reference_worktree="${BACKGROUND_TRACER_WORKTREE:?set BACKGROUND_TRACER_WORKTREE}"
 output_dir="${LEAFAGE_A1B_FIXTURE_OUT:?set LEAFAGE_A1B_FIXTURE_OUT to a new output directory}"
+python3 "$repo_root/scripts/fixtures/build_leafage_a1b_fixtures.py" \
+  --preflight-output \
+  --output-dir "$output_dir" \
+  --exporter-worktree "$repo_root"
+
+assert_exporter_source_unchanged() {
+  local current_head
+  current_head="$(git -C "$repo_root" rev-parse HEAD)"
+  if [[ "$current_head" != "$exporter_commit" ]]; then
+    echo "Arc exporter HEAD changed: expected $exporter_commit, found $current_head" >&2
+    return 1
+  fi
+  if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=all)" ]]; then
+    echo "Arc exporter worktree must remain clean" >&2
+    return 1
+  fi
+}
 
 exporter_commit="$(git -C "$repo_root" rev-parse HEAD)"
 if ! git -C "$repo_root" merge-base --is-ancestor "$writer_producer" "$exporter_commit"; then
   echo "Arc exporter must descend from writer producer $writer_producer" >&2
   exit 1
 fi
-if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=all)" ]]; then
-  echo "Arc exporter worktree must be clean so the manifest records exact source" >&2
-  exit 1
-fi
+assert_exporter_source_unchanged
 format_reference_head="$(git -C "$format_reference_worktree" rev-parse HEAD)"
 format_reference_tag_commit="$(git -C "$format_reference_worktree" rev-parse "${format_reference_release}^{}")"
 if [[ "$format_reference_head" != "$format_reference_commit" ]] || \
@@ -93,11 +119,6 @@ if [[ -n "$(git -C "$format_reference_worktree" status --porcelain --untracked-f
   echo "background-tracer format-reference worktree must be clean" >&2
   exit 1
 fi
-if [[ -e "$output_dir" ]]; then
-  echo "output directory already exists: $output_dir" >&2
-  exit 1
-fi
-
 capture_dir="$(mktemp -d "${TMPDIR:-/tmp}/arc-a1b-capture.XXXXXX")"
 verification_capture_dir="$(mktemp -d "${TMPDIR:-/tmp}/arc-a1b-verify.XXXXXX")"
 capture_log_dir="$(mktemp -d "${TMPDIR:-/tmp}/arc-a1b-logs.XXXXXX")"
@@ -113,6 +134,7 @@ run_capture() {
   local log_file="$2"
   local -a pipeline_status
 
+  assert_exporter_source_unchanged
   set +e
   ARC_A1B_CAPTURE_DIR="$target_dir" \
     rustup run 1.91.1 cargo test \
@@ -125,24 +147,22 @@ run_capture() {
   pipeline_status=("${PIPESTATUS[@]}")
   set -e
 
+  assert_exporter_source_unchanged
   validate_capture_result "${pipeline_status[0]}" "${pipeline_status[1]}" "$log_file"
 }
 
 run_capture "$capture_dir" "$capture_log"
 run_capture "$verification_capture_dir" "$verification_capture_log"
 
-if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=all)" ]]; then
-  echo "Arc exporter worktree changed while captures were running" >&2
-  exit 1
-fi
-
 rm -- "$capture_log" "$verification_capture_log"
 
+assert_exporter_source_unchanged
 python3 "$repo_root/scripts/fixtures/build_leafage_a1b_fixtures.py" \
   --capture-dir "$capture_dir" \
   --verification-capture-dir "$verification_capture_dir" \
   --output-dir "$output_dir" \
   --exporter-worktree "$repo_root" \
+  --expected-exporter-commit "$exporter_commit" \
   --format-reference-worktree "$format_reference_worktree"
 
 echo "Arc A1b fixtures written to $output_dir"
