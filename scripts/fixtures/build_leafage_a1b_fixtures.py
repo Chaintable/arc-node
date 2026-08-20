@@ -8,10 +8,12 @@ import copy
 import gzip
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 STATE_DIFF_BITMAP_BYTES = 125
@@ -32,6 +34,11 @@ EXPECTED_LABELS = {
     3: "create2",
     4: "failed-create",
 }
+CAPTURE_CONTEXT = "capture-context.json"
+EXPECTED_CAPTURE_ENTRIES = frozenset(
+    {CAPTURE_CONTEXT}
+    | {f"{number}-{label}.json" for number, label in EXPECTED_LABELS.items()}
+)
 EXPORTER_ENTRYPOINT = Path("scripts/fixtures/build_leafage_a1b_fixtures.py")
 ALLOWED_EXPORTER_CHANGES = frozenset(
     {
@@ -49,8 +56,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verification-capture-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--exporter-worktree", type=Path, required=True)
+    parser.add_argument("--expected-exporter-commit", required=True)
     parser.add_argument("--format-reference-worktree", type=Path, required=True)
     return parser.parse_args()
+
+
+def output_preflight_cli(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--exporter-worktree", type=Path, required=True)
+    args = parser.parse_args(arguments)
+    resolve_final_output_path(
+        args.output_dir, args.exporter_worktree.resolve(strict=True)
+    )
 
 
 def git(worktree: Path, *args: str) -> str:
@@ -117,6 +135,25 @@ def load_captures(capture_dir: Path) -> list[tuple[str, dict[str, Any]]]:
     return captures
 
 
+def validate_capture_directory(capture_dir: Path) -> None:
+    if capture_dir.is_symlink() or not capture_dir.is_dir():
+        raise ValueError(f"capture path is not a directory: {capture_dir}")
+
+    actual_entries = {entry.name for entry in capture_dir.iterdir()}
+    missing = sorted(EXPECTED_CAPTURE_ENTRIES - actual_entries)
+    unexpected = sorted(actual_entries - EXPECTED_CAPTURE_ENTRIES)
+    if missing or unexpected:
+        raise ValueError(
+            f"capture directory has missing entries {missing} "
+            f"and unexpected entries {unexpected}: {capture_dir}"
+        )
+
+    for name in sorted(EXPECTED_CAPTURE_ENTRIES):
+        entry = capture_dir / name
+        if entry.is_symlink() or not entry.is_file():
+            raise ValueError(f"capture entry must be a regular file: {entry}")
+
+
 def ensure_entrypoint_binding(script_path: Path, exporter_root: Path) -> None:
     expected_path = (exporter_root / EXPORTER_ENTRYPOINT).resolve()
     if script_path.resolve() != expected_path:
@@ -135,8 +172,81 @@ def ensure_only_test_harness_changes(changed_paths: set[str]) -> None:
         )
 
 
+def ensure_expected_exporter_commit(actual: str, expected: str) -> None:
+    if actual != expected:
+        raise ValueError(
+            f"exporter HEAD changed: expected {expected}, found {actual}"
+        )
+
+
+def ensure_exporter_worktree_state(
+    exporter_root: Path, expected_exporter_commit: str
+) -> None:
+    ensure_expected_exporter_commit(
+        git(exporter_root, "rev-parse", "HEAD"), expected_exporter_commit
+    )
+    if git(
+        exporter_root,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    ):
+        raise ValueError("exporter worktree must be clean")
+
+
+def resolve_final_output_path(output_dir: Path, exporter_root: Path) -> Path:
+    if output_dir.exists() or output_dir.is_symlink():
+        raise ValueError(f"output directory already exists: {output_dir}")
+
+    resolved_output = output_dir.resolve()
+    try:
+        resolved_output.relative_to(exporter_root)
+    except ValueError:
+        return resolved_output
+    raise ValueError(
+        f"output directory must be outside the exporter worktree: {output_dir}"
+    )
+
+
+def create_staging_output(final_output: Path) -> tempfile.TemporaryDirectory:
+    # TemporaryDirectory forces 0700; match Path.mkdir's mode after the current umask.
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    staging = tempfile.TemporaryDirectory(
+        prefix=f".{final_output.name}.staging.", dir=final_output.parent
+    )
+    Path(staging.name).chmod(0o777 & ~current_umask)
+    return staging
+
+
+def finalize_staged_output(
+    staging: tempfile.TemporaryDirectory,
+    final_output: Path,
+    exporter_root: Path,
+    expected_exporter_commit: str,
+) -> None:
+    try:
+        ensure_exporter_worktree_state(exporter_root, expected_exporter_commit)
+        if final_output.exists() or final_output.is_symlink():
+            raise ValueError(f"output directory already exists: {final_output}")
+        Path(staging.name).rename(final_output)
+    except BaseException:
+        staging.cleanup()
+        raise
+    staging.cleanup()
+
+
+def expect_value_error(action: Callable[[], Any], message: str) -> None:
+    try:
+        action()
+    except ValueError:
+        return
+    raise AssertionError(message)
+
+
 def validate_exporter_provenance(
     exporter_worktree: Path,
+    expected_exporter_commit: str,
 ) -> tuple[str, str, str, list[str]]:
     exporter_root = exporter_worktree.resolve(strict=True)
     git_root = Path(git(exporter_root, "rev-parse", "--show-toplevel")).resolve(
@@ -147,14 +257,13 @@ def validate_exporter_provenance(
 
     script_path = Path(__file__).resolve(strict=True)
     ensure_entrypoint_binding(script_path, exporter_root)
-    exporter_commit = git(exporter_root, "rev-parse", "HEAD")
-    if git(
-        exporter_root,
-        "status",
-        "--porcelain",
-        "--untracked-files=all",
-    ):
-        raise ValueError("exporter worktree must be clean")
+    resolved_expected_commit = git(
+        exporter_root, "rev-parse", f"{expected_exporter_commit}^{{commit}}"
+    )
+    ensure_expected_exporter_commit(
+        resolved_expected_commit, expected_exporter_commit
+    )
+    ensure_exporter_worktree_state(exporter_root, expected_exporter_commit)
 
     release_commit = git(exporter_root, "rev-parse", "v0.7.3^{}")
     subprocess.run(
@@ -177,7 +286,7 @@ def validate_exporter_provenance(
             "merge-base",
             "--is-ancestor",
             WRITER_PRODUCER_COMMIT,
-            exporter_commit,
+            expected_exporter_commit,
         ],
         check=True,
     )
@@ -189,7 +298,7 @@ def validate_exporter_provenance(
                 "diff",
                 "--name-only",
                 "--no-renames",
-                f"{WRITER_PRODUCER_COMMIT}..{exporter_commit}",
+                f"{WRITER_PRODUCER_COMMIT}..{expected_exporter_commit}",
             ).splitlines(),
         )
     )
@@ -198,42 +307,178 @@ def validate_exporter_provenance(
     entrypoint_blob = git(
         exporter_root,
         "rev-parse",
-        f"{exporter_commit}:{EXPORTER_ENTRYPOINT.as_posix()}",
+        f"{expected_exporter_commit}:{EXPORTER_ENTRYPOINT.as_posix()}",
     )
     working_entrypoint_blob = git(exporter_root, "hash-object", str(script_path))
     if working_entrypoint_blob != entrypoint_blob:
         raise ValueError(
             "executed converter blob does not match the recorded exporter commit"
         )
-    return exporter_commit, release_commit, entrypoint_blob, changed_paths
+    return expected_exporter_commit, release_commit, entrypoint_blob, changed_paths
 
 
 def provenance_self_test() -> None:
     exporter_root = Path("/arc-a1b-exporter-self-test")
     ensure_entrypoint_binding(exporter_root / EXPORTER_ENTRYPOINT, exporter_root)
     ensure_only_test_harness_changes(set(ALLOWED_EXPORTER_CHANGES))
+    ensure_expected_exporter_commit("a" * 40, "a" * 40)
 
-    failures = 0
-    try:
-        ensure_entrypoint_binding(exporter_root / "copied-transformer.py", exporter_root)
-    except ValueError:
-        failures += 1
-    try:
-        ensure_only_test_harness_changes(
+    expect_value_error(
+        lambda: ensure_entrypoint_binding(
+            exporter_root / "copied-transformer.py", exporter_root
+        ),
+        "provenance self-test accepted a copied entrypoint",
+    )
+    expect_value_error(
+        lambda: ensure_only_test_harness_changes(
             set(ALLOWED_EXPORTER_CHANGES) | {"crates/node/src/lib.rs"}
-        )
-    except ValueError:
-        failures += 1
-    if failures != 2:
-        raise AssertionError("provenance self-test accepted an invalid source")
+        ),
+        "provenance self-test accepted a source path outside the allowlist",
+    )
+    expect_value_error(
+        lambda: ensure_expected_exporter_commit("a" * 40, "b" * 40),
+        "provenance self-test accepted a mismatched exporter commit",
+    )
+    output_staging_self_test()
     print("provenance self-test passed")
 
 
-def main() -> None:
+def output_staging_self_test() -> None:
+    with tempfile.TemporaryDirectory(prefix="arc-a1b-output-test.") as temp:
+        test_root = Path(temp)
+        exporter_root = test_root / "exporter"
+        exporter_root.mkdir()
+        exporter_root = exporter_root.resolve(strict=True)
+        inside_output = exporter_root / "fixtures"
+        expect_value_error(
+            lambda: resolve_final_output_path(inside_output, exporter_root),
+            "output self-test accepted a path inside the exporter",
+        )
+        if inside_output.exists():
+            raise AssertionError("output preflight created a rejected final path")
+
+        exporter_alias = test_root / "exporter-alias"
+        exporter_alias.symlink_to(exporter_root)
+        expect_value_error(
+            lambda: resolve_final_output_path(
+                exporter_alias / "fixtures", exporter_root
+            ),
+            "output self-test accepted a symlink into the exporter",
+        )
+
+        subprocess.run(
+            ["git", "-C", str(exporter_root), "init", "--quiet"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(exporter_root),
+                "-c",
+                "user.name=Arc fixture self-test",
+                "-c",
+                "user.email=arc-fixture-self-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "self-test",
+            ],
+            check=True,
+        )
+        expected_commit = git(exporter_root, "rev-parse", "HEAD")
+        output_parent = test_root / "outputs"
+        output_parent.mkdir()
+        final_output = output_parent / "fixtures"
+        staging = create_staging_output(final_output)
+        staging_path = Path(staging.name)
+        (staging_path / "manifest.json").write_text("{}")
+        (exporter_root / "dirty").write_text("dirty")
+        expect_value_error(
+            lambda: finalize_staged_output(
+                staging, final_output, exporter_root, expected_commit
+            ),
+            "output self-test accepted a dirty exporter",
+        )
+        if final_output.exists() or staging_path.exists():
+            raise AssertionError("failed output publication left files behind")
+
+        (exporter_root / "dirty").unlink()
+        staging = create_staging_output(final_output)
+        staging_path = Path(staging.name)
+        (staging_path / "manifest.json").write_text("{}")
+        control_output = test_root / "control-output"
+        control_output.mkdir()
+        finalize_staged_output(staging, final_output, exporter_root, expected_commit)
+        if not (final_output / "manifest.json").is_file() or staging_path.exists():
+            raise AssertionError("output self-test failed to publish staged output")
+        if (final_output.stat().st_mode & 0o777) != (
+            control_output.stat().st_mode & 0o777
+        ):
+            raise AssertionError("published output root does not honor the current umask")
+
+
+def capture_set_self_test() -> None:
+    with tempfile.TemporaryDirectory(prefix="arc-a1b-capture-set-test.") as temp:
+        capture_dir = Path(temp)
+        for name in EXPECTED_CAPTURE_ENTRIES:
+            (capture_dir / name).write_text("{}")
+        validate_capture_directory(capture_dir)
+
+        missing = capture_dir / "4-failed-create.json"
+        missing.unlink()
+        expect_value_error(
+            lambda: validate_capture_directory(capture_dir),
+            "capture-set self-test accepted a missing file",
+        )
+        missing.write_text("{}")
+
+        unexpected = capture_dir / "5-unexpected.json"
+        unexpected.write_text("{}")
+        expect_value_error(
+            lambda: validate_capture_directory(capture_dir),
+            "capture-set self-test accepted an extra file",
+        )
+        unexpected.unlink()
+
+        unexpected_directory = capture_dir / "unexpected-directory"
+        unexpected_directory.mkdir()
+        expect_value_error(
+            lambda: validate_capture_directory(capture_dir),
+            "capture-set self-test accepted an extra directory",
+        )
+        unexpected_directory.rmdir()
+
+        expected = capture_dir / "0-genesis.json"
+        expected.unlink()
+        expected.symlink_to(capture_dir / "capture-context.json")
+        expect_value_error(
+            lambda: validate_capture_directory(capture_dir),
+            "capture-set self-test accepted a symlink",
+        )
+        expected.unlink()
+        expected.mkdir()
+        expect_value_error(
+            lambda: validate_capture_directory(capture_dir),
+            "capture-set self-test accepted a directory",
+        )
+    print("capture-set self-test passed")
+
+
+def generate(staging_holder: list[tempfile.TemporaryDirectory]) -> None:
     args = parse_args()
+    exporter_root = args.exporter_worktree.resolve(strict=True)
     exporter_commit, release_commit, entrypoint_blob, exporter_changed_paths = (
-        validate_exporter_provenance(args.exporter_worktree)
+        validate_exporter_provenance(
+            exporter_root, args.expected_exporter_commit
+        )
     )
+    final_output = resolve_final_output_path(args.output_dir, exporter_root)
     if not args.capture_dir.is_dir():
         raise SystemExit(f"capture directory does not exist: {args.capture_dir}")
     if not args.verification_capture_dir.is_dir():
@@ -241,8 +486,8 @@ def main() -> None:
             "verification capture directory does not exist: "
             f"{args.verification_capture_dir}"
         )
-    if args.output_dir.exists():
-        raise SystemExit(f"output directory must not exist: {args.output_dir}")
+    validate_capture_directory(args.capture_dir)
+    validate_capture_directory(args.verification_capture_dir)
 
     format_reference_head = git(args.format_reference_worktree, "rev-parse", "HEAD")
     format_reference_tag = git(
@@ -271,9 +516,9 @@ def main() -> None:
                 f"format-reference source {source} is {actual_blob}, expected {expected_blob}"
             )
 
-    context = json.loads((args.capture_dir / "capture-context.json").read_text())
+    context = json.loads((args.capture_dir / CAPTURE_CONTEXT).read_text())
     verification_context = json.loads(
-        (args.verification_capture_dir / "capture-context.json").read_text()
+        (args.verification_capture_dir / CAPTURE_CONTEXT).read_text()
     )
     if context != verification_context:
         raise ValueError("independent captures used different chain context")
@@ -297,7 +542,13 @@ def main() -> None:
             }
         )
 
-    args.output_dir.mkdir(parents=True)
+    ensure_exporter_worktree_state(
+        exporter_root, args.expected_exporter_commit
+    )
+    final_output.parent.mkdir(parents=True, exist_ok=True)
+    staging = create_staging_output(final_output)
+    staging_holder.append(staging)
+    args.output_dir = Path(staging.name)
     files: list[dict[str, Any]] = []
     blocks: list[dict[str, Any]] = []
     previous_hash: str | None = None
@@ -397,6 +648,9 @@ def main() -> None:
     record(bundle_state_diff_path, "bundle0_index_and_state_diff_rlp")
 
     files.sort(key=lambda item: item["path"])
+    ensure_exporter_worktree_state(
+        exporter_root, args.expected_exporter_commit
+    )
     manifest = {
         "schema_version": 1,
         "producer_baseline": {
@@ -483,10 +737,26 @@ def main() -> None:
     }
     manifest_path = args.output_dir / "manifest.json"
     write_new(manifest_path, json_bytes(manifest, pretty=True))
+    finalize_staged_output(
+        staging, final_output, exporter_root, args.expected_exporter_commit
+    )
+
+
+def main() -> None:
+    staging_holder: list[tempfile.TemporaryDirectory] = []
+    try:
+        generate(staging_holder)
+    finally:
+        for staging in staging_holder:
+            staging.cleanup()
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test-provenance"]:
         provenance_self_test()
+    elif sys.argv[1:] == ["--self-test-capture-set"]:
+        capture_set_self_test()
+    elif sys.argv[1:2] == ["--preflight-output"]:
+        output_preflight_cli(sys.argv[2:])
     else:
         main()
