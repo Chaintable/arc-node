@@ -862,6 +862,16 @@ impl From<&alloy_genesis::Genesis> for BlockStorageDiff {
     }
 }
 
+/// Build a canonical bytes32 ID for a synthetic genesis transaction.
+///
+/// Layout: one-byte kind, eleven zero bytes, then the twenty-byte address.
+fn genesis_tx_id(kind: u8, address: Address) -> String {
+    let mut id = [0u8; 32];
+    id[0] = kind;
+    id[12..].copy_from_slice(address.as_slice());
+    H256::from(id).to_string()
+}
+
 /// Build synthetic genesis transactions and traces (balance transfers + code deploys).
 pub fn build_genesis_txs_and_traces(
     genesis: &alloy_genesis::Genesis,
@@ -880,10 +890,9 @@ pub fn build_genesis_txs_and_traces(
 
     for addr in sorted_addrs {
         let account = &genesis.alloc[addr];
-        let addr_lower = format!("{addr:?}").to_lowercase();
 
         if account.balance > U256::ZERO {
-            let tx_id = format!("0xgenesis01{:013}{}", 0, addr_lower);
+            let tx_id = genesis_tx_id(1, *addr);
             txs.push(DebankTransaction {
                 id: tx_id.clone(),
                 from: zero_addr,
@@ -910,7 +919,7 @@ pub fn build_genesis_txs_and_traces(
         if let Some(ref code) = account.code
             && !code.is_empty()
         {
-            let tx_id = format!("0xgenesis02{:013}{}", 0, addr_lower);
+            let tx_id = genesis_tx_id(2, *addr);
             txs.push(DebankTransaction {
                 id: tx_id.clone(),
                 from: zero_addr,
@@ -938,8 +947,7 @@ pub fn build_genesis_txs_and_traces(
     // Native token contract (0xeeee...eeee). Reuse the canonical constant
     // (D11: avoids production unwrap() of from_str at the same time).
     let native_addr = crate::erc20_handle::NATIVE_TOKEN_ADDRESS;
-    let native_addr_lower = format!("{native_addr:?}").to_lowercase();
-    let native_tx_id = format!("0xgenesis03{:013}{}", 0, native_addr_lower);
+    let native_tx_id = genesis_tx_id(3, native_addr);
     txs.push(DebankTransaction {
         id: native_tx_id.clone(),
         from: zero_addr,
@@ -969,6 +977,96 @@ mod tests {
         state::{Account, AccountInfo},
         DatabaseCommit,
     };
+
+    #[test]
+    fn genesis_synthetic_ids_are_canonical_bytes32_and_drive_validation() {
+        let balance_addr: Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let code_addr: Address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            .parse()
+            .unwrap();
+        let genesis = alloy_genesis::Genesis::default().extend_accounts([
+            (
+                balance_addr,
+                alloy_genesis::GenesisAccount::default().with_balance(U256::from(1)),
+            ),
+            (
+                code_addr,
+                alloy_genesis::GenesisAccount::default()
+                    .with_code(Some(Bytes::from_static(&[0x60, 0x00]))),
+            ),
+        ]);
+
+        let (transactions, traces) = build_genesis_txs_and_traces(&genesis);
+        let expected_ids = [
+            "0x0100000000000000000000000000000000000000000000000000000000000001",
+            "0x020000000000000000000000abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "0x030000000000000000000000eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        ];
+
+        assert_eq!(
+            transactions
+                .iter()
+                .map(|transaction| transaction.id.as_str())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        for transaction in &transactions {
+            assert_eq!(transaction.id.len(), 66);
+            assert!(transaction.id.parse::<H256>().is_ok());
+        }
+        for (trace, transaction) in traces.iter().zip(&transactions) {
+            assert_eq!(trace.tx_id, transaction.id);
+            assert_eq!(
+                trace.id,
+                DebankTrace::calculate_id(vec![&transaction.id, "", "0"])
+            );
+        }
+
+        let block_file = BlockFile {
+            block: DebankBlock {
+                id: H256::repeat_byte(0x11),
+                ..Default::default()
+            },
+            transactions,
+            traces,
+            ..Default::default()
+        };
+        assert_eq!(block_file.validation().validation_hash, 220_494);
+    }
+
+    #[test]
+    fn arc_mainnet_genesis_ids_and_validation_are_stable() {
+        let genesis: alloy_genesis::Genesis =
+            serde_json::from_str(include_str!("../../../assets/mainnet/genesis.json")).unwrap();
+        let (transactions, traces) = build_genesis_txs_and_traces(&genesis);
+
+        assert_eq!(transactions.len(), 273);
+        assert_eq!(traces.len(), 273);
+        assert!(transactions
+            .iter()
+            .all(|transaction| transaction.id.parse::<H256>().is_ok()));
+        assert!(traces
+            .iter()
+            .all(|trace| trace.tx_id.parse::<H256>().is_ok()));
+        assert!(transactions.iter().any(|transaction| {
+            transaction.id == "0x01000000000000000000000050a2b0b577ec24d7ce1aed372a8a6fd14ce1be57"
+        }));
+
+        let block_file = BlockFile {
+            block: DebankBlock {
+                id: "0x09944e07412986bb417fd0006c89ffb71ee523d68ce2017ec2dabc944c42edad"
+                    .parse()
+                    .unwrap(),
+                ..Default::default()
+            },
+            transactions,
+            traces,
+            ..Default::default()
+        };
+        assert_eq!(block_file.validation().validation_hash, 356_679);
+    }
 
     #[test]
     fn create_and_create2_use_the_protocol_create_type() {
