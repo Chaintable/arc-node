@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-writer_producer="1ff564adb44a54d5ddd7a31e60a4f64498650801"
+writer_producer="23d38e7d0cbf54e184faf3751c619f2169b3ed79"
 format_reference_release="v0.1.43"
 format_reference_commit="7c4e096bfbc132dcb79312e2371c80919b966a52"
 
