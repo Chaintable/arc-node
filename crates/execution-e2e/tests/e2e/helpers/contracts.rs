@@ -16,7 +16,7 @@
 
 //! Inline bytecode for minimal test contracts.
 
-use alloy_primitives::{keccak256, Address, Bytes};
+use alloy_primitives::{b256, keccak256, Address, Bytes, B256};
 use revm_bytecode::opcode::*;
 
 /// Contract with `receive() external payable {}` — accepts value, does nothing.
@@ -26,6 +26,20 @@ use revm_bytecode::opcode::*;
 /// ```
 pub fn payable_contract_deploy_code() -> Bytes {
     let runtime = [STOP];
+    deploy_code(&runtime)
+}
+
+/// Contract that returns the effective EVM caller as one ABI-sized word.
+pub fn caller_contract_deploy_code() -> Bytes {
+    #[rustfmt::skip]
+    let runtime = [
+        CALLER,
+        PUSH1, 0x00,
+        MSTORE,
+        PUSH1, 0x20,
+        PUSH1, 0x00,
+        RETURN,
+    ];
     deploy_code(&runtime)
 }
 
@@ -41,6 +55,35 @@ pub fn reverting_contract_deploy_code() -> Bytes {
     let runtime = [
         PUSH1, 0x00, // revert(0,
         PUSH1, 0x00, //   0)
+        REVERT,
+    ];
+    deploy_code(&runtime)
+}
+
+pub const REVERT_LOG_TOPIC: B256 =
+    b256!("1111111111111111111111111111111111111111111111111111111111111111");
+pub const REVERT_LOG_DATA: B256 =
+    b256!("2222222222222222222222222222222222222222222222222222222222222222");
+
+/// Contract that emits one LOG1 with a fixed topic and 32-byte data word, then reverts.
+pub fn log1_then_revert_contract_deploy_code() -> Bytes {
+    #[rustfmt::skip]
+    let runtime = [
+        PUSH32, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+                0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+                0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+                0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+        PUSH1, 0x00,
+        MSTORE,
+        PUSH32, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+                0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+                0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+                0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        PUSH1, 0x20,
+        PUSH1, 0x00,
+        LOG1,
+        PUSH1, 0x00,
+        PUSH1, 0x00,
         REVERT,
     ];
     deploy_code(&runtime)
@@ -75,13 +118,18 @@ pub fn reverting_constructor_code() -> Bytes {
 /// selfdestruct   ;; []            — send balance to addr and destroy
 /// ```
 pub fn selfdestruct_contract_deploy_code() -> Bytes {
+    deploy_code(&selfdestruct_contract_runtime_code())
+}
+
+/// Runtime bytecode installed by [`selfdestruct_contract_deploy_code`].
+pub fn selfdestruct_contract_runtime_code() -> Bytes {
     #[rustfmt::skip]
     let runtime = [
         PUSH1, 0x00, CALLDATALOAD, // calldataload(0) → 32-byte word
         PUSH1, 0x60, SHR,          // shr(96) → target address
         SELFDESTRUCT,               // selfdestruct(addr)
     ];
-    deploy_code(&runtime)
+    Bytes::copy_from_slice(&runtime)
 }
 
 /// Contract that warms a calldata target with BALANCE, then calls SELFDESTRUCT

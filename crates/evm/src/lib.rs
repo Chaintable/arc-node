@@ -36,4 +36,6 @@ pub mod subcall;
 mod subcall_test;
 
 // Re-export commonly used types
-pub use evm::{ArcEvm, ArcEvmConfig, ArcEvmFactory};
+pub use evm::{
+    ArcEvm, ArcEvmConfig, ArcEvmFactory, SubcallTraceCompletion, SubcallTraceCompletionPhase,
+};

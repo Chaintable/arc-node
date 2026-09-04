@@ -114,6 +114,7 @@ config             = { version = "0.14", features = ["toml"], default-features =
 criterion = "0.7"
 crunchy = "=0.2.2"
 csv = "1.4"
+debank-rpc = { version = "0.0.1", path = "crates/debank-rpc" }
 deranged = "0.5.5"
 directories        = "5.0.1"
 
