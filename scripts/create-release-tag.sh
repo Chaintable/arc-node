@@ -4,18 +4,15 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  create-release-tag.sh --source <ref> --release-kind patch|minor|major [--as-release-candidate] [--release-ref-prefix test-] [--base-branch main]
-  create-release-tag.sh --tag <existing tag> [--release-ref-prefix test-] [--base-branch main]
+  create-release-tag.sh --source <ref> --release-kind patch|minor|major [--as-release-candidate] [--release-domain domain] [--base-branch main]
+  create-release-tag.sh --tag <existing tag> [--release-domain domain] [--base-branch main]
 
 Environment:
   PUSH_TAG=false  Create the tag locally but do not push it to origin.
-  RELEASE_REF_PREFIX
-                  Namespace prefix used to derive release branches and tags.
-                  Empty derives release/ and v. test- derives test-release/
-                  and test-v.
-  TAG_PREFIX      Internal release tag prefix derived from RELEASE_REF_PREFIX.
+  RELEASE_DOMAIN  Optional release domain.
+  TAG_PREFIX      Internal release tag prefix.
   RELEASE_BRANCH_PREFIX
-                  Internal release branch prefix derived from RELEASE_REF_PREFIX.
+                  Internal release branch prefix.
   BASE_BRANCH=main
                   Base branch used for minor and major releases.
   MAIN_BRANCH     Deprecated alias for BASE_BRANCH.
@@ -38,7 +35,7 @@ CREATED_NEW_TAG=false
 CREATED_RELEASE_BRANCH=false
 RESOLVED_SOURCE_REF=""
 SOURCE_BRANCH=""
-RELEASE_REF_PREFIX="${RELEASE_REF_PREFIX:-}"
+RELEASE_DOMAIN="${RELEASE_DOMAIN:-}"
 BASE_BRANCH="${BASE_BRANCH:-${MAIN_BRANCH:-main}}"
 
 while [[ $# -gt 0 ]]; do
@@ -47,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     --release-kind) RELEASE_KIND="${2:?missing release kind}"; shift 2 ;;
     --tag) TAG="${2:?missing tag}"; shift 2 ;;
     --as-release-candidate) AS_RELEASE_CANDIDATE=true; shift ;;
-    --release-ref-prefix) RELEASE_REF_PREFIX="${2-}"; shift 2 ;;
+    --release-domain) RELEASE_DOMAIN="${2-}"; shift 2 ;;
     --base-branch) BASE_BRANCH="${2:?missing base branch}"; shift 2 ;;
     --main-branch) BASE_BRANCH="${2:?missing main branch}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -75,14 +72,18 @@ validate_namespace_ref() {
   fi
 }
 
-TAG_PREFIX="$(release_tag_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")"
-RELEASE_BRANCH_PREFIX="$(release_branch_prefix_from_ref_prefix "${RELEASE_REF_PREFIX}")"
-BASE_BRANCH="${BASE_BRANCH:-main}"
-
-if [[ -z "${TAG_PREFIX}" ]]; then
-  echo "tag prefix cannot be empty" >&2
+if ! release_validate_domain "${RELEASE_DOMAIN}"; then
+  echo "Invalid release domain: ${RELEASE_DOMAIN}" >&2
   exit 1
 fi
+TAG_PREFIX="v"
+if ! RELEASE_BRANCH_PREFIX="$(release_effective_branch_prefix "${RELEASE_DOMAIN}")"; then
+  echo "Invalid release domain: ${RELEASE_DOMAIN}" >&2
+  exit 1
+fi
+
+BASE_BRANCH="${BASE_BRANCH:-main}"
+
 if [[ -z "${RELEASE_BRANCH_PREFIX}" ]]; then
   echo "release branch prefix cannot be empty" >&2
   exit 1
@@ -91,7 +92,6 @@ if [[ -z "${BASE_BRANCH}" ]]; then
   echo "base branch cannot be empty" >&2
   exit 1
 fi
-validate_namespace_ref "tag prefix" "refs/tags/${TAG_PREFIX}0.0.0"
 validate_namespace_ref "release branch prefix" "refs/heads/${RELEASE_BRANCH_PREFIX}0.0"
 validate_namespace_ref "base branch" "refs/heads/${BASE_BRANCH}"
 
@@ -103,13 +103,12 @@ if ! git fetch origin '+refs/heads/*:refs/remotes/origin/*' --tags --prune >/dev
   echo "Warning: unable to fetch origin; continuing with local refs because ALLOW_STALE_RELEASE_REFS=true." >&2
 fi
 
+# TAG_PREFIX is "v" for every domain, so `git tag --list` globs below are
+# intentionally coarse (they can match other domains' tags); this is the sole
+# gate that keeps tag resolution scoped to RELEASE_DOMAIN.
 tag_version() {
   local tag="$1"
-  local prefix="${2:-${TAG_PREFIX}}"
-  if [[ "${tag:0:${#prefix}}" != "${prefix}" ]]; then
-    return 1
-  fi
-  printf '%s\n' "${tag:${#prefix}}"
+  release_tag_version_for_domain "${tag}" "${RELEASE_DOMAIN}"
 }
 
 validate_tag() {
@@ -121,15 +120,19 @@ validate_tag() {
 }
 
 format_final_tag() {
-  printf '%s%s.%s.%s\n' "${TAG_PREFIX}" "$1" "$2" "$3"
-}
-
-format_final_tag_with_prefix() {
-  printf '%s%s.%s.%s\n' "$1" "$2" "$3" "$4"
+  if [[ -z "${RELEASE_DOMAIN}" ]]; then
+    printf '%s%s.%s.%s\n' "${TAG_PREFIX}" "$1" "$2" "$3"
+  else
+    printf '%s%s.%s.%s-%s\n' "${TAG_PREFIX}" "$1" "$2" "$3" "${RELEASE_DOMAIN}"
+  fi
 }
 
 format_rc_tag() {
-  printf '%s%s.%s.%s-rc%s\n' "${TAG_PREFIX}" "$1" "$2" "$3" "$4"
+  if [[ -z "${RELEASE_DOMAIN}" ]]; then
+    printf '%s%s.%s.%s-rc%s\n' "${TAG_PREFIX}" "$1" "$2" "$3" "$4"
+  else
+    printf '%s%s.%s.%s-%s.rc%s\n' "${TAG_PREFIX}" "$1" "$2" "$3" "${RELEASE_DOMAIN}" "$4"
+  fi
 }
 
 release_line_from_branch() {
@@ -244,15 +247,14 @@ normalize_branch_name() {
 }
 
 latest_global_tag() {
-  local prefix="${1:-${TAG_PREFIX}}"
   local tag version final_tag
 
   while IFS= read -r tag; do
     [[ -z "${tag}" ]] && continue
 
-    version="$(tag_version "${tag}" "${prefix}")" || continue
+    version="$(tag_version "${tag}")" || continue
     if [[ "${version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rc[0-9]+$ ]]; then
-      final_tag="$(format_final_tag_with_prefix "${prefix}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")"
+      final_tag="$(format_final_tag "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")"
       if git rev-parse --verify --quiet "refs/tags/${final_tag}" >/dev/null; then
         continue
       fi
@@ -260,21 +262,20 @@ latest_global_tag() {
 
     echo "${tag}"
     return
-  done < <(git tag --list "${prefix}[0-9]*" --sort=-v:refname)
+  done < <(git tag --list "${TAG_PREFIX}[0-9]*" --sort=-v:refname)
 }
 
 latest_tag() {
   local source="$1"
   local tag_filter="$2"
-  local prefix="${3:-${TAG_PREFIX}}"
   local tag version final_tag final_sha
 
   while IFS= read -r tag; do
     [[ -z "${tag}" ]] && continue
 
-    version="$(tag_version "${tag}" "${prefix}")" || continue
+    version="$(tag_version "${tag}")" || continue
     if [[ "${version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rc[0-9]+$ ]]; then
-      final_tag="$(format_final_tag_with_prefix "${prefix}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")"
+      final_tag="$(format_final_tag "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")"
       if git rev-parse --verify --quiet "refs/tags/${final_tag}" >/dev/null; then
         final_sha="$(git rev-list -n1 "${final_tag}")"
         if git merge-base --is-ancestor "${final_sha}" "${source}"; then
@@ -291,8 +292,17 @@ latest_tag() {
 latest_matching_rc_tag() {
   local source="$1"
   local final_tag="$2"
+  local rc_separator="-"
+  local tag
 
-  git tag --merged "${source}" --list "${final_tag}-rc[0-9]*" --sort=-v:refname | head -n1
+  [[ -n "${RELEASE_DOMAIN}" ]] && rc_separator="."
+
+  while IFS= read -r tag; do
+    [[ -z "${tag}" ]] && continue
+    tag_version "${tag}" >/dev/null || continue
+    echo "${tag}"
+    return
+  done < <(git tag --merged "${source}" --list "${final_tag}${rc_separator}rc[0-9]*" --sort=-v:refname)
 }
 
 latest_final_tag_for_candidate() {
@@ -311,7 +321,7 @@ latest_final_tag_for_candidate() {
     tag_filter="${TAG_PREFIX}${major}.${minor}.*"
   fi
 
-  if tag="$(latest_final_tag_for_prefix "${candidate_tag}" "${tag_filter}" "${TAG_PREFIX}")"; then
+  if tag="$(latest_final_tag_for_prefix "${candidate_tag}" "${tag_filter}")"; then
     echo "${tag}"
     return
   fi
@@ -321,14 +331,13 @@ latest_final_tag_for_candidate() {
 latest_final_tag_for_prefix() {
   local candidate_tag="$1"
   local tag_filter="$2"
-  local prefix="$3"
   local tag version
 
   while IFS= read -r tag; do
     [[ -z "${tag}" ]] && continue
     [[ -n "${candidate_tag}" && "${tag}" == "${candidate_tag}" ]] && continue
 
-    version="$(tag_version "${tag}" "${prefix}")" || continue
+    version="$(tag_version "${tag}")" || continue
     if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "${tag}"
       return
@@ -387,7 +396,7 @@ next_tag() {
   latest="${latest:-${base_tag}}"
   latest_version="$(tag_version "${latest}")"
   latest_uses_release_prefix=false
-  if tag_version "${latest}" "${TAG_PREFIX}" >/dev/null 2>&1; then
+  if tag_version "${latest}" >/dev/null 2>&1; then
     latest_uses_release_prefix=true
   fi
 
@@ -632,7 +641,7 @@ SHORT_SHA="$(git rev-parse --short=8 "${SHA}")"
 VERSION="$(tag_version "${TAG}")"
 IS_RELEASE_CANDIDATE=false
 RELEASE_BRANCH=""
-if [[ "${TAG}" =~ -rc[0-9]+$ ]]; then
+if [[ "${VERSION}" =~ -rc[0-9]+$ ]]; then
   IS_RELEASE_CANDIDATE=true
 fi
 if [[ "${VERSION}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+(-rc[0-9]+)?$ ]]; then
@@ -654,6 +663,9 @@ elif git branch --contains "${SHA}" --format='%(refname:short)' 2>/dev/null | gr
 fi
 
 {
+  echo "release_domain=${RELEASE_DOMAIN}"
+  echo "tag_prefix=${TAG_PREFIX}"
+  echo "release_branch_prefix=${RELEASE_BRANCH_PREFIX}"
   echo "tag=${TAG}"
   echo "sha=${SHA}"
   echo "short_sha=${SHORT_SHA}"

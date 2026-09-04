@@ -33,7 +33,16 @@ use crate::metrics::AppMetrics;
 use crate::request::{AppRequest, CommitCertificateInfo};
 use crate::state::{State, StatusSnapshot};
 use crate::stats::Stats;
-use crate::store::Store;
+use crate::store::{RangeFailureReason, RangeQueryResult, Store};
+
+/// Returned by [`go`] when the consensus channel closes.
+///
+/// During a graceful shutdown the Node actor is stopped first, which closes this
+/// channel on purpose; outside of shutdown it means consensus stopped unexpectedly
+/// and the node should restart.
+#[derive(Debug, thiserror::Error)]
+#[error("Consensus channel closed unexpectedly")]
+struct ConsensusChannelClosed;
 
 pub async fn run(
     mut state: State,
@@ -41,6 +50,7 @@ pub async fn run(
     engine: Engine,
     rx_app_req: Receiver<AppRequest>,
     cancel_token: CancellationToken,
+    graceful_shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     if let Some(halt_height) = state.env_config().halt_height {
         warn!("Consensus configured to halt at block height: {halt_height}");
@@ -77,9 +87,20 @@ pub async fn run(
     let result = match result {
         Some(Ok(never)) => match never {},
         Some(Err(e)) => {
-            error!("🔴 Error in application: {e:#}");
-            error!("🔴 Shutting down");
-            Err(e)
+            // A closed consensus channel during a graceful shutdown means the Node
+            // actor was stopped first on purpose, so treat it as a clean exit. Any
+            // other error — or a closed channel outside of shutdown — is a genuine
+            // failure and must still surface so the node restarts.
+            if graceful_shutdown.is_cancelled()
+                && e.downcast_ref::<ConsensusChannelClosed>().is_some()
+            {
+                info!("🟢🟢 Application is shutting down gracefully");
+                Ok(())
+            } else {
+                error!("🔴 Error in application: {e:#}");
+                error!("🔴 Shutting down");
+                Err(e)
+            }
         }
         None => {
             info!("🟢🟢 Application is shutting down gracefully");
@@ -170,7 +191,7 @@ async fn go(
                     });
                 },
                 None => {
-                    return Err(eyre!("Consensus channel closed unexpectedly"));
+                    return Err(ConsensusChannelClosed.into());
                 }
             },
 
@@ -447,6 +468,78 @@ async fn handle_app_request(req: AppRequest, ctx: &AppRequestContext) -> eyre::R
             }
         }
 
+        AppRequest::GetCertificateRange(range, reply) => {
+            let result = ctx
+                .store
+                .get_certificate_range(range.from, range.count)
+                .await
+                .wrap_err_with(|| {
+                    format!("GetCertificateRange: Failed to get certificates for {range:?}")
+                })?;
+
+            let info = match result {
+                None => None,
+                Some(RangeQueryResult::Unavailable {
+                    reason,
+                    failed_heights,
+                }) => Some(RangeQueryResult::Unavailable {
+                    reason,
+                    failed_heights,
+                }),
+                Some(RangeQueryResult::Complete(certs)) => Some(
+                    get_certificates_info(ctx.proposer_selector, &ctx.engine, &ctx.metrics, certs)
+                        .await,
+                ),
+            };
+
+            if let Err(e) = reply.send(info) {
+                error!("GetCertificateRange: Failed to reply: {e:?}");
+            }
+        }
+
+        AppRequest::GetMisbehaviorEvidenceRange(range, reply) => {
+            let evidence = ctx
+                .store
+                .get_misbehavior_evidence_range(range.from, range.count)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "GetMisbehaviorEvidenceRange: Failed to get misbehavior evidence for {range:?}"
+                    )
+                })?;
+            if let Err(e) = reply.send(evidence) {
+                error!("GetMisbehaviorEvidenceRange: Failed to reply: {e:?}");
+            }
+        }
+
+        AppRequest::GetProposalMonitorDataRange(range, reply) => {
+            let data = ctx
+                .store
+                .get_proposal_monitor_data_range(range.from, range.count)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "GetProposalMonitorDataRange: Failed to get proposal monitor data for {range:?}"
+                    )
+                })?;
+            if let Err(e) = reply.send(data) {
+                error!("GetProposalMonitorDataRange: Failed to reply: {e:?}");
+            }
+        }
+
+        AppRequest::GetInvalidPayloadsRange(range, reply) => {
+            let payloads = ctx
+                .store
+                .get_invalid_payloads_range(range.from, range.count)
+                .await
+                .wrap_err_with(|| {
+                    format!("GetInvalidPayloadsRange: Failed to get invalid payloads for {range:?}")
+                })?;
+            if let Err(e) = reply.send(payloads) {
+                error!("GetInvalidPayloadsRange: Failed to reply: {e:?}");
+            }
+        }
+
         AppRequest::GetStatus(reply) => {
             let snapshot = ctx.status_rx.borrow().clone();
             let status = snapshot
@@ -490,15 +583,12 @@ async fn get_certificate_info(
         });
     }
 
-    // The validator set that signed the certificate is the one *before* executing that block,
-    // since the block itself could contain validator set changes.
-    let prev_height = stored.certificate.height.as_u64().saturating_sub(1);
     let validator_set = {
         let _guard =
-            metrics.start_engine_api_timer("get_certificate_info.get_active_validator_set");
+            metrics.start_engine_api_timer("get_certificate_info.get_signing_validator_set");
         engine
             .eth
-            .get_active_validator_set(prev_height)
+            .get_signing_validator_set(stored.certificate.height.as_u64())
             .await
             .ok()?
     };
@@ -516,6 +606,42 @@ async fn get_certificate_info(
         certificate_type: stored.certificate_type,
         proposer,
     })
+}
+
+/// Resolve proposers for a complete range of stored certificates.
+///
+/// Reuses [`get_certificate_info`], so the validator-set lookup only runs
+/// for legacy rows without a stored proposer. Heights whose lookup fails
+/// become an `Internal` range failure.
+async fn get_certificates_info(
+    proposer_selector: impl ProposerSelector + Copy,
+    engine: &Engine,
+    metrics: &AppMetrics,
+    certs: Vec<StoredCommitCertificate>,
+) -> RangeQueryResult<CommitCertificateInfo> {
+    let mut infos = Vec::with_capacity(certs.len());
+    let mut failed_heights = Vec::new();
+
+    // TODO(perf): if ranging over legacy (proposer == None) rows becomes a
+    // bottleneck, batch these eth_call valset lookups like get_execution_payloads.
+    // Only reachable for pre-migration rows on an archive EL; bounded by the
+    // MAX_RANGE_COUNT constant.
+    for stored in certs {
+        let height = stored.certificate.height;
+        match get_certificate_info(proposer_selector, engine, metrics, stored).await {
+            Some(info) => infos.push(info),
+            None => failed_heights.push(height),
+        }
+    }
+
+    if failed_heights.is_empty() {
+        RangeQueryResult::Complete(infos)
+    } else {
+        RangeQueryResult::Unavailable {
+            reason: RangeFailureReason::Internal,
+            failed_heights,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -574,10 +700,10 @@ mod tests {
         assert_eq!(info.certificate.height, Height::new(42));
     }
 
-    /// get_certificate_info must fetch the validator set at `certificate.height - 1` — the
-    /// set that signed the certificate, i.e. the state *before* executing the certified block.
+    /// get_certificate_info passes the certificate's consensus height directly;
+    /// the EthereumAPI impl is responsible for querying at `consensus_height - 1`.
     #[tokio::test]
-    async fn get_certificate_info_queries_validator_set_at_prev_height_when_proposer_is_missing() {
+    async fn get_certificate_info_queries_signing_validator_set_when_proposer_is_missing() {
         let cert_height = 42u64;
         let fallback_validator_set = validator_set();
         let expected_proposer = fallback_validator_set
@@ -587,8 +713,8 @@ mod tests {
 
         let mut mock_eth = MockEthereumAPI::new();
         mock_eth
-            .expect_get_active_validator_set()
-            .with(eq(cert_height - 1))
+            .expect_get_signing_validator_set()
+            .with(eq(cert_height))
             .once()
             .returning(move |_| Ok(fallback_validator_set.clone()));
 
@@ -609,20 +735,53 @@ mod tests {
         assert_eq!(info.proposer, expected_proposer);
     }
 
-    /// At the first certificate height, the previous-height validator-set lookup
-    /// must query height 0.
     #[tokio::test]
-    async fn get_certificate_info_queries_validator_set_at_zero_for_first_certificate_height() {
+    async fn get_certificates_info_skips_engine_when_proposers_are_stored() {
+        let proposer = Address::new([0x42; 20]);
+        // No mock expectations: any engine call would panic.
+        let engine = Engine::new(
+            Box::new(MockEngineAPI::new()),
+            Box::new(MockEthereumAPI::new()),
+        );
+        let metrics = AppMetrics::default();
+        let ctx = ArcContext::default();
+
+        let result = get_certificates_info(
+            ctx.proposer_selector,
+            &engine,
+            &metrics,
+            vec![
+                stored_cert(1, Some(proposer)),
+                stored_cert(2, Some(proposer)),
+                stored_cert(3, Some(proposer)),
+            ],
+        )
+        .await;
+
+        let RangeQueryResult::Complete(infos) = result else {
+            panic!("expected complete range");
+        };
+        let heights: Vec<u64> = infos
+            .iter()
+            .map(|i| i.certificate.height.as_u64())
+            .collect();
+        assert_eq!(heights, vec![1, 2, 3]);
+        assert!(infos.iter().all(|i| i.proposer == proposer));
+    }
+
+    #[tokio::test]
+    async fn get_certificates_info_resolves_legacy_rows_via_validator_set() {
+        let stored_proposer = Address::new([0x42; 20]);
         let fallback_validator_set = validator_set();
-        let expected_proposer = fallback_validator_set
+        let expected_fallback = fallback_validator_set
             .get_by_index(0)
             .expect("test validator set is non-empty")
             .address;
 
         let mut mock_eth = MockEthereumAPI::new();
         mock_eth
-            .expect_get_active_validator_set()
-            .with(eq(0u64))
+            .expect_get_signing_validator_set()
+            .with(eq(2u64))
             .once()
             .returning(move |_| Ok(fallback_validator_set.clone()));
 
@@ -630,16 +789,53 @@ mod tests {
         let metrics = AppMetrics::default();
         let ctx = ArcContext::default();
 
-        let info = get_certificate_info(
+        let result = get_certificates_info(
             ctx.proposer_selector,
             &engine,
             &metrics,
-            stored_cert(1, None),
+            vec![stored_cert(1, Some(stored_proposer)), stored_cert(2, None)],
         )
-        .await
-        .expect("should return Some");
+        .await;
 
-        assert_eq!(info.certificate.height, Height::new(1));
-        assert_eq!(info.proposer, expected_proposer);
+        let RangeQueryResult::Complete(infos) = result else {
+            panic!("expected complete range");
+        };
+        assert_eq!(infos[0].proposer, stored_proposer);
+        assert_eq!(infos[1].proposer, expected_fallback);
+    }
+
+    #[tokio::test]
+    async fn get_certificates_info_reports_failed_lookups_as_internal() {
+        let mut mock_eth = MockEthereumAPI::new();
+        mock_eth
+            .expect_get_signing_validator_set()
+            .with(eq(2u64))
+            .once()
+            .returning(|_| Err(eyre!("validator set unavailable")));
+
+        let engine = Engine::new(Box::new(MockEngineAPI::new()), Box::new(mock_eth));
+        let metrics = AppMetrics::default();
+        let ctx = ArcContext::default();
+
+        let result = get_certificates_info(
+            ctx.proposer_selector,
+            &engine,
+            &metrics,
+            vec![
+                stored_cert(1, Some(Address::new([0x42; 20]))),
+                stored_cert(2, None),
+            ],
+        )
+        .await;
+
+        let RangeQueryResult::Unavailable {
+            reason,
+            failed_heights,
+        } = result
+        else {
+            panic!("expected unavailable range");
+        };
+        assert_eq!(reason, RangeFailureReason::Internal);
+        assert_eq!(failed_heights, vec![Height::new(2)]);
     }
 }

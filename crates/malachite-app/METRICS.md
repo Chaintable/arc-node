@@ -106,6 +106,10 @@ This application exposes Prometheus metrics on the `/metrics` endpoint. The foll
   - **Labels:**
     - `proposer`: Address of the validator that was proposer for the missed round.
 
+- **`arc_malachite_app_clock_skew_nil_vote_count`** (Counter)
+  - **Description:** Number of vote-time nil-downgrade decisions taken because the proposer's header timestamp was more than 30 seconds ahead of local time, counted just before the value is handed to consensus. In rare cases the resulting prevote is not actually sent — the undecided-block store fails, or consensus drops the value at its per-(height, round) cap — so this is a near-upper bound on skew nil-prevotes rather than an exact tally. The block's persisted (execution-only) validity is untouched, so a value that later carries a commit certificate is still adopted via sync. It is zero in healthy operation; a rising count points at clock skew on this node or the proposer.
+  - **Labels:**
+    - `path`: Which path saw the proposal — `received_proposal_part` (live arrival) or `started_round` (buffered/early-arrival re-offered at round start).
 - **`arc_malachite_app_sync_fell_behind_count`** (Counter)
   - **Description:** Number of times the node fell behind and transitioned from InSync to CatchingUp.
 
