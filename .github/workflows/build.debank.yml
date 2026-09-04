@@ -1,0 +1,172 @@
+name: Build artifacts (DeBank)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches:
+      - debank
+      - sync/upstream-v0.8.0
+  release:
+    types:
+      - created
+  workflow_dispatch:
+
+concurrency:
+  group: debank-image-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  REGISTRY: 294354037686.dkr.ecr.ap-northeast-1.amazonaws.com
+  IMAGE: blockchain/arc-x
+  BAKE_TARGET: arc-execution
+
+jobs:
+  build-artifacts:
+    name: Build ${{ matrix.arch }}
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: [self-hosted, "${{ matrix.arch }}"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve image metadata
+        id: vars
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          if [[ "$SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Checkout SHA $SHA does not match event SHA $EXPECTED_SHA"
+            exit 1
+          fi
+          SHORT_HASH="${SHA::8}"
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            REVISION="$RELEASE_TAG"
+          else
+            REVISION="${SHA::7}"
+          fi
+          {
+            echo "full_hash=$SHA"
+            echo "short_hash=$SHORT_HASH"
+            echo "git_version=$(git describe --tags --always --dirty)"
+            echo "revision=$REVISION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "294354037686"
+          force-skip-oidc: true
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        with:
+          registries: "294354037686"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build and push image
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9 # v7.3.0
+        with:
+          source: .
+          files: docker-bake.hcl
+          targets: ${{ env.BAKE_TARGET }}
+          set: |
+            ${{ env.BAKE_TARGET }}.platform=linux/${{ matrix.arch }}
+            ${{ env.BAKE_TARGET }}.tags=${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.arch }}-${{ steps.vars.outputs.revision }}
+            ${{ env.BAKE_TARGET }}.output=type=registry
+        env:
+          BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+          CI: "true"
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_COMMIT_HASH: ${{ steps.vars.outputs.full_hash }}
+          GIT_VERSION: ${{ steps.vars.outputs.git_version }}
+          GIT_SHORT_HASH: ${{ steps.vars.outputs.short_hash }}
+
+      - name: Verify image version
+        env:
+          EXPECTED_SHA: ${{ steps.vars.outputs.full_hash }}
+          REVISION: ${{ steps.vars.outputs.revision }}
+        run: |
+          IMAGE_REF="${REGISTRY}/${IMAGE}:${{ matrix.arch }}-${REVISION}"
+          VERSION_OUTPUT="$(docker run --rm --pull=always --platform "linux/${{ matrix.arch }}" "$IMAGE_REF" --version)"
+          printf '%s\n' "$VERSION_OUTPUT"
+          if ! printf '%s\n' "$VERSION_OUTPUT" | grep -Fqx "Commit SHA: $EXPECTED_SHA"; then
+            echo "::error::Image commit does not match checkout: expected $EXPECTED_SHA"
+            exit 1
+          fi
+
+  merge-docker-manifest:
+    name: Merge multi-arch manifest
+    runs-on: [self-hosted, general]
+    needs: build-artifacts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve image metadata
+        id: vars
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          if [[ "$SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Checkout SHA $SHA does not match event SHA $EXPECTED_SHA"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            REVISION="$RELEASE_TAG"
+          else
+            REVISION="${SHA::7}"
+          fi
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "294354037686"
+          force-skip-oidc: true
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        with:
+          registries: "294354037686"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Create and inspect manifest
+        env:
+          REVISION: ${{ steps.vars.outputs.revision }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${REGISTRY}/${IMAGE}:${REVISION}" \
+            "${REGISTRY}/${IMAGE}:amd64-${REVISION}" \
+            "${REGISTRY}/${IMAGE}:arm64-${REVISION}"
+          docker buildx imagetools inspect "${REGISTRY}/${IMAGE}:${REVISION}"
