@@ -18,6 +18,7 @@
 
 use std::collections::HashSet;
 
+use alloy_consensus::constants::EMPTY_ROOT_HASH;
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, U256};
 use arc_execution_e2e::ArcTestNode;
@@ -55,17 +56,24 @@ pub async fn trace_debank_block(
         state_diff.hash == output.header.state_root,
         "StateDiff root does not match the block header"
     );
-    let parent: Option<alloy_rpc_types_eth::Block> = client
-        .request(
-            "eth_getBlockByHash",
-            rpc_params![output.block_file.block.parent_id, false],
-        )
-        .await?;
-    let parent = parent.ok_or_else(|| eyre::eyre!("parent block is unavailable"))?;
-    ensure!(
-        state_diff.parent_hash == parent.header.state_root,
-        "StateDiff parent root does not match the parent block header"
-    );
+    if block_number == 0 {
+        ensure!(
+            state_diff.parent_hash == EMPTY_ROOT_HASH,
+            "genesis StateDiff parent root is not the empty root"
+        );
+    } else {
+        let parent: Option<alloy_rpc_types_eth::Block> = client
+            .request(
+                "eth_getBlockByHash",
+                rpc_params![output.block_file.block.parent_id, false],
+            )
+            .await?;
+        let parent = parent.ok_or_else(|| eyre::eyre!("parent block is unavailable"))?;
+        ensure!(
+            state_diff.parent_hash == parent.header.state_root,
+            "StateDiff parent root does not match the parent block header"
+        );
+    }
     ensure!(
         output.validation_hash == output.block_file.validation().validation_hash,
         "BlockFile validation hash mismatch"

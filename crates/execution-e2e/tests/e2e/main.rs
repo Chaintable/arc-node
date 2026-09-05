@@ -22,6 +22,7 @@ mod block_hash_history;
 mod block_production;
 mod debank_eip7702;
 mod debank_precompiles;
+mod debank_query_rpc;
 mod debank_system_contracts;
 mod debank_trace;
 mod debank_trace_edge_cases;
