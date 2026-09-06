@@ -45,12 +45,16 @@ pub fn eth_erc20_handle<DB: DatabaseRef>(state: &DB, input: Option<&[u8]>) -> Si
             let mut addr_bytes = [0u8; 20];
             addr_bytes.copy_from_slice(&data[16..36]);
             let user_addr = Address::from(addr_bytes);
-            let balance = state
-                .basic_ref(user_addr)
-                .ok()
-                .flatten()
-                .map(|acc| acc.balance)
-                .unwrap_or_default();
+            let balance = match state.basic_ref(user_addr) {
+                Ok(account) => account.map(|acc| acc.balance).unwrap_or_default(),
+                Err(error) => {
+                    return SingleCallResult {
+                        code: MultiCallErrorCode::NativeMethodStateError as i32,
+                        err: format!("native balance read failed: {error}"),
+                        ..Default::default()
+                    }
+                }
+            };
             SingleCallResult {
                 code: MultiCallErrorCode::Success as i32,
                 err: String::new(),

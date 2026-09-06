@@ -44,6 +44,38 @@ pub(crate) struct CapturedEvents {
 }
 
 impl CapturedEvents {
+    /// Restore logical child results before building parity traces.
+    pub fn apply_subcall_completions(
+        &self,
+        inspector: &mut TracingInspector,
+    ) -> Result<(), String> {
+        let nodes = inspector.traces_mut().nodes_mut();
+        self.validate(nodes.len())?;
+        for (index, (node, frame)) in nodes.iter_mut().zip(&self.frames).enumerate() {
+            if node.idx != index || node.trace.success != frame.success {
+                return Err(format!(
+                    "trace and event inspectors disagree on frame {index}"
+                ));
+            }
+            let Some(completion) = frame.subcall_completion() else {
+                continue;
+            };
+            let status = if !completion.child_status.is_ok() {
+                completion.child_status
+            } else if !completion.final_status.is_ok() {
+                completion.final_status
+            } else {
+                completion.child_status
+            };
+            node.trace.output = completion.child_output.clone();
+            node.trace.gas_used = completion.child_gas_used;
+            node.trace.gas_limit = completion.child_gas_limit;
+            node.trace.success = status.is_ok();
+            node.trace.status = Some(status);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, expected_frames: usize) -> Result<(), String> {
         if !self.valid {
             return Err("event inspector observed an invalid frame stack".to_string());
@@ -1257,6 +1289,22 @@ mod tests {
                     valid: true,
                 };
 
+                let mut inspector = TracingInspector::new(Default::default());
+                *inspector.traces_mut() = arena.clone();
+                captured.apply_subcall_completions(&mut inspector).unwrap();
+                let trace = &inspector.traces().nodes()[0].trace;
+                assert!(!trace.success);
+                assert_eq!(
+                    trace.status,
+                    Some(if child_status.is_ok() {
+                        final_status
+                    } else {
+                        child_status
+                    })
+                );
+                assert_eq!(trace.output.as_ref(), b"raw child output");
+                assert_eq!((trace.gas_used, trace.gas_limit), (7, 11));
+
                 let (traces, error_traces, events, error_events) = build_debank_traces(
                     B256::repeat_byte(0xaa),
                     arena,
@@ -1311,6 +1359,15 @@ mod tests {
                 events: vec![],
                 valid: true,
             };
+
+            let mut inspector = TracingInspector::new(Default::default());
+            *inspector.traces_mut() = arena.clone();
+            captured.apply_subcall_completions(&mut inspector).unwrap();
+            let trace = &inspector.traces().nodes()[0].trace;
+            assert!(trace.success);
+            assert_eq!(trace.status, Some(InstructionResult::Stop));
+            assert_eq!(trace.output.as_ref(), b"raw child output");
+            assert_eq!((trace.gas_used, trace.gas_limit), (7, 11));
 
             let (traces, error_traces, events, error_events) = build_debank_traces(
                 B256::repeat_byte(0xaa),

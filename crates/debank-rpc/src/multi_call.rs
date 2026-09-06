@@ -35,7 +35,7 @@ where
         fast_fail: Option<bool>,
         _use_parallel: Option<bool>,
         disable_cache: Option<bool>,
-        mut state_overrides: Option<StateOverride>,
+        state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> Result<MultiCallResp, Eth::Error> {
         use alloy_rpc_types_eth::state::EvmOverrides;
@@ -60,6 +60,11 @@ where
 
         self.eth_api
             .spawn_with_state_at_block(target_block, move |eth_api, mut db| {
+                // Apply overrides before either native-token or ordinary EVM calls.
+                if let Some(overrides) = state_overrides {
+                    alloy_evm::overrides::apply_state_overrides(overrides, &mut db)
+                        .map_err(EthApiError::from_state_overrides_err)?;
+                }
                 let mut result_response: Vec<SingleCallResult> = Vec::with_capacity(requests.len());
 
                 for request in requests {
@@ -93,8 +98,7 @@ where
                     }
 
                     // Regular EVM call
-                    let overrides =
-                        EvmOverrides::new(state_overrides.take(), block_overrides.clone());
+                    let overrides = EvmOverrides::new(None, block_overrides.clone());
                     let (current_evm_env, prepared_tx) =
                         eth_api.prepare_call_env(evm_env.clone(), request, &mut db, overrides)?;
 

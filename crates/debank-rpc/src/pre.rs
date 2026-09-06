@@ -2,16 +2,18 @@ use alloy_consensus::BlockHeader;
 use alloy_eips::BlockId;
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides, Log, TransactionInfo};
+use arc_evm::ArcEvmConfig;
 use jsonrpsee::core::RpcResult;
-use reth_evm::EvmEnvFor;
+use reth_evm::{ConfigureEvm, Evm, EvmEnvFor};
 use reth_rpc_eth_api::{
     helpers::{EthTransactions, TraceExt},
-    EthApiTypes, RpcTxReq,
+    EthApiTypes, RpcNodeCore, RpcTxReq,
 };
 use reth_rpc_eth_types::{EthApiError, StateCacheDb};
 use revm::{context::result::ResultAndState, DatabaseCommit};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
+use crate::event_inspector::{record_subcall_trace_completion, ArcEventInspector};
 use crate::types::{PreError, PreErrorCode, PreResult};
 
 /// `pre` namespace API implementation.
@@ -29,7 +31,7 @@ impl<Eth> PreApi<Eth> {
 
 impl<Eth> PreApi<Eth>
 where
-    Eth: EthApiTypes + TraceExt + 'static,
+    Eth: RpcNodeCore<Evm = ArcEvmConfig> + EthApiTypes + TraceExt + 'static,
 {
     /// Execute a single transaction with tracing, committing state changes to the db.
     fn trace_transaction(
@@ -41,16 +43,29 @@ where
         block_timestamp: u64,
     ) -> PreResult {
         let result: Result<PreResult, PreError> = (|| {
-            let mut inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-
-            // Execute with inspector, then commit state changes so subsequent txs see effects.
-            let ResultAndState { result, state } = self
+            let inspector = (
+                TracingInspector::new(TracingInspectorConfig::default_parity()),
+                ArcEventInspector::default(),
+            );
+            let mut evm = self
                 .eth_api
-                .inspect(&mut *db, evm_env, tx_env, &mut inspector)
-                .map_err(|e| PreError {
+                .evm_config()
+                .evm_with_env_and_inspector(&mut *db, evm_env, inspector);
+            evm.set_subcall_trace_completion_hook(record_subcall_trace_completion);
+            let ResultAndState { result, state } = evm.transact(tx_env).map_err(|e| PreError {
+                code: PreErrorCode::UnKnown as i64,
+                msg: e.to_string(),
+            })?;
+            let (mut inspector, events) = std::mem::take(evm.inspector_mut());
+            drop(evm);
+            events
+                .into_captured()
+                .apply_subcall_completions(&mut inspector)
+                .map_err(|msg| PreError {
                     code: PreErrorCode::UnKnown as i64,
-                    msg: e.to_string(),
+                    msg,
                 })?;
+            // Commit state changes so subsequent transactions see their effects.
             db.commit(state);
             let gas_used = result.tx_gas_used();
 
@@ -163,7 +178,7 @@ where
 #[async_trait::async_trait]
 impl<Eth> crate::DebankPreApiServer<RpcTxReq<Eth::NetworkTypes>> for PreApi<Eth>
 where
-    Eth: EthApiTypes + EthTransactions + TraceExt + 'static,
+    Eth: RpcNodeCore<Evm = ArcEvmConfig> + EthApiTypes + EthTransactions + TraceExt + 'static,
 {
     async fn trace_many(
         &self,

@@ -19,6 +19,7 @@ jsonrpsee = { workspace = true, features = ["server", "macros"] }
 
 # Alloy
 alloy-consensus = { workspace = true }
+alloy-evm = { workspace = true }
 alloy-eips = { workspace = true }
 alloy-genesis = { workspace = true }
 alloy-network = { workspace = true }
