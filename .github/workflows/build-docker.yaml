@@ -30,9 +30,10 @@ env:
 jobs:
   build:
     if: >-
+      github.repository == 'circlefin/arc-node' && (
       github.event_name == 'workflow_call' ||
       github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'build-docker')
+      contains(github.event.pull_request.labels.*.name, 'build-docker'))
     name: Build ${{ matrix.image }} (${{ matrix.platform }})
     permissions:
       contents: read

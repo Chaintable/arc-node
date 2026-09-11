@@ -19,6 +19,7 @@ jobs:
   validate-release-pr:
     name: Validate release metadata
     if: >-
+      github.repository == 'circlefin/arc-node' &&
       github.event.action != 'closed' &&
       contains(github.event.pull_request.labels.*.name, 'release') &&
       github.event.pull_request.head.repo.full_name == github.repository &&
@@ -44,6 +45,7 @@ jobs:
   finalize-release:
     name: Create release branch and tag
     if: >-
+      github.repository == 'circlefin/arc-node' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       contains(github.event.pull_request.labels.*.name, 'release') &&
