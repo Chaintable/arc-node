@@ -33,7 +33,14 @@ import { buildProtocolConfigGenesisAllocs, schemaProtocolConfig } from './Protoc
 import { BuilderContext } from './context'
 import { Address, fromHex, Hex, toHex } from 'viem'
 import { buildValidatorManagerGenesisAllocs, schemaValidatorManager } from './ValidatorManager'
-import { memoAddress, multicall3FromAddress, nativeCoinAutorityAddress, nativeCoinControlAddress } from './addresses'
+import {
+  gasGuzzlerAddress,
+  memoAddress,
+  multicall3FromAddress,
+  nativeCoinAutorityAddress,
+  nativeCoinControlAddress,
+  testTokenAddress,
+} from './addresses'
 
 const emptyPrecompileStart = 0x1800000000000000000000000000000000000002n
 const emptyPrecompileEnd = 0x18000000000000000000000000000000000000ffn
@@ -204,15 +211,11 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
     }
   }
 
-  // Add GasGuzzler test contract if enabled.
+  // Add GasGuzzler test contract if enabled. Pinned to the canonical gasGuzzlerAddress
+  // (like Memo/Multicall3From) so it stays in sync with consumers that hardcode it
+  // (spammer, addresses.ts) regardless of bytecode/toolchain drift.
   if (gasGuzzlerEnabled === true) {
-    const [address, alloc] = buildAccountAlloc({
-      address: await ctx.contractLoader.getDeterministicAddress('GasGuzzler'),
-      balance: 0n,
-      nonce: 1n,
-      code: await ctx.contractLoader.getCode('GasGuzzler'),
-    })
-    insert([address, alloc])
+    insert(await buildImplContractAlloc(ctx, 'GasGuzzler', { address: gasGuzzlerAddress }))
   }
 
   // Add Memo contract if enabled.
@@ -226,8 +229,9 @@ export const buildGenesis = async (ctx: BuilderContext, config: GenesisConfig) =
   }
 
   // Add TestToken ERC-20 contract if enabled. Prefund accounts receive token balances.
+  // Pinned to the canonical testTokenAddress (like GasGuzzler) so it stays in sync with
+  // consumers that hardcode it (spammer), regardless of bytecode/toolchain drift.
   if (testTokenEnabled === true) {
-    const testTokenAddress = await ctx.contractLoader.getDeterministicAddress('TestToken')
     const testTokenCode = await ctx.contractLoader.getCode('TestToken')
     const prefundAddresses = prefund?.map((p) => p.address) ?? []
     const balancePerAccount = 1_000_000n * 10n ** 18n // 1M tokens

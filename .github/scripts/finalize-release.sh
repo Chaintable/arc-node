@@ -102,18 +102,6 @@ parse_release_metadata() {
 
   TAG="$(extract_body_field "Release tag")" || die "PR body is missing 'Release tag: ...'"
   RELEASE_BRANCH="$(extract_body_field "Release branch")" || die "PR body is missing 'Release branch: ...'"
-  RELEASE_KIND="$(extract_body_field "Release kind" || true)"
-  RELEASE_KIND="${RELEASE_KIND:-patch}"
-  # Trim leading/trailing whitespace and lowercase (field may be hand-edited in the PR body).
-  # Only outer whitespace is stripped, not internal, so a typo like "min or" still fails loudly.
-  RELEASE_KIND="${RELEASE_KIND#"${RELEASE_KIND%%[![:space:]]*}"}"
-  RELEASE_KIND="${RELEASE_KIND%"${RELEASE_KIND##*[![:space:]]}"}"
-  RELEASE_KIND="$(tr '[:upper:]' '[:lower:]' <<< "${RELEASE_KIND}")"
-
-  case "${RELEASE_KIND}" in
-    patch|minor|major) ;;
-    *) die "Invalid Release kind: ${RELEASE_KIND}" ;;
-  esac
 
   VERSION="$(tag_version)" || die "Release tags must start with ${TAG_PREFIX}: ${TAG}"
   [[ "${RELEASE_BRANCH}" == "${RELEASE_BRANCH_PREFIX}"* ]] || die "Release branches must start with ${RELEASE_BRANCH_PREFIX}: ${RELEASE_BRANCH}"
@@ -132,23 +120,23 @@ parse_release_metadata() {
   EXPECTED_RELEASE_BRANCH="${RELEASE_BRANCH_PREFIX}${MAJOR}.${MINOR}"
   [[ "${RELEASE_BRANCH}" == "${EXPECTED_RELEASE_BRANCH}" ]] || die "Release branch must be ${EXPECTED_RELEASE_BRANCH}, got ${RELEASE_BRANCH}"
 
-  EFFECTIVE_RELEASE_KIND="${RELEASE_KIND}"
-  if [[ "${RELEASE_KIND}" == "patch" && "${PATCH}" == "0" ]]; then
+  # Release kind is derived from the tag itself, not a caller-supplied PR body field: a label
+  # can drift out of sync with the tag it's supposed to describe (see the public-release-handoff
+  # fix on the private side, which hit this for a mismatched release_kind input).
+  if [[ "${PATCH}" != "0" ]]; then
+    EFFECTIVE_RELEASE_KIND="patch"
+  elif [[ "${MINOR}" == "0" ]]; then
+    EFFECTIVE_RELEASE_KIND="major"
+  else
     EFFECTIVE_RELEASE_KIND="minor"
-    note "Release kind promoted from patch to minor for ${TAG} (PATCH=0 means first release on a new branch)"
   fi
 
   case "${EFFECTIVE_RELEASE_KIND}" in
     patch)
       [[ "${PR_BASE_REF}" == "${RELEASE_BRANCH}" ]] || die "Patch release PRs must target ${RELEASE_BRANCH}, got ${PR_BASE_REF}"
       ;;
-    minor)
-      [[ "${PATCH}" == "0" ]] || die "Minor release PRs require an X.Y.0 tag, got ${TAG}"
-      [[ "${PR_BASE_REF}" == "${MAIN_BRANCH}" ]] || die "Minor release PRs must target ${MAIN_BRANCH}, got ${PR_BASE_REF}"
-      ;;
-    major)
-      [[ "${MINOR}" == "0" && "${PATCH}" == "0" ]] || die "Major release PRs require an X.0.0 tag, got ${TAG}"
-      [[ "${PR_BASE_REF}" == "${MAIN_BRANCH}" ]] || die "Major release PRs must target ${MAIN_BRANCH}, got ${PR_BASE_REF}"
+    minor|major)
+      [[ "${PR_BASE_REF}" == "${MAIN_BRANCH}" ]] || die "Minor/major release PRs must target ${MAIN_BRANCH}, got ${PR_BASE_REF}"
       ;;
   esac
 }
@@ -253,4 +241,6 @@ main() {
   write_outputs
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

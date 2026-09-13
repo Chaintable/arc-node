@@ -36,8 +36,9 @@ use crate::subcall::{
     SubcallCompletionResult, SubcallContinuationData, SubcallError, SubcallInitResult,
     SubcallPrecompile,
 };
-use alloy_primitives::{address, Address, U256};
+use alloy_primitives::{address, Address, B256, U256};
 use alloy_sol_types::{sol, SolCall};
+use revm::bytecode::Bytecode;
 use revm::handler::FrameResult;
 use revm::interpreter::interpreter_action::{CallInput, CallInputs, CallScheme, CallValue};
 use revm_context_interface::cfg::gas;
@@ -121,17 +122,22 @@ fn decode_child_call(inputs: &CallInputs) -> Result<(CallInputs, u64), SubcallEr
     #[allow(clippy::arithmetic_side_effects)]
     let child_gas_limit = available - (available / 64);
 
+    // revm 38 requires `known_bytecode` to be populated by the caller. The precompile
+    // trait has no journal access, so `ArcEvm::init_subcall` overwrites this placeholder
+    // with the target's bytecode (following EIP-7702 delegation) before handing the
+    // frame to revm. `reservoir` is forwarded from the parent frame (EIP-8037).
     let child_inputs = CallInputs {
         scheme: CallScheme::Call,
         target_address: target,
         bytecode_address: target,
-        known_bytecode: None,
+        known_bytecode: (B256::ZERO, Bytecode::default()),
         value: CallValue::Transfer(U256::ZERO),
         input: CallInput::Bytes(calldata),
         gas_limit: child_gas_limit,
         is_static: false,
         caller: sender,
         return_memory_offset: 0..0,
+        reservoir: inputs.reservoir,
     };
 
     Ok((child_inputs, overhead))
@@ -249,13 +255,14 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: CALL_FROM_ADDRESS,
             bytecode_address: CALL_FROM_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(calldata.into()),
             gas_limit,
             is_static: false,
             caller: address!("c000000000000000000000000000000000000001"),
             return_memory_offset: 0..0,
+            reservoir: 0,
         };
 
         let init_result = precompile
@@ -371,13 +378,14 @@ mod tests {
             scheme: CallScheme::Call,
             target_address: CALL_FROM_ADDRESS,
             bytecode_address: CALL_FROM_ADDRESS,
-            known_bytecode: None,
+            known_bytecode: (B256::ZERO, Bytecode::default()),
             value: CallValue::Transfer(U256::ZERO),
             input: CallInput::Bytes(calldata.into()),
             gas_limit,
             is_static: false,
             caller: address!("c000000000000000000000000000000000000001"),
             return_memory_offset: 0..0,
+            reservoir: 0,
         }
     }
 

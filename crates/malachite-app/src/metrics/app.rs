@@ -114,6 +114,20 @@ pub struct Inner {
     /// labelled by source (engine reject, assembly failure, sync decode).
     invalid_payloads_count: Family<InvalidPayloadSourceLabel, Counter>,
 
+    /// Number of prevotes downgraded to nil because the proposer's header
+    /// timestamp was too far ahead of local time, labelled by the path that saw
+    /// the proposal (live arrival vs buffered/round-start).
+    clock_skew_nil_vote_count: Family<SkewNilVoteSourceLabel, Counter>,
+
+    /// Number of payload validations that yielded no verdict (transient engine
+    /// error), labelled by source.
+    transient_validation_errors_count: Family<TransientValidationSourceLabel, Counter>,
+
+    /// Number of times the node stopped because a payload was not bound to its
+    /// place in the chain, labelled by the path that found it. Any non-zero value
+    /// is an alert, and the label says where to start reading.
+    binding_halt_count: Family<BindingHaltLabel, Counter>,
+
     /// Number of pending proposal parts waiting to be processed at a future height or round
     pending_proposal_parts_count: Gauge,
 
@@ -167,6 +181,9 @@ impl Inner {
             height_restart_count: Counter::default(),
             sync_fell_behind_count: Counter::default(),
             invalid_payloads_count: Family::default(),
+            clock_skew_nil_vote_count: Family::default(),
+            transient_validation_errors_count: Family::default(),
+            binding_halt_count: Family::default(),
             pending_proposal_parts_count: Gauge::default(),
             consensus_params: Family::default(),
             handshake_replay_blocks: Gauge::default(),
@@ -316,6 +333,24 @@ impl AppMetrics {
                 "invalid_payloads_count",
                 "Number of invalid payloads observed and persisted for forensics",
                 metrics.invalid_payloads_count.clone(),
+            );
+
+            registry.register(
+                "clock_skew_nil_vote_count",
+                "Number of prevotes downgraded to nil for a too-far-future proposer timestamp, labelled by path",
+                metrics.clock_skew_nil_vote_count.clone(),
+            );
+
+            registry.register(
+                "binding_halt_count",
+                "Number of node halts caused by a payload not bound to its place in the chain, labelled by site",
+                metrics.binding_halt_count.clone(),
+            );
+
+            registry.register(
+                "transient_validation_errors_count",
+                "Number of transient (no-verdict) payload validation errors, labelled by source",
+                metrics.transient_validation_errors_count.clone(),
             );
 
             registry.register(
@@ -549,6 +584,63 @@ impl AppMetrics {
             .get()
     }
 
+    /// Increment the clock-skew nil-vote counter for the given path.
+    pub fn inc_clock_skew_nil_vote_count(&self, source: SkewNilVoteSource) {
+        self.clock_skew_nil_vote_count
+            .get_or_create(&SkewNilVoteSourceLabel::new(source))
+            .inc();
+    }
+
+    /// Number of clock-skew nil-votes recorded for a specific path.
+    #[cfg(test)]
+    pub fn get_clock_skew_nil_vote_count_by_source(&self, source: SkewNilVoteSource) -> u64 {
+        self.clock_skew_nil_vote_count
+            .get_or_create(&SkewNilVoteSourceLabel::new(source))
+            .get()
+    }
+
+    /// Increment the transient-validation-error counter for the given source.
+    pub fn inc_transient_validation_errors_count(&self, source: TransientValidationSource) {
+        self.transient_validation_errors_count
+            .get_or_create(&TransientValidationSourceLabel::new(source))
+            .inc();
+    }
+
+    /// Total number of transient validation errors across all sources.
+    #[cfg(test)]
+    pub fn get_transient_validation_errors_count(&self) -> u64 {
+        TransientValidationSource::ALL
+            .iter()
+            .map(|source| self.get_transient_validation_errors_count_by_source(*source))
+            .sum()
+    }
+
+    /// Number of transient validation errors recorded for a specific source.
+    #[cfg(test)]
+    pub fn get_transient_validation_errors_count_by_source(
+        &self,
+        source: TransientValidationSource,
+    ) -> u64 {
+        self.transient_validation_errors_count
+            .get_or_create(&TransientValidationSourceLabel::new(source))
+            .get()
+    }
+
+    /// Increment the binding-halt counter for the path that found the break.
+    pub fn inc_binding_halt_count(&self, site: BindingHaltSite) {
+        self.binding_halt_count
+            .get_or_create(&BindingHaltLabel::new(site))
+            .inc();
+    }
+
+    /// Number of binding halts recorded at a specific site.
+    #[cfg(test)]
+    pub fn get_binding_halt_count(&self, site: BindingHaltSite) -> u64 {
+        self.binding_halt_count
+            .get_or_create(&BindingHaltLabel::new(site))
+            .get()
+    }
+
     /// Observe the number of pending proposal parts
     pub fn observe_pending_proposal_parts_count(&self, count: usize) {
         self.pending_proposal_parts_count.set(count as i64);
@@ -683,18 +775,32 @@ pub enum InvalidPayloadSource {
     AssemblyFailure,
     /// SSZ decode of a value received via sync failed.
     SyncDecode,
+    /// The payload block number is not the consensus height. This is a property
+    /// of the payload alone, so the sender is answerable for it.
+    PayloadHeight,
+    /// The payload does not extend the block finalized at the previous height.
+    /// This one compares the payload against local state, so it also rises when
+    /// this node's view of that height is the one that is wrong.
+    PayloadParent,
 }
 
 impl InvalidPayloadSource {
     #[cfg(test)]
-    pub(super) const ALL: [InvalidPayloadSource; 3] =
-        [Self::EngineReject, Self::AssemblyFailure, Self::SyncDecode];
+    pub(super) const ALL: [InvalidPayloadSource; 5] = [
+        Self::EngineReject,
+        Self::AssemblyFailure,
+        Self::SyncDecode,
+        Self::PayloadHeight,
+        Self::PayloadParent,
+    ];
 
     fn as_str(&self) -> &'static str {
         match self {
             Self::EngineReject => "engine_reject",
             Self::AssemblyFailure => "assembly_failure",
             Self::SyncDecode => "sync_decode",
+            Self::PayloadHeight => "payload_height",
+            Self::PayloadParent => "payload_parent",
         }
     }
 }
@@ -706,6 +812,116 @@ struct InvalidPayloadSourceLabel {
 
 impl InvalidPayloadSourceLabel {
     fn new(source: InvalidPayloadSource) -> Self {
+        Self {
+            source: source.as_str(),
+        }
+    }
+}
+
+/// The path on which a clock-skew nil-vote was recorded, used to label the
+/// counter so isolated local drift can be told apart from a broader problem.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum SkewNilVoteSource {
+    /// A proposal that arrived live for the current round.
+    ReceivedProposal,
+    /// A proposal whose parts were buffered and re-offered at round start.
+    StartedRound,
+}
+
+impl SkewNilVoteSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReceivedProposal => "received_proposal_part",
+            Self::StartedRound => "started_round",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SkewNilVoteSourceLabel {
+    path: &'static str,
+}
+
+impl SkewNilVoteSourceLabel {
+    fn new(source: SkewNilVoteSource) -> Self {
+        Self {
+            path: source.as_str(),
+        }
+    }
+}
+
+/// Path that found a payload not bound to its place in the chain and stopped the
+/// node, used to label the counter.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum BindingHaltSite {
+    /// A decided payload, found before it could be finalized.
+    Decided,
+    /// A block this node built for an earlier attempt at the same height.
+    ReusedBlock,
+    /// The node's own previous block, which is not the predecessor of the height
+    /// it is about to propose at.
+    PreviousBlock,
+    /// A stored payload the handshake replays to bring the execution client
+    /// forward. This one stops the node at startup, and the process aborts within
+    /// milliseconds. A scrape usually misses it, so an absent `replay` count is no
+    /// evidence either way: go to the startup logs.
+    Replay,
+}
+
+impl BindingHaltSite {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Decided => "decided",
+            Self::ReusedBlock => "reused_block",
+            Self::PreviousBlock => "previous_block",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BindingHaltLabel {
+    site: &'static str,
+}
+
+impl BindingHaltLabel {
+    fn new(site: BindingHaltSite) -> Self {
+        Self {
+            site: site.as_str(),
+        }
+    }
+}
+
+/// Handler path that produced a transient (no-verdict) validation error, used
+/// to label the counter.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum TransientValidationSource {
+    /// Validating freshly assembled proposal parts when a round starts.
+    StartedRoundPending,
+    /// Re-validating already-stored undecided blocks when a round starts.
+    StartedRoundRevalidation,
+}
+
+impl TransientValidationSource {
+    #[cfg(test)]
+    pub(super) const ALL: [TransientValidationSource; 2] =
+        [Self::StartedRoundPending, Self::StartedRoundRevalidation];
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::StartedRoundPending => "started_round_pending",
+            Self::StartedRoundRevalidation => "started_round_revalidation",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct TransientValidationSourceLabel {
+    source: &'static str,
+}
+
+impl TransientValidationSourceLabel {
+    fn new(source: TransientValidationSource) -> Self {
         Self {
             source: source.as_str(),
         }
@@ -798,5 +1014,33 @@ mod tests {
         metrics.inc_consensus_round_missed(proposer);
 
         assert_eq!(metrics.get_consensus_round_missed_count(proposer), 3);
+    }
+
+    #[test]
+    fn transient_validation_errors_count_registers_and_increments_per_source() {
+        let registry = SharedRegistry::global().with_moniker("transient_validation_errors_test");
+        let metrics = AppMetrics::register(&registry);
+
+        metrics
+            .inc_transient_validation_errors_count(TransientValidationSource::StartedRoundPending);
+        metrics
+            .inc_transient_validation_errors_count(TransientValidationSource::StartedRoundPending);
+        metrics.inc_transient_validation_errors_count(
+            TransientValidationSource::StartedRoundRevalidation,
+        );
+
+        assert_eq!(
+            metrics.get_transient_validation_errors_count_by_source(
+                TransientValidationSource::StartedRoundPending
+            ),
+            2,
+        );
+        assert_eq!(
+            metrics.get_transient_validation_errors_count_by_source(
+                TransientValidationSource::StartedRoundRevalidation
+            ),
+            1,
+        );
+        assert_eq!(metrics.get_transient_validation_errors_count(), 3);
     }
 }
