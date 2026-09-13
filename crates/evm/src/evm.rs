@@ -200,6 +200,40 @@ fn load_account_with_code_metered<J: JournalTr>(
     }
 }
 
+/// Completion metadata for a transparent subcall frame observed by an inspector.
+///
+/// A spawned child reaches the inspector's `call_end` before the subcall precompile
+/// runs its completion phase. Consumers that combine traces with canonical journal
+/// logs need both results to classify a completion-time rollback correctly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubcallTraceCompletion {
+    /// Result of the executed child before subcall completion.
+    pub child_status: InstructionResult,
+    /// Output returned by the executed child before subcall completion.
+    pub child_output: Bytes,
+    /// Gas used by the executed child before subcall completion.
+    pub child_gas_used: u64,
+    /// Gas limit applied to the executed child after Arc frame preparation.
+    pub child_gas_limit: u64,
+    /// Result returned by the subcall precompile to its caller.
+    pub final_status: InstructionResult,
+    /// Whether completion reverted a child that had executed successfully.
+    pub rolled_back_by_completion: bool,
+    /// Number of canonical journal logs after completion and any rollback.
+    pub post_completion_log_count: usize,
+    /// Whether the inspector has already received `frame_end` for this frame.
+    pub phase: SubcallTraceCompletionPhase,
+}
+
+/// Position of subcall completion relative to the inspector's frame lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubcallTraceCompletionPhase {
+    /// The child completed synchronously during frame initialization.
+    BeforeFrameEnd,
+    /// A spawned child completed after its inspector frame had ended.
+    AfterFrameEnd,
+}
+
 #[derive(Debug)]
 pub struct ArcEvm<CTX, INSP, I, P, F = EthFrame<EthInterpreter>> {
     /// Inner EVM type.
@@ -211,6 +245,8 @@ pub struct ArcEvm<CTX, INSP, I, P, F = EthFrame<EthInterpreter>> {
     subcall_registry: Arc<SubcallRegistry>,
     /// Active subcall continuations, keyed by the precompile call's depth.
     subcall_continuations: HashMap<usize, SubcallContinuation>,
+    /// Optional observer for the completion phase of transparent subcall frames.
+    subcall_trace_completion_hook: Option<fn(&mut INSP, SubcallTraceCompletion)>,
 }
 
 /// ArcEvm implementation, wrapping an inner revm EVM instance to apply handler
@@ -241,6 +277,23 @@ impl<CTX: ContextTr, INSP, P> ArcEvm<CTX, INSP, EthInstructions<EthInterpreter, 
             hardfork_flags,
             subcall_registry,
             subcall_continuations: HashMap::new(),
+            subcall_trace_completion_hook: None,
+        }
+    }
+}
+
+impl<CTX, INSP, I, P, F> ArcEvm<CTX, INSP, I, P, F> {
+    /// Installs an observer for transparent subcall completion metadata.
+    pub fn set_subcall_trace_completion_hook(
+        &mut self,
+        hook: fn(&mut INSP, SubcallTraceCompletion),
+    ) {
+        self.subcall_trace_completion_hook = Some(hook);
+    }
+
+    fn notify_subcall_trace_completion(&mut self, completion: SubcallTraceCompletion) {
+        if let Some(hook) = self.subcall_trace_completion_hook {
+            hook(&mut self.inner.inspector, completion);
         }
     }
 }
@@ -738,7 +791,32 @@ where
             let continuation_key = finished_depth.checked_sub(1);
             if let Some(key) = continuation_key {
                 if let Some(continuation) = self.subcall_continuations.remove(&key) {
+                    let trace_completion =
+                        self.subcall_trace_completion_hook.is_some().then(|| {
+                            (
+                                result.instruction_result(),
+                                result.interpreter_result().output.clone(),
+                                result.gas().total_gas_spent(),
+                                result.gas().limit(),
+                            )
+                        });
                     let final_result = self.complete_subcall(result, continuation)?;
+                    if let Some((child_status, child_output, child_gas_used, child_gas_limit)) =
+                        trace_completion
+                    {
+                        let final_status = final_result.instruction_result();
+                        self.notify_subcall_trace_completion(SubcallTraceCompletion {
+                            child_status,
+                            child_output,
+                            child_gas_used,
+                            child_gas_limit,
+                            final_status,
+                            rolled_back_by_completion: child_status.is_ok()
+                                && !final_status.is_ok(),
+                            post_completion_log_count: self.inner.ctx.journal_ref().logs().len(),
+                            phase: SubcallTraceCompletionPhase::AfterFrameEnd,
+                        });
+                    }
                     if stack_empty {
                         // Direct EOA -> precompile: no parent frame to propagate to.
                         return Ok(Some(final_result));
@@ -1089,7 +1167,30 @@ where
                     continuation_data: init_result.continuation_data,
                     checkpoint,
                 };
+                let trace_completion = self.subcall_trace_completion_hook.is_some().then(|| {
+                    (
+                        child_result.instruction_result(),
+                        child_result.interpreter_result().output.clone(),
+                        child_result.gas().total_gas_spent(),
+                        child_result.gas().limit(),
+                    )
+                });
                 let final_result = self.complete_subcall(child_result, continuation)?;
+                if let Some((child_status, child_output, child_gas_used, child_gas_limit)) =
+                    trace_completion
+                {
+                    let final_status = final_result.instruction_result();
+                    self.notify_subcall_trace_completion(SubcallTraceCompletion {
+                        child_status,
+                        child_output,
+                        child_gas_used,
+                        child_gas_limit,
+                        final_status,
+                        rolled_back_by_completion: child_status.is_ok() && !final_status.is_ok(),
+                        post_completion_log_count: self.inner.ctx.journal_ref().logs().len(),
+                        phase: SubcallTraceCompletionPhase::BeforeFrameEnd,
+                    });
+                }
                 Ok(ItemOrResult::Result(final_result))
             }
         }
@@ -1321,7 +1422,7 @@ where
     }
 }
 
-/// Mirrors the default [`InspectorEvmTr::inspect_frame_init`] from revm-inspector v15.0.0
+/// Mirrors the default [`InspectorEvmTr::inspect_frame_init`] from revm-inspector v19.0.0
 /// (`revm::inspector::traits`), but routes through `ArcEvm::frame_init` (not the inner
 /// `InnerEvm::frame_init`) so Arc-specific logic (blocklist checks, EIP-7708 logs, subcall
 /// routing) is always applied.
@@ -1334,8 +1435,7 @@ where
 /// directly, matching upstream semantics where inspector `call()` mutations flow through
 /// to execution.
 ///
-/// Keep in sync with: <https://github.com/bluealloy/revm/blob/v103/crates/inspector/src/traits.rs#L98-L137>
-/// (revm crate v34.0.0 — verify this function if upgrading revm)
+/// Keep in sync with the pinned revm v38 inspector implementation when upgrading revm.
 impl<CTX, INSP, I, P> ArcEvm<CTX, INSP, I, P>
 where
     CTX: ContextTr<Journal: JournalExt> + ContextSetters,
@@ -3730,6 +3830,20 @@ mod tests {
             EthInstructions<EthInterpreter, EthEvmContext<InMemoryDB>>,
             PrecompilesMap,
         >;
+
+        #[derive(Debug, Default)]
+        struct CompletionInspector {
+            completions: Vec<SubcallTraceCompletion>,
+        }
+
+        impl revm::inspector::Inspector<EthEvmContext<InMemoryDB>, EthInterpreter> for CompletionInspector {}
+
+        fn capture_completion(
+            inspector: &mut CompletionInspector,
+            completion: SubcallTraceCompletion,
+        ) {
+            inspector.completions.push(completion);
+        }
 
         /// Creates an ArcEvm backed by an in-memory DB with accounts and deployed contracts.
         ///
@@ -6454,6 +6568,103 @@ mod tests {
                 slot_value,
                 U256::ZERO,
                 "child's SSTORE(0, 42) should have been reverted after completion OOG"
+            );
+        }
+
+        #[test]
+        fn test_completion_hook_reports_spawned_child_rollback_after_frame_end() {
+            use crate::subcall::AllowedCallers;
+            use crate::subcall_test::{
+                ExcessiveCompleteSubcallPrecompile, EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+            };
+
+            const STORAGE_CONTRACT: Address = address!("c000000000000000000000000000000000000021");
+            let mut evm = setup_test_evm_with_inspector(
+                &[(EOA, U256::from(1_000_000))],
+                &[
+                    (
+                        WRAPPER,
+                        wrapper_call_bytecode(EXCESSIVE_COMPLETE_SUBCALL_ADDRESS),
+                    ),
+                    (STORAGE_CONTRACT, sstore_42_then_drain_gas_bytecode()),
+                ],
+                &[],
+                CompletionInspector::default(),
+            );
+            let mut registry = SubcallRegistry::new();
+            registry.register(
+                EXCESSIVE_COMPLETE_SUBCALL_ADDRESS,
+                Arc::new(ExcessiveCompleteSubcallPrecompile),
+                AllowedCallers::Unrestricted,
+            );
+            evm.subcall_registry = Arc::new(registry);
+            evm.set_subcall_trace_completion_hook(capture_completion);
+
+            let result = evm
+                .inspect_one_tx(TxEnv {
+                    caller: EOA,
+                    kind: TxKind::Call(WRAPPER),
+                    value: U256::ZERO,
+                    gas_limit: 100_000,
+                    gas_price: 0,
+                    chain_id: Some(LOCAL_DEV.chain_id()),
+                    data: encode_subcall_test_input(STORAGE_CONTRACT, &[]),
+                    ..Default::default()
+                })
+                .expect("inspect should succeed");
+            assert!(result.is_success(), "wrapper should catch completion OOG");
+
+            let [completion] = evm.inner.inspector.completions.as_slice() else {
+                panic!("expected exactly one subcall completion");
+            };
+            assert!(completion.child_status.is_ok());
+            assert!(completion.child_output.is_empty());
+            assert!(completion.child_gas_used > 0);
+            assert!(completion.child_gas_limit > completion.child_gas_used);
+            assert!(!completion.final_status.is_ok());
+            assert!(completion.rolled_back_by_completion);
+            assert_eq!(completion.post_completion_log_count, 0);
+            assert_eq!(completion.phase, SubcallTraceCompletionPhase::AfterFrameEnd);
+        }
+
+        #[test]
+        fn test_completion_hook_reports_immediate_eoa_child_before_frame_end() {
+            const TARGET_EOA: Address = address!("e000000000000000000000000000000000000099");
+            let mut evm = setup_test_evm_with_inspector(
+                &[(EOA, U256::from(1_000_000)), (TARGET_EOA, U256::ZERO)],
+                &[(WRAPPER, wrapper_call_bytecode(CALL_FROM_ADDRESS))],
+                &[WRAPPER],
+                CompletionInspector::default(),
+            );
+            evm.set_subcall_trace_completion_hook(capture_completion);
+
+            let result = evm
+                .inspect_one_tx(TxEnv {
+                    caller: EOA,
+                    kind: TxKind::Call(WRAPPER),
+                    value: U256::ZERO,
+                    gas_limit: 1_000_000,
+                    gas_price: 0,
+                    chain_id: Some(LOCAL_DEV.chain_id()),
+                    data: encode_call_from_input(EOA, TARGET_EOA, &[]),
+                    ..Default::default()
+                })
+                .expect("inspect should succeed");
+            assert!(result.is_success());
+
+            let [completion] = evm.inner.inspector.completions.as_slice() else {
+                panic!("expected exactly one subcall completion");
+            };
+            assert!(completion.child_status.is_ok());
+            assert!(completion.child_output.is_empty());
+            assert_eq!(completion.child_gas_used, 0);
+            assert!(completion.child_gas_limit > 0);
+            assert!(completion.final_status.is_ok());
+            assert!(!completion.rolled_back_by_completion);
+            assert_eq!(completion.post_completion_log_count, 0);
+            assert_eq!(
+                completion.phase,
+                SubcallTraceCompletionPhase::BeforeFrameEnd
             );
         }
 

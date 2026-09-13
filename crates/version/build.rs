@@ -21,6 +21,10 @@ use vergen_git2::{BuildBuilder, Emitter, Git2Builder};
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-env-changed=ARC_IDEMPOTENT_BUILD");
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_DESCRIBE");
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_DIRTY");
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_SHA_SHORT");
 
     let idempotent = matches!(
         dotenvy::var("ARC_IDEMPOTENT_BUILD").as_deref(),

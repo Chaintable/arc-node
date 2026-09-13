@@ -15,6 +15,7 @@
 // limitations under the License.
 
 pub mod contracts;
+pub mod debank;
 pub mod eip7708;
 pub mod payload;
 pub mod utils;
