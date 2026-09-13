@@ -1,3 +1,57 @@
+# Chaintable write node
+
+> Fork of [circlefin/arc-node](https://github.com/circlefin/arc-node), with Chaintable pipeline patches.
+
+## Architecture
+
+This repo runs Arc's execution layer with a [Chaintable pipeline](https://github.com/Chaintable/pipeline)-compatible tracer. It exposes block headers, transactions, call traces, receipts, events, and state diffs through `trace_debankBlock`. An external [background-tracer / ETL](https://github.com/Chaintable/background-tracer) process calls this RPC and uploads the results to **S3 + Kafka**; the writer itself does not upload to either service (see pipeline's [architecture](https://github.com/Chaintable/pipeline/blob/main/docs/architecture.md)).
+
+- **Block headers + state diffs** → Kafka + S3 → [leafage-evm](https://github.com/Chaintable/leafage-evm): a lightweight EVM executor serving state queries.
+- **Block files** (transactions · call traces · receipts · events) → S3 → Chaintable's transaction/trace indexing pipeline.
+
+```text
+Arc write node (this repo)
+        │ trace_debankBlock RPC
+        ▼
+background-tracer / ETL
+        ├─ block headers + state diffs ─→ Kafka + S3 ─→ leafage-evm
+        └─ block files ─────────────────→ S3 ─→ Chaintable indexing pipeline
+```
+
+## Chaintable images
+
+The public image workflows build the execution node from this repository for
+`linux/amd64` and `linux/arm64`:
+
+- Base image: `public.ecr.aws/b2h7a5c4/chaintable/arc-node`
+- Writer alias: `public.ecr.aws/b2h7a5c4/chaintable/arc-writer` (the same manifest)
+
+Same-repository PRs, default-branch pushes, and manual builds use an eight-character
+commit tag; per-architecture base tags append `-amd64` or `-arm64`. GitHub Releases
+use `v<base-version>-ct.N` tags. Use a fixed tag after its build and manifest jobs
+succeed; provisioning both public ECR repositories is a maintainer prerequisite.
+
+These images contain `arc-node-execution` and `arc-snapshots`, not the consensus
+node. The consensus client and external ETL are separate services. The Arc
+documentation below describes the underlying client, not the Chaintable image
+publication process.
+
+For local image builds, initialize the public submodules and use the existing
+Bake target (including its certificate context):
+
+```bash
+git submodule update --init --recursive
+GIT_COMMIT_HASH="$(git rev-parse HEAD)" \
+GIT_SHORT_HASH="$(git rev-parse --short=8 HEAD)" \
+GIT_VERSION="$(git describe --tags --always --dirty)" \
+docker buildx bake arc-execution --set arc-execution.tags=arc-writer:local
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) for the
+Chaintable contribution and vulnerability-reporting processes.
+
+---
+
 <p align="center">
   <a href="https://www.arc.io/">
     <picture>

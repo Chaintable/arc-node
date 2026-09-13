@@ -1,31 +1,121 @@
-# Contributing to Arc Node
+# Contributing
 
-## Working with Protocol Buffers
+Thanks for your interest in contributing.
 
-This project uses Protocol Buffers for consensus and node communication (except consensus-critical serialization). Proto definitions are located in `crates/types/proto` and `crates/remote-signer/proto`. We use [buf](https://buf.build/) to lint, format, and check for breaking changes in our proto files.
+This repository is a **fork**: upstream [circlefin/arc-node](https://github.com/circlefin/arc-node)
+plus the [Chaintable pipeline](https://github.com/Chaintable/pipeline) tracer. It
+runs write node(s) that produce block data for the Chaintable data pipeline, for
+the chain(s) listed in this repository's CI configuration and README. It is not
+a general-purpose fork of Arc Node.
 
-> **Prerequisite:** `buf` must be installed before using these targets. See [Prerequisites](README.md#prerequisites) for installation instructions.
+**First, determine where your change belongs:**
 
-### Available Make Targets
+- **Chain client changes** (consensus, p2p, EVM, RPC, txpool) — contribute
+  **upstream**, following their contributing process. We cannot accept
+  chain-core changes in this fork: they would diverge from upstream and be lost
+  or cause conflicts at the next upstream merge. If an upstream fix matters to
+  this fork, open an issue here linking the upstream PR/commit and we will pull
+  it in with the next sync.
 
-- `make buf-lint` - Lint protobuf files to ensure they follow best practices
-- `make buf-format` - Format protobuf files (this is included in `make lint`)
-- `make buf-breaking` - Check for breaking changes against the main branch
+- **Pipeline layer changes** — the pipeline tracer and its block-data output,
+  the Dockerfile, published images, CI workflows, or docs about running this
+  write node — contribute **here**, following the process below.
 
-### Before Committing Changes
+---
 
-If you modify any `.proto` files, always run `make buf-lint` and `make buf-breaking` to ensure your changes don't introduce linting issues or breaking changes. The `buf-breaking` command compares your changes against the main branch to detect any backwards-incompatible modifications. Breaking changes should be carefully reviewed and documented as they can impact existing deployments.
+## Our Process (contributions to the Chaintable pipeline layer)
 
-### CI
+### Getting Started
 
-CI action runs the breaking change detection step on every pull request. To skip this step for a specific pull request, you can add the `buf skip breaking` label to the PR. See [Skip breaking change detection using labels](https://buf.build/docs/bsr/ci-cd/github-actions/#skip-breaking-change-detection-using-labels).
+Requirements:
 
-Note: `make lint` automatically runs `buf-format`.
+* Rust (version per `rust-toolchain.toml`)
+* Docker with Buildx for the release image
+* Native build prerequisites — see [Development](README.md#development)
 
-### (Optional) Pre-commit hooks
+### Development Workflow
 
-Developers may install [pre-commit](https://pre-commit.com/) hooks, which will handle all the formatting and linting automatically.
+1. Fork the repository
+2. Create a branch from `debank`
+3. Make changes, focused on the pipeline layer
+4. Run local checks
+5. Open a PR
+
+Keep PRs small and focused.
+
+### Local Checks (must pass)
 
 ```bash
-pre-commit install
+git submodule update --init --recursive
+cargo fmt --all -- --check
+cargo build --locked --bin arc-node-execution
+cargo test --locked -p debank-rpc
 ```
+
+### Code Guidelines
+
+* Keep the diff minimal — prefer hooks over invasive edits to client code
+* Match the existing code style and conventions (`cargo fmt`)
+* Prefer simple and explicit logic
+* Do not change chain-core behavior (see the top of this document)
+
+### Testing
+
+Changes to the pipeline layer must include tests where practical. At minimum,
+describe how you verified the emitted data: chain, block range, and what you
+compared it against.
+
+### Pull Requests
+
+Before submitting:
+
+* Local checks pass
+* Tests added or updated
+* Behavior changes clearly explained
+
+PRs should include:
+
+* Summary
+* Motivation
+* Testing details
+* Compatibility impact
+
+Note on CI: it builds the Docker images for this repository, and the image
+publishing jobs run for same-repository PRs only. External fork PRs do not receive
+publishing credentials. A maintainer will build and verify your change on an
+internal branch. Both architectures must pass the image's Commit SHA check.
+
+### Commit Guidelines
+
+* Use clear, descriptive messages
+
+Example:
+
+```
+tracer: fix state-diff ordering for reorged blocks
+```
+
+### Releases
+
+* Release tags follow `v<base-version>-ct.N` (`ct` = Chaintable; e.g.
+  `v0.8.0-ct.1`); a GitHub Release publishes the versioned images
+
+### Reporting Issues
+
+Please include:
+
+* Image tag or commit
+* Chain and block height
+* Reproduction steps
+* Expected vs actual behavior
+
+### Security
+
+Do not disclose vulnerabilities publicly.
+
+See [SECURITY.md](./SECURITY.md) for reporting instructions.
+
+### License
+
+By contributing, you agree that your contributions are licensed under the same
+terms as this repository — see [LICENSE](./LICENSE) (Apache-2.0).
