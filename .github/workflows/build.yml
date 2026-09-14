@@ -18,24 +18,31 @@ permissions:
 env:
   AWS_REGION: us-east-1
   REGISTRY: public.ecr.aws/b2h7a5c4/chaintable
-  IMAGE_NAME: arc-node
   CHAINS: "arc"
-  DOCKERFILE: deployments/Dockerfile.execution
-  BAKE_TARGET: arc-execution
 
 jobs:
   build-artifacts:
-    name: Build ${{ matrix.arch }}
+    name: Build ${{ matrix.component }} ${{ matrix.arch }}
     # Same-repository PRs publish review images. External forks cannot receive publishing credentials.
     if: github.repository == 'Chaintable/arc-node' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
       matrix:
+        arch: [amd64, arm64]
+        component: [execution, consensus]
         include:
           - arch: amd64
             runner: ubuntu-latest
           - arch: arm64
             runner: ubuntu-24.04-arm
+          - component: execution
+            image_name: arc-node
+          - component: consensus
+            image_name: arc-consensus
+    env:
+      IMAGE_NAME: ${{ matrix.image_name }}
+      DOCKERFILE: deployments/Dockerfile.${{ matrix.component }}
+      BAKE_TARGET: arc-${{ matrix.component }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     permissions:
@@ -117,8 +124,8 @@ jobs:
             ${{ env.BAKE_TARGET }}.platform=linux/${{ matrix.arch }}
             ${{ env.BAKE_TARGET }}.tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.revision }}-${{ matrix.arch }}
             ${{ env.BAKE_TARGET }}.output=type=registry
-            ${{ env.BAKE_TARGET }}.cache-from=type=gha,scope=arc-execution-${{ matrix.arch }}
-            ${{ env.BAKE_TARGET }}.cache-to=type=gha,mode=max,scope=arc-execution-${{ matrix.arch }}
+            ${{ env.BAKE_TARGET }}.cache-from=type=gha,scope=arc-${{ matrix.component }}-${{ matrix.arch }}
+            ${{ env.BAKE_TARGET }}.cache-to=type=gha,mode=max,scope=arc-${{ matrix.component }}-${{ matrix.arch }}
         env:
           BUILDX_NO_DEFAULT_ATTESTATIONS: 1
           CI: "true"
@@ -140,10 +147,25 @@ jobs:
             exit 1
           fi
 
+      - name: Verify runtime shell and utilities
+        env:
+          REVISION: ${{ steps.vars.outputs.revision }}
+          COMPONENT: ${{ matrix.component }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          bash .github/scripts/test-runtime-image.sh \
+            "${REGISTRY}/${IMAGE_NAME}:${REVISION}-${ARCH}" "arc-node-${COMPONENT}"
+
   merge-docker-manifest:
-    name: Merge multi-arch manifest
+    name: Merge ${{ matrix.image_name }} multi-arch manifest
     runs-on: ubuntu-latest
     needs: build-artifacts
+    strategy:
+      fail-fast: false
+      matrix:
+        image_name: [arc-node, arc-consensus]
+    env:
+      IMAGE_NAME: ${{ matrix.image_name }}
     permissions:
       contents: read
       id-token: write
@@ -204,10 +226,12 @@ jobs:
             "${REGISTRY}/${IMAGE_NAME}:${REVISION}-amd64" \
             "${REGISTRY}/${IMAGE_NAME}:${REVISION}-arm64"
           docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${REVISION}"
-          # Writer aliases reference the same multi-architecture manifest, without rebuilding.
-          for chain in ${CHAINS}; do
-            docker buildx imagetools create \
-              --tag "${REGISTRY}/${chain}-writer:${REVISION}" \
-              "${REGISTRY}/${IMAGE_NAME}:${REVISION}"
-            docker buildx imagetools inspect "${REGISTRY}/${chain}-writer:${REVISION}"
-          done
+          # Only the execution image has Writer aliases; never alias consensus as Writer.
+          if [[ "$IMAGE_NAME" == "arc-node" ]]; then
+            for chain in ${CHAINS}; do
+              docker buildx imagetools create \
+                --tag "${REGISTRY}/${chain}-writer:${REVISION}" \
+                "${REGISTRY}/${IMAGE_NAME}:${REVISION}"
+              docker buildx imagetools inspect "${REGISTRY}/${chain}-writer:${REVISION}"
+            done
+          fi

@@ -29,7 +29,7 @@ RUN cargo chef prepare --recipe-path arc-node-execution-recipe.json
 ###############
 FROM chef AS builder
 
-# Create a non-root user 'arc' with UID/GID 999. This method is used because distroless images lack user management tools like 'useradd'.
+# Create the runtime user 'arc' with UID/GID 999 without adding user-management tools to the final image.
 # The user's home directory is set to /data and shell to /bin/false for security.
 RUN printf 'arc:x:999:999::/data:/bin/false\n' > /tmp/passwd && \
     printf 'arc:x:999:\n' > /tmp/group
@@ -88,9 +88,20 @@ RUN --mount=type=cache,id=reth-cargo-registry,sharing=locked,target=/usr/local/c
 #######################
 # release runtime image
 #######################
-FROM gcr.io/distroless/cc-debian12:nonroot AS release-runtime
+FROM public.ecr.aws/docker/library/debian:bookworm-slim AS runtime-base
 
 COPY --from=chef /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Kubernetes init/runmode scripts require Bash and coreutils; keep Debian 12
+# compatibility with the builder and the previous distroless runtime.
+COPY assets/apt/apt-retry.conf /etc/apt/apt.conf.d/apt-retry.conf
+COPY assets/apt/debian.sources /etc/apt/sources.list.d/debian.sources
+RUN rm -f /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends bash coreutils libstdc++6 && \
+    rm -rf /var/lib/apt/lists/*
+
+FROM runtime-base AS release-runtime
 
 # Copy user information from the builder stage into the runtime image.
 COPY --from=builder /tmp/passwd /etc/passwd
