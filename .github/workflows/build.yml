@@ -3,9 +3,9 @@ name: build
 # Same-repository PRs publish SHA-tagged images for review; releases use release.yml.
 on:
   pull_request:
-    branches: [main, debank]
+    branches: [main]
   push:
-    branches: [main, debank]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -32,9 +32,9 @@ jobs:
         component: [execution, consensus]
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu2404-linux-x86-64-16c
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu2204-arm64-16c
           - component: execution
             image_name: arc-node
           - component: consensus
