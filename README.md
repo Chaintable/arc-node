@@ -20,19 +20,23 @@ background-tracer / ETL
 
 ## Chaintable images
 
-The public image workflows build the execution node from this repository for
+The public image workflows build the execution and consensus nodes from this repository for
 `linux/amd64` and `linux/arm64`:
 
 - Base image: `public.ecr.aws/b2h7a5c4/chaintable/arc-node`
 - Writer alias: `public.ecr.aws/b2h7a5c4/chaintable/arc-writer` (the same manifest)
+- Consensus image: `public.ecr.aws/b2h7a5c4/chaintable/arc-consensus`
 
 Same-repository PRs, default-branch pushes, and manual builds use an eight-character
 commit tag; per-architecture base tags append `-amd64` or `-arm64`. GitHub Releases
 use `v<base-version>-ct.N` tags. Use a fixed tag after its build and manifest jobs
-succeed; provisioning both public ECR repositories is a maintainer prerequisite.
+succeed; provisioning all three public ECR repositories is a maintainer prerequisite.
 
-These images contain `arc-node-execution` and `arc-snapshots`, not the consensus
-node. The consensus client and external ETL are separate services. The Arc
+The execution images contain `arc-node-execution` and `arc-snapshots`; the consensus
+image contains `arc-node-consensus` and `arc-snapshots`. Both use Debian 12 with Bash,
+`sh`, and coreutils for Kubernetes init/runmode scripts, retaining user `arc`
+(UID/GID 999) and their direct binary entrypoints. The consensus client and external
+ETL remain separate services. The Arc
 documentation below describes the underlying client, not the Chaintable image
 publication process.
 
@@ -46,6 +50,9 @@ GIT_SHORT_HASH="$(git rev-parse --short=8 HEAD)" \
 GIT_VERSION="$(git describe --tags --always --dirty)" \
 docker buildx bake arc-execution --set arc-execution.tags=arc-writer:local
 ```
+
+For consensus, use target `arc-consensus` and tag override
+`--set arc-consensus.tags=arc-consensus:local` with the same build metadata.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) for the
 Chaintable contribution and vulnerability-reporting processes.
