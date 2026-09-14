@@ -3,9 +3,9 @@ name: build
 # Same-repository PRs publish SHA-tagged images for review; releases use release.yml.
 on:
   pull_request:
-    branches: [main, debank]
+    branches: [main]
   push:
-    branches: [main, debank]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
