@@ -1,9 +1,9 @@
-# Debian package sources with fallback mirrors for CI reliability
-# Uses DEB822 format with multiple URIs - APT tries them in order until one works
+# Debian package sources and mirrors for CI reliability
+# APT updates each DEB822 URI separately; these are not ordered failover endpoints.
 #
 # Mirror selection rationale:
 # - Primary: deb.debian.org (Fastly CDN, globally distributed)
-# - Fallbacks: University mirrors that also mirror debian-security
+# - Additional mirrors: Waterloo (main) and xTom (main and security)
 #
 # NOTE: Uses HTTPS because HTTP port 80 is blocked by StepSecurity egress policy.
 # NOTE: The suite "bookworm" must match the Debian version in the Dockerfiles.
@@ -17,7 +17,7 @@ Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 
 Types: deb
-URIs: https://deb.debian.org/debian-security https://mirror.csclub.uwaterloo.ca/debian-security https://mirror.xtom.com/debian-security
+URIs: https://deb.debian.org/debian-security https://mirror.xtom.com/debian-security
 Suites: bookworm-security
 Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
