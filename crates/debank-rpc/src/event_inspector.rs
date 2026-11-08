@@ -110,6 +110,9 @@ impl CapturedEvents {
                 }
                 let observed_success = match completion.phase {
                     SubcallTraceCompletionPhase::BeforeFrameEnd => completion.final_status.is_ok(),
+                    SubcallTraceCompletionPhase::BeforeChildFrameEnd => {
+                        completion.child_status.is_ok() && completion.final_status.is_ok()
+                    }
                     SubcallTraceCompletionPhase::AfterFrameEnd => completion.child_status.is_ok(),
                 };
                 if frame.success != observed_success {
@@ -234,7 +237,8 @@ impl ArcEventInspector {
 
     fn record_subcall_completion(&mut self, completion: SubcallTraceCompletion) {
         let frame_id = match completion.phase {
-            SubcallTraceCompletionPhase::BeforeFrameEnd => self.frame_stack.last().copied(),
+            SubcallTraceCompletionPhase::BeforeFrameEnd
+            | SubcallTraceCompletionPhase::BeforeChildFrameEnd => self.frame_stack.last().copied(),
             SubcallTraceCompletionPhase::AfterFrameEnd => self.last_finished_frame.take(),
         };
 
@@ -1254,11 +1258,19 @@ mod tests {
 
         for phase in [
             SubcallTraceCompletionPhase::BeforeFrameEnd,
+            SubcallTraceCompletionPhase::BeforeChildFrameEnd,
             SubcallTraceCompletionPhase::AfterFrameEnd,
         ] {
             for (child_status, final_status, expected_error) in cases {
                 let observed_status = match phase {
                     SubcallTraceCompletionPhase::BeforeFrameEnd => final_status,
+                    SubcallTraceCompletionPhase::BeforeChildFrameEnd => {
+                        if child_status.is_ok() {
+                            final_status
+                        } else {
+                            child_status
+                        }
+                    }
                     SubcallTraceCompletionPhase::AfterFrameEnd => child_status,
                 };
                 let arena = call_arena(vec![call_node(
@@ -1325,9 +1337,10 @@ mod tests {
     }
 
     #[test]
-    fn subcall_trace_uses_raw_child_output_and_gas_in_both_completion_phases() {
+    fn subcall_trace_uses_raw_child_output_and_gas_in_all_completion_phases() {
         for phase in [
             SubcallTraceCompletionPhase::BeforeFrameEnd,
+            SubcallTraceCompletionPhase::BeforeChildFrameEnd,
             SubcallTraceCompletionPhase::AfterFrameEnd,
         ] {
             let mut node = call_node(
