@@ -58,6 +58,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 alloy-rlp.workspace = true
+alloy-signer.workspace = true
 arc-precompiles = { path = "../precompiles", features = ["integration", "test-utils"] }
 debank-rpc.workspace = true
 reth-tracing.workspace = true
