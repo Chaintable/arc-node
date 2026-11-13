@@ -61,6 +61,7 @@ alloy-rlp.workspace = true
 alloy-signer.workspace = true
 arc-precompiles = { path = "../precompiles", features = ["integration", "test-utils"] }
 debank-rpc.workspace = true
+reth-execution-cache.workspace = true
 reth-tracing.workspace = true
 revm-bytecode.workspace = true
 rstest.workspace = true
