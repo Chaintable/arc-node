@@ -29,8 +29,11 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
-use arc_evm_node::node::{ArcNode, ArcRpcConfig};
 use arc_evm_node::ARC_RPC_MAX_BATCH_ENTRIES_DEFAULT;
+use arc_evm_node::{
+    node::{ArcNode, ArcRpcConfig},
+    writer::{start_delivery, Delivery, DeliveryConfig, WriterValidatorBuilder},
+};
 use arc_execution_config::addresses_denylist::{
     AddressesDenylistConfig, DEFAULT_DENYLIST_ERC7201_BASE_SLOT,
 };
@@ -59,8 +62,8 @@ use arc_node_execution::ArcConsensus;
 use arc_node_execution::ArcEvmConfig;
 use arc_node_execution::ArcEvmFactory;
 use reth_db::DatabaseEnv;
-use reth_node_builder::NodeBuilder;
 use reth_node_builder::WithLaunchContext;
+use reth_node_builder::{Node, NodeBuilder};
 use reth_node_ethereum::EthEvmConfig;
 
 /// Arc Network node CLI with custom version handling
@@ -152,6 +155,10 @@ fn follow_url_for_consensus(
 
 #[derive(Debug, Args)]
 struct ArcExtraCli {
+    /// Enable Writer with a JSON delivery configuration.
+    #[arg(long = "writer-config", env = "ARC_WRITER_CONFIG")]
+    writer_config: Option<std::path::PathBuf>,
+
     /// Enable custom ARC RPC namespace (certificates etc.).
     #[arg(long = "enable-arc-rpc", default_value_t = false)]
     enable_arc_rpc: bool,
@@ -611,30 +618,68 @@ fn main() {
             let tx_relay_timeout = ext.arc_tx_relays_timeout;
             let rebroadcast_interval =
                 std::time::Duration::from_secs(ext.txpool_rebroadcast_interval);
-            let handle = builder
-                .node(ArcNode::new(
-                    arc_rpc_cfg,
-                    invalid_tx_list_cfg,
-                    addresses_denylist_config,
-                    payload_builder_deadline_ms,
-                    wait_for_payload,
-                    filter_pending_txs,
-                    allow_unprotected_txs,
-                    max_response_body_size,
-                    max_batch_entries,
-                    rebroadcast_interval,
-                    tx_relays,
-                    tx_relay_timeout,
-                ))
-                .launch_with_debug_capabilities()
-                .await?;
+            let arc = ArcNode::new(
+                arc_rpc_cfg,
+                invalid_tx_list_cfg,
+                addresses_denylist_config,
+                payload_builder_deadline_ms,
+                wait_for_payload,
+                filter_pending_txs,
+                allow_unprotected_txs,
+                max_response_body_size,
+                max_batch_entries,
+                rebroadcast_interval,
+                tx_relays,
+                tx_relay_timeout,
+            );
+            let (exit, _shutdown) = if let Some(path) = ext.writer_config {
+                let config: DeliveryConfig = serde_json::from_reader(std::fs::File::open(path)?)?;
+                let consensus_url = ext
+                    .arc_rpc_upstream_url
+                    .as_deref()
+                    .ok_or_else(|| eyre::eyre!("--writer-config requires --arc-rpc-upstream-url"))?
+                    .parse()?;
+                let spec = builder.config().chain.clone();
+                let database = builder
+                    .config()
+                    .datadir
+                    .clone()
+                    .resolve_datadir(spec.chain())
+                    .db();
+                let source_id = database.canonicalize()?.to_string_lossy().into_owned();
+                let delivery =
+                    Delivery::open(&config, spec.chain().id(), spec.genesis_hash(), source_id)?;
+                let arc = arc.with_writer_history(delivery.clone());
+                let handle = builder
+                    .with_types::<ArcNode>()
+                    .with_components(arc.components_builder())
+                    .with_add_ons(
+                        arc.add_ons()
+                            .with_engine_validator(WriterValidatorBuilder::new(delivery.clone())),
+                    )
+                    .on_node_started(move |node| {
+                        start_delivery(&node, &spec, delivery, config, consensus_url)
+                    })
+                    .launch_with_debug_capabilities()
+                    .await?;
+                (
+                    handle.node_exit_future,
+                    handle.node.add_ons_handle.engine_shutdown.clone(),
+                )
+            } else {
+                let handle = builder.node(arc).launch_with_debug_capabilities().await?;
+                (
+                    handle.node_exit_future,
+                    handle.node.add_ons_handle.engine_shutdown.clone(),
+                )
+            };
 
             spawn_pprof_server(ext.pprof_addr.parse()?, ext.pprof_heap_prof);
 
             #[cfg(unix)]
-            install_sigterm_handler(handle.node.add_ons_handle.engine_shutdown.clone());
+            install_sigterm_handler(_shutdown);
 
-            handle.node_exit_future.await
+            exit.await
         },
     ) {
         eprintln!("Error: {err:?}");

@@ -15,8 +15,8 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 use pipeline_rs_arc::execution::ArcEventInspector;
 
-use crate::event_inspector::record_subcall_trace_completion;
 use crate::types::{PreError, PreErrorCode, PreResult};
+use arc_evm::writer::record_subcall_trace_completion;
 
 /// `pre` namespace API implementation.
 #[derive(Clone)]

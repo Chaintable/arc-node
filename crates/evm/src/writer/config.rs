@@ -1,5 +1,6 @@
 use std::{fmt, sync::Arc};
 
+use crate::{assembler::ArcBlockAssembler, executor::ArcBlockExecutor, ArcEvmConfig};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_evm::{
     block::{state::StateDB, BlockExecutorFactory},
@@ -9,7 +10,6 @@ use alloy_evm::{
 };
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
-use arc_evm::{assembler::ArcBlockAssembler, executor::ArcBlockExecutor, ArcEvmConfig};
 use arc_execution_config::chainspec::ArcChainSpec;
 use pipeline_rs_arc::{
     execution::{seal_history, LiveCapture, WriterExecutor},
@@ -31,7 +31,7 @@ use revm::{
 
 use super::evm::{writer_evm, WriterEvm};
 
-type ParentRoot = Arc<dyn Fn(B256) -> Result<B256, SpoolError> + Send + Sync>;
+pub(crate) type ParentRoot = Arc<dyn Fn(B256) -> Result<B256, SpoolError> + Send + Sync>;
 
 #[derive(Clone)]
 enum Mode {

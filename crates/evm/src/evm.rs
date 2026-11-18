@@ -86,8 +86,15 @@ use revm_context_interface::{FrameStack, Transaction};
 use revm_handler::SystemCallTx;
 use revm_interpreter::interpreter_action::FrameInit;
 use revm_interpreter::{CallScheme, CreateScheme, FrameInput, Instruction};
-use revm_primitives::{Address, Bytes};
+use revm_primitives::{Address, Bytes, B256};
 use std::collections::{HashMap, HashSet};
+
+use crate::writer::WriterEvmConfig;
+use pipeline_rs_arc::{CaptureSink, SpoolError};
+use reth_evm::{
+    either::Either,
+    execute::{BasicBlockExecutor, BlockExecutionError, Executor},
+};
 
 use crate::handler::ArcEvmHandler;
 use crate::opcode::{
@@ -1858,11 +1865,24 @@ impl EvmFactory for ArcEvmFactory {
 }
 
 /// Custom EVM configuration for Arc
+#[derive(Clone)]
+struct HistoryCapture {
+    parent_root: Arc<dyn Fn(B256) -> Result<B256, SpoolError> + Send + Sync>,
+    sink: Arc<dyn CaptureSink>,
+}
+
+impl std::fmt::Debug for HistoryCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryCapture").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ArcEvmConfig {
     pub(crate) inner: EthEvmConfig<ArcChainSpec, ArcEvmFactory>,
     pub(crate) evm_factory_instance: ArcEvmFactory,
     pub(crate) block_assembler: ArcBlockAssembler<ArcChainSpec>,
+    history_capture: Option<HistoryCapture>,
 }
 
 impl ArcEvmConfig {
@@ -1874,6 +1894,26 @@ impl ArcEvmConfig {
             inner,
             evm_factory_instance,
             block_assembler: ArcBlockAssembler::new(chain_spec.clone()),
+            history_capture: None,
+        }
+    }
+
+    pub fn with_history_capture(
+        mut self,
+        parent_root: impl Fn(B256) -> Result<B256, SpoolError> + Send + Sync + 'static,
+        sink: Arc<dyn CaptureSink>,
+    ) -> Self {
+        self.history_capture = Some(HistoryCapture {
+            parent_root: Arc::new(parent_root),
+            sink,
+        });
+        self
+    }
+
+    pub fn without_history_capture(&self) -> Self {
+        Self {
+            history_capture: None,
+            ..self.clone()
         }
     }
 
@@ -1933,6 +1973,23 @@ impl ConfigureEvm for ArcEvmConfig {
     type NextBlockEnvCtx = <EthEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
     type BlockExecutorFactory = Self;
     type BlockAssembler = ArcBlockAssembler<ArcChainSpec>;
+
+    fn batch_executor<DB: Database>(
+        &self,
+        db: DB,
+    ) -> impl Executor<DB, Primitives = Self::Primitives, Error = BlockExecutionError> {
+        match &self.history_capture {
+            Some(history) => Either::Left(BasicBlockExecutor::new(
+                WriterEvmConfig::history(
+                    self.without_history_capture(),
+                    history.parent_root.clone(),
+                    history.sink.clone(),
+                ),
+                db,
+            )),
+            None => Either::Right(BasicBlockExecutor::new(self, db)),
+        }
+    }
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         self

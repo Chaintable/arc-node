@@ -5,9 +5,9 @@ use std::{fmt, sync::Arc};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
+use arc_evm::writer::WriterEvmConfig;
 use arc_evm::ArcEvmConfig;
 use arc_execution_config::chainspec::ArcChainSpec;
-use debank_rpc::writer::WriterEvmConfig;
 use pipeline_rs_arc::{execution::LiveCapture, CaptureSink};
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::EthChainSpec;
@@ -32,7 +32,19 @@ use reth_trie_db::ChangesetCache;
 
 use crate::{node::ArcEngineValidatorBuilder, ArcEngineValidator};
 
+mod delivery;
 pub mod history;
+pub use delivery::start_delivery;
+pub use pipeline_rs_arc::{Delivery, DeliveryConfig};
+
+#[derive(Clone)]
+pub(crate) struct HistorySink(pub(crate) Arc<dyn CaptureSink>);
+
+impl fmt::Debug for HistorySink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistorySink").finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone)]
 pub struct WriterValidatorBuilder {

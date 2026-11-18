@@ -12,7 +12,7 @@ COPY assets/apt/debian.sources /etc/apt/sources.list.d/debian.sources
 # Remove default sources.list to use only our fallback-enabled sources
 RUN rm -f /etc/apt/sources.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends libclang-dev pkg-config && \
+    apt-get install -y --no-install-recommends cmake libclang-dev libssl-dev pkg-config && \
     rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef@0.1.73
 
@@ -98,7 +98,7 @@ COPY assets/apt/apt-retry.conf /etc/apt/apt.conf.d/apt-retry.conf
 COPY assets/apt/debian.sources /etc/apt/sources.list.d/debian.sources
 RUN rm -f /etc/apt/sources.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends bash coreutils procps libstdc++6 && \
+    apt-get install -y --no-install-recommends bash coreutils procps libssl3 libstdc++6 && \
     rm -rf /var/lib/apt/lists/*
 
 FROM runtime-base AS release-runtime
@@ -131,7 +131,7 @@ COPY assets/apt/debian.sources /etc/apt/sources.list.d/debian.sources
 # Install iptables and tc for chaos testing
 RUN rm -f /etc/apt/sources.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends iptables iproute2 && \
+    apt-get install -y --no-install-recommends iptables iproute2 libssl3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy application binaries from the builder stage into the final image.

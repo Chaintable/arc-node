@@ -35,7 +35,7 @@ use reth_engine_primitives::EngineTypes;
 use reth_ethereum::{node::EthEngineTypes, node::EthEvmConfig};
 use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_primitives::EthPrimitives;
-use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
+use reth_evm::ConfigureEvm;
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
 use reth_node_api::{
     AddOnsContext, FullNodeComponents, HeaderTy, NodeAddOns, PayloadAttributesBuilder,
@@ -75,7 +75,6 @@ use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use reth_rpc_server_types::RethRpcModule;
 use reth_tracing::tracing::{info, warn};
 use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
-use revm::context::TxEnv;
 use std::{default::Default, marker::PhantomData, sync::Arc};
 
 use arc_execution_config::addresses_denylist::AddressesDenylistConfig;
@@ -110,6 +109,7 @@ fn remove_public_bundle_rpc_methods(modules: &mut TransportRpcModules) {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ArcNode {
+    history_sink: Option<crate::writer::HistorySink>,
     pub rpc_cfg: ArcRpcConfig,
     pub invalid_tx_list_cfg: InvalidTxListConfig,
     pub addresses_denylist_config: AddressesDenylistConfig,
@@ -143,9 +143,15 @@ pub struct ArcNode {
 }
 
 impl ArcNode {
+    pub fn with_writer_history(mut self, sink: Arc<dyn pipeline_rs_arc::CaptureSink>) -> Self {
+        self.history_sink = Some(crate::writer::HistorySink(sink));
+        self
+    }
+
     /// Node with default settings and an explicitly supplied denylist config.
     pub fn with_denylist_config(addresses_denylist_config: AddressesDenylistConfig) -> Self {
         Self {
+            history_sink: None,
             rpc_cfg: ArcRpcConfig::default(),
             invalid_tx_list_cfg: InvalidTxListConfig::default(),
             addresses_denylist_config,
@@ -178,6 +184,7 @@ impl ArcNode {
         tx_relay_timeout: std::time::Duration,
     ) -> Self {
         Self {
+            history_sink: None,
             rpc_cfg,
             invalid_tx_list_cfg,
             addresses_denylist_config,
@@ -437,7 +444,7 @@ where
             Primitives = EthPrimitives,
             Payload: EngineTypes<ExecutionData = ExecutionData>,
         >,
-        Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+        Evm = ArcEvmConfig,
     >,
     EthB: EthApiBuilder<N>,
     EthB::EthApi: RpcNodeCore<Evm = ArcEvmConfig, Primitives = EthPrimitives>,
@@ -445,7 +452,6 @@ where
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
-    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
     RpcMiddleware: RethRpcMiddleware,
 {
     type Handle = RpcHandle<N, EthB::EthApi>;
@@ -457,7 +463,7 @@ where
         let validation_api = ValidationApi::<_, _, <N::Types as NodeTypes>::Payload>::new(
             ctx.node.provider().clone(),
             Arc::new(ctx.node.consensus().clone()),
-            ctx.node.evm_config().clone(),
+            ctx.node.evm_config().without_history_capture(),
             ctx.config.rpc.flashbots_config(),
             ctx.node.task_executor().clone(),
             Arc::new(ArcEngineValidator::new(ctx.config.chain.clone())),
@@ -515,7 +521,7 @@ where
             Primitives = EthPrimitives,
             Payload: EngineTypes<ExecutionData = ExecutionData>,
         >,
-        Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+        Evm = ArcEvmConfig,
     >,
     EthB: EthApiBuilder<N>,
     EthB::EthApi: RpcNodeCore<Evm = ArcEvmConfig, Primitives = EthPrimitives>,
@@ -523,7 +529,6 @@ where
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
-    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
 {
     type EthApi = EthB::EthApi;
 
@@ -541,14 +546,13 @@ where
             Primitives = EthPrimitives,
             Payload: EngineTypes<ExecutionData = ExecutionData>,
         >,
-        Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+        Evm = ArcEvmConfig,
     >,
     EthB: EthApiBuilder<N>,
     PVB: Send,
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
-    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
     RpcMiddleware: Send,
 {
     type ValidatorBuilder = EVB;
@@ -588,6 +592,9 @@ where
             self.wait_for_payload,
             self.rebroadcast_interval,
         )
+        .executor(ArcExecutorBuilder {
+            history_sink: self.history_sink.clone(),
+        })
     }
 
     fn add_ons(&self) -> Self::AddOns {
@@ -621,7 +628,9 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ArcNode {
 /// A regular Arc evm and executor builder.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
-pub struct ArcExecutorBuilder;
+pub struct ArcExecutorBuilder {
+    history_sink: Option<crate::writer::HistorySink>,
+}
 
 impl<Types, Node> ExecutorBuilder<Node> for ArcExecutorBuilder
 where
@@ -635,7 +644,26 @@ where
             ctx.chain_spec().clone(),
             ArcEvmFactory::new(ctx.chain_spec().clone()),
         );
-        Ok(ArcEvmConfig::new(evm_config))
+        let evm_config = ArcEvmConfig::new(evm_config);
+        if let Some(history) = self.history_sink {
+            use reth_provider::HeaderProvider;
+            let provider = ctx.provider().clone();
+            return Ok(evm_config.with_history_capture(
+                move |hash| {
+                    let header = provider
+                        .header(hash)
+                        .map_err(|err| pipeline_rs_arc::SpoolError::Projection(err.to_string()))?
+                        .ok_or_else(|| {
+                            pipeline_rs_arc::SpoolError::Projection(format!(
+                                "missing parent header {hash} for history capture"
+                            ))
+                        })?;
+                    Ok(header.state_root)
+                },
+                history.0,
+            ));
+        }
+        Ok(evm_config)
     }
 }
 

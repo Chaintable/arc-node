@@ -21,6 +21,7 @@ arbitrary = [
 integration = ["arc-precompiles/integration"]
 
 [dependencies]
+pipeline-rs-arc = { path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer", features = ["execution"] }
 # alloy
 alloy-consensus = { workspace = true, features = ["serde"] }
 alloy-eips.workspace = true

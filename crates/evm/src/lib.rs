@@ -34,6 +34,7 @@ pub mod opcode;
 pub mod subcall;
 #[cfg(test)]
 mod subcall_test;
+pub mod writer;
 
 // Re-export commonly used types
 pub use evm::{

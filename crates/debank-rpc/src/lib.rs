@@ -13,12 +13,10 @@
 
 pub mod debank_trace;
 pub mod erc20_handle;
-mod event_inspector;
 pub mod multi_call;
 pub mod pre;
 pub mod trace_block;
 pub mod types;
-pub mod writer;
 
 // Re-export key types for registration
 pub use debank_trace::DebankOutPut;

@@ -4,7 +4,7 @@
 
 ## Architecture
 
-This repo runs Arc's execution layer with a [Chaintable pipeline](https://github.com/Chaintable/pipeline)-compatible tracer. It exposes block headers, transactions, call traces, receipts, events, and state diffs through `trace_debankBlock`. An external [background-tracer / ETL](https://github.com/Chaintable/background-tracer) process calls this RPC and uploads the results to **S3 + Kafka**; the writer itself does not upload to either service (see pipeline's [architecture](https://github.com/Chaintable/pipeline/blob/main/docs/architecture.md)).
+This repo runs Arc's execution layer with a [Chaintable pipeline](https://github.com/Chaintable/pipeline)-compatible tracer. It exposes block headers, transactions, call traces, receipts, events, and state diffs through `trace_debankBlock`. An external [background-tracer / ETL](https://github.com/Chaintable/background-tracer) process calls this RPC and uploads the results to **S3 + Kafka**; this is the default mode (see pipeline's [architecture](https://github.com/Chaintable/pipeline/blob/main/docs/architecture.md)).
 
 - **Block headers + state diffs** → Kafka + S3 → [leafage-evm](https://github.com/Chaintable/leafage-evm): a lightweight EVM executor serving state queries.
 - **Block files** (transactions · call traces · receipts · events) → S3 → Chaintable's transaction/trace indexing pipeline.
@@ -17,6 +17,38 @@ background-tracer / ETL
         ├─ block headers + state diffs ─→ Kafka + S3 ─→ leafage-evm
         └─ block files ─────────────────→ S3 ─→ Chaintable indexing pipeline
 ```
+
+## In-process Writer
+
+Pass `--writer-config <file>` and `--arc-rpc-upstream-url <trusted-consensus-url>`
+to `arc-node-execution node` to publish from native Arc execution. Use the same
+database and spool across restarts. Kafka recovery reads the last `NewBlock`
+message in the configured partition. Run a single publishing owner for that
+partition.
+
+Example configuration:
+
+```json
+{
+  "spool": "/var/lib/arc/writer",
+  "spool_bytes": 68719476736,
+  "version": "shadow",
+  "blockfile_bucket": "arc-blockfiles",
+  "nodex_bucket": "arc-state",
+  "kafka_topic": "arc-shadow",
+  "kafka_partition": 0,
+  "kafka": { "bootstrap.servers": "localhost:9092" },
+  "initialize_empty_topic": true
+}
+```
+
+`initialize_empty_topic` defaults to false. Enable it to bootstrap a new stream
+with genesis. S3 uses the AWS SDK configuration and credentials. For an isolated
+S3-compatible service, set `s3_endpoint` in the same file. Keep credentials out
+of source control. Size the spool for the entire historical backfill range pending
+native validation. Historical publication waits for a persisted Finish checkpoint,
+a matching Arc consensus certificate and all required object acknowledgements.
+Realtime publication follows Reth's canonical selection and the same Kafka tail.
 
 ## Chaintable images
 

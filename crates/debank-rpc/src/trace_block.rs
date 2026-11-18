@@ -28,7 +28,7 @@ use reth_rpc_eth_types::{cache::db::StateProviderTraitObjWrapper, EthApiError};
 use revm::database::states::bundle_state::BundleRetention;
 
 use crate::debank_trace::*;
-use crate::event_inspector::record_subcall_trace_completion;
+use arc_evm::writer::record_subcall_trace_completion;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TxExecutionOutcome {

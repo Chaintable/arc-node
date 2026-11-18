@@ -10,6 +10,7 @@ use std::{
 use alloy_primitives::{Bytes, B256};
 use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadAttributes};
+use arc_evm::writer::WriterEvmConfig;
 use arc_evm::{ArcEvmConfig, ArcEvmFactory};
 use arc_evm_node::{
     node::ArcNode,
@@ -19,7 +20,6 @@ use arc_evm_node::{
     },
 };
 use arc_execution_config::{addresses_denylist::AddressesDenylistConfig, chainspec::MAINNET};
-use debank_rpc::writer::WriterEvmConfig;
 use debank_rpc::{DebankTraceApiServer, DebankTraceBlock};
 use pipeline_rs_arc::{
     execution::{capture_genesis, LiveCapture},
@@ -125,7 +125,7 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         Vec::new(),
     ));
     let writer = NodeBuilder::new(config)
-        .testing_node(runtime)
+        .testing_node(runtime.clone())
         .with_types::<ArcNode>()
         .with_components(arc.components_builder())
         .with_add_ons(
@@ -182,11 +182,9 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
     assert!(writer_status.is_valid(), "{writer_status:?}");
 
     let parent_root = genesis.state_root();
-    let history = WriterEvmConfig::history(
-        plain_config.clone(),
-        Arc::new(move |_| Ok(parent_root)),
-        sink.clone(),
-    );
+    let history = plain_config
+        .clone()
+        .with_history_capture(move |_| Ok(parent_root), sink.clone());
     let state = || {
         plain
             .node
@@ -329,6 +327,64 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         "H2 {} downloaded and captured over loopback P2P",
         block2.hash()
     );
+    let mut archive_config = NodeConfig::new(MAINNET.clone()).with_unused_ports();
+    archive_config.network.discovery.disable_discovery = true;
+    archive_config.network.bootnodes = Some(Vec::new());
+    archive_config.debug.tip = Some(block2.hash());
+    archive_config.debug.max_block = Some(2);
+    let archive_sink = Arc::new(CaptureLog::default());
+    let archive = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        NodeBuilder::new(archive_config)
+            .testing_node(runtime)
+            .node(
+                ArcNode::with_denylist_config(AddressesDenylistConfig::new(
+                    Default::default(),
+                    Default::default(),
+                    Vec::new(),
+                ))
+                .with_writer_history(archive_sink.clone()),
+            )
+            .launch_with_debug_capabilities(),
+    )
+    .await??;
+    archive.node.network.add_peer(
+        peer.id,
+        std::net::SocketAddr::from(([127, 0, 0, 1], peer.tcp_port)),
+    );
+    let archive_certificate = DecidedBlock {
+        height: 2,
+        block_hash: block2.hash(),
+    };
+    let archive_range = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Some(range) =
+                confirmed_range(&archive.node.provider, kafka_tail, 2, archive_certificate)?
+            {
+                break Ok::<_, eyre::Report>(range);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        archive_range
+            .iter()
+            .map(|block| block.hash)
+            .collect::<Vec<_>>(),
+        [block.hash(), block2.hash()]
+    );
+    {
+        let captures = archive_sink.0.lock().unwrap();
+        assert_eq!(captures.len(), 2);
+        for ((captured, source), expected) in
+            captures.iter().zip([&input["writer"], &input2["writer"]])
+        {
+            assert_eq!(*source, CaptureSource::HistoryAwaitingMerkle);
+            equivalent(captured, expected)?;
+        }
+    }
+    println!("Native historical Execution stage captured H1 and H2 before Finish committed");
     let shutdown = plain
         .node
         .add_ons_handle

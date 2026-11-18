@@ -1,9 +1,9 @@
+use crate::ArcEvmFactory;
 use alloy_evm::{eth::EthEvmContext, Database, EvmEnv, EvmFactory};
-use arc_evm::ArcEvmFactory;
 use pipeline_rs_arc::execution::{CaptureEvm, CaptureInspector};
 use revm::inspector::Inspector;
 
-use crate::event_inspector::record_subcall_trace_completion;
+use super::record_subcall_trace_completion;
 
 pub type WriterEvm<DB, I> =
     CaptureEvm<<ArcEvmFactory as EvmFactory>::Evm<DB, CaptureInspector<I>>, I>;

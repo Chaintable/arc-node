@@ -18,7 +18,7 @@ pub struct DecidedBlock {
 pub async fn read_decided_block(
     client: &Client,
     consensus_url: &Url,
-    height: u64,
+    height: Option<u64>,
 ) -> eyre::Result<Option<DecidedBlock>> {
     let mut url = consensus_url.clone();
     url.path_segments_mut()
@@ -26,16 +26,22 @@ pub async fn read_decided_block(
         .pop_if_empty()
         .push("commit");
     url.set_query(None);
-    let response = client.get(url).query(&[("height", height)]).send().await?;
+    let mut request = client.get(url);
+    if let Some(height) = height {
+        request = request.query(&[("height", height)]);
+    }
+    let response = request.send().await?;
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(None);
     }
     let block: DecidedBlock = response.error_for_status()?.json().await?;
-    eyre::ensure!(
-        block.height == height,
-        "Arc commit height mismatch: requested {height}, received {}",
-        block.height
-    );
+    if let Some(height) = height {
+        eyre::ensure!(
+            block.height == height,
+            "Arc commit height mismatch: requested {height}, received {}",
+            block.height
+        );
+    }
     Ok(Some(block))
 }
 

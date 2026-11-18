@@ -1,9 +1,9 @@
 //! Adapts Arc EVM subcall completion to the library's trace observer.
 
-use arc_evm::{SubcallTraceCompletion, SubcallTraceCompletionPhase};
+use crate::{SubcallTraceCompletion, SubcallTraceCompletionPhase};
 use pipeline_rs_arc::execution::{self, TraceInspector};
 
-pub(crate) fn record_subcall_trace_completion(
+pub fn record_subcall_trace_completion(
     inspector: &mut TraceInspector,
     completion: SubcallTraceCompletion,
 ) {

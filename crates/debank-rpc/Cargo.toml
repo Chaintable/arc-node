@@ -53,10 +53,8 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 
-# Writer capture contract
-alloy-rpc-types-engine.workspace = true
+# DeBank trace projection
 pipeline-rs-arc = { path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer", features = ["execution"] }
-arc-execution-config.workspace = true
 
 [dev-dependencies]
 alloy-genesis.workspace = true
