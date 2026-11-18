@@ -33,6 +33,7 @@ alloy-sol-types = { workspace = true }
 arc-evm = { workspace = true }
 
 # Reth
+reth-ethereum = { workspace = true, features = ["evm"] }
 reth-chainspec = { workspace = true }
 reth-evm = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
@@ -57,3 +58,8 @@ sha1 = "0.10"
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
+
+# Writer capture contract
+alloy-rpc-types-engine.workspace = true
+pipeline-rs-arc = { path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer" }
+arc-execution-config.workspace = true

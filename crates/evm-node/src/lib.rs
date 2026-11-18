@@ -25,6 +25,7 @@ pub mod payload;
 pub mod rebroadcast;
 pub mod rpc;
 pub mod rpc_middleware;
+pub mod writer;
 
 // Re-export commonly used types
 pub use engine::ArcEngineValidator;

@@ -88,3 +88,33 @@ tracing-test = "0.2"
 
 [lints]
 workspace = true
+
+[dev-dependencies.alloy-rpc-types-engine]
+workspace = true
+
+[dev-dependencies.debank-rpc]
+workspace = true
+
+[dev-dependencies.reth-primitives-traits]
+workspace = true
+
+[dev-dependencies.reth-provider]
+workspace = true
+
+[dev-dependencies.reth-tasks]
+workspace = true
+
+[dev-dependencies.pipeline-rs-arc]
+path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer"
+
+[dev-dependencies.reth-revm]
+workspace = true
+
+[dev-dependencies.alloy-rpc-types-eth]
+workspace = true
+
+[dev-dependencies.serde]
+workspace = true
+
+[dev-dependencies.thiserror]
+workspace = true

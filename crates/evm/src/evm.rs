@@ -1876,6 +1876,22 @@ impl ArcEvmConfig {
             block_assembler: ArcBlockAssembler::new(chain_spec.clone()),
         }
     }
+
+    /// Builds the Arc executor around an EVM adapter while retaining Arc's
+    /// chain rules and receipt builder.
+    pub fn create_executor_with_evm<'a, E: AlloyEvmTrait>(
+        &'a self,
+        evm: E,
+        ctx: EthBlockExecutionCtx<'a>,
+    ) -> ArcBlockExecutor<'a, E, &'a Arc<ArcChainSpec>, &'a reth_ethereum::evm::RethReceiptBuilder>
+    {
+        ArcBlockExecutor::new(
+            evm,
+            ctx,
+            self.inner.chain_spec(),
+            self.inner.executor_factory.receipt_builder(),
+        )
+    }
 }
 
 impl BlockExecutorFactory for ArcEvmConfig {
@@ -1907,12 +1923,7 @@ impl BlockExecutorFactory for ArcEvmConfig {
         DB: StateDB,
         I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>,
     {
-        ArcBlockExecutor::new(
-            evm,
-            ctx,
-            self.inner.chain_spec(),
-            self.inner.executor_factory.receipt_builder(),
-        )
+        self.create_executor_with_evm(evm, ctx)
     }
 }
 

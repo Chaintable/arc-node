@@ -50,7 +50,7 @@ impl TxExecutionOutcome {
     }
 }
 
-fn new_debank_inspector() -> (TracingInspector, ArcEventInspector) {
+pub(crate) fn new_debank_inspector() -> (TracingInspector, ArcEventInspector) {
     let mut config = TracingInspectorConfig::default_parity()
         .set_steps(true)
         .set_record_logs(true)
@@ -104,49 +104,16 @@ where
             return Err(EthApiError::HeaderNotFound(block_id).into());
         };
 
-        let debank_block = DebankBlock {
-            id: block.hash(),
-            height: block.number(),
-            parent_id: block.parent_hash(),
-            base_fee_per_gas: block.base_fee_per_gas(),
-            miner: block.beneficiary(),
-            gas_limit: block.gas_limit(),
-            gas_used: block.gas_used(),
-            timestamp: block.timestamp(),
-            process_start_timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0),
-        };
+        let (debank_block, debank_header) = block_metadata(block.sealed_block());
 
-        let debank_header = Header {
-            inner: block.header().clone(),
-            hash: block.hash(),
-            total_difficulty: None,
-            size: None,
-        };
-
-        // Genesis block: synthetic txs from chain spec
+        // Genesis block: synthetic txs from chain spec.
         if block.number() == 0 {
             let chain_spec = self.eth_api.provider().chain_spec();
-            let genesis = chain_spec.genesis();
-            let mut state_diff: BlockStorageDiff = genesis.into();
-            state_diff.hash = block.state_root();
-            let (transactions, traces) = build_genesis_txs_and_traces(genesis);
-            let block_file = BlockFile {
-                block: debank_block,
-                transactions,
-                traces,
-                storage_contracts: get_storage_contracts_from_genesis(genesis),
-                ..Default::default()
-            };
-            let validation_hash = block_file.validation().validation_hash;
-            return Ok(DebankOutPut {
-                block_file,
-                header: debank_header,
-                state_diff: alloy_rlp::encode(state_diff).into(),
-                validation_hash,
-            });
+            return Ok(genesis_output(
+                chain_spec.genesis(),
+                debank_block,
+                debank_header,
+            ));
         }
 
         // Build DebankTransactions from receipts
@@ -434,7 +401,58 @@ where
     }
 }
 
-fn validate_transaction_classification(
+pub(crate) fn block_metadata(
+    block: &reth_primitives_traits::SealedBlock<reth_primitives_traits::BlockTy<EthPrimitives>>,
+) -> (DebankBlock, Header) {
+    (
+        DebankBlock {
+            id: block.hash(),
+            height: block.number(),
+            parent_id: block.parent_hash(),
+            base_fee_per_gas: block.base_fee_per_gas(),
+            miner: block.beneficiary(),
+            gas_limit: block.gas_limit(),
+            gas_used: block.gas_used(),
+            timestamp: block.timestamp(),
+            process_start_timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        },
+        Header {
+            inner: block.header().clone(),
+            hash: block.hash(),
+            total_difficulty: None,
+            size: None,
+        },
+    )
+}
+
+pub(crate) fn genesis_output(
+    genesis: &alloy_genesis::Genesis,
+    block: DebankBlock,
+    header: Header,
+) -> DebankOutPut {
+    let mut state_diff: BlockStorageDiff = genesis.into();
+    state_diff.hash = header.state_root;
+    let (transactions, traces) = build_genesis_txs_and_traces(genesis);
+    let block_file = BlockFile {
+        block,
+        transactions,
+        traces,
+        storage_contracts: get_storage_contracts_from_genesis(genesis),
+        ..Default::default()
+    };
+    let validation_hash = block_file.validation().validation_hash;
+    DebankOutPut {
+        block_file,
+        header,
+        state_diff: alloy_rlp::encode(state_diff).into(),
+        validation_hash,
+    }
+}
+
+pub(crate) fn validate_transaction_classification(
     tx_success: bool,
     traces: &[DebankTrace],
     error_traces: &[DebankTrace],
@@ -470,7 +488,7 @@ fn validate_transaction_classification(
     Ok(())
 }
 
-fn debank_transaction_target(
+pub(crate) fn debank_transaction_target(
     recipient: Option<alloy_primitives::Address>,
     contract_address: Option<alloy_primitives::Address>,
 ) -> alloy_primitives::Address {

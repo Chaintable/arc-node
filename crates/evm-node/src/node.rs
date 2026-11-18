@@ -377,6 +377,21 @@ where
         ArcAddOns::new(inner.with_engine_api(engine_api_builder), arc_rpc)
     }
 
+    /// Replace the engine tree validator builder for Writer execution.
+    pub fn with_engine_validator<T>(
+        self,
+        engine_validator_builder: T,
+    ) -> ArcAddOns<N, EthB, PVB, EB, T, RpcMiddleware>
+    where
+        T: Send,
+    {
+        let Self { inner, arc_rpc } = self;
+        ArcAddOns::new(
+            inner.with_engine_validator(engine_validator_builder),
+            arc_rpc,
+        )
+    }
+
     /// Replace the payload validator builder.
     pub fn with_payload_validator<V, T>(
         self,

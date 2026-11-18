@@ -13,7 +13,7 @@ use alloy_primitives::{
 };
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_rpc_types_eth::Header;
-use revm::{database::BundleState, DatabaseRef};
+use revm::{database::BundleState, state::AccountInfo, DatabaseRef};
 use revm_inspectors::tracing::{
     types::{CallKind, CallTraceNode},
     CallTraceArena,
@@ -731,6 +731,26 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
     bundle: BundleState,
     pre_db: DB,
 ) -> BlockStorageDiff {
+    storage_diffs_from_bundle(bundle, |address, _| {
+        pre_db
+            .basic_ref(address)
+            .ok()
+            .flatten()
+            .map(|account| account.code_hash)
+    })
+}
+
+/// Projects a single-block bundle whose original account metadata is from its parent.
+pub(crate) fn captured_storage_diff(bundle: BundleState) -> BlockStorageDiff {
+    storage_diffs_from_bundle(bundle, |_, original| {
+        original.map(|account| account.code_hash)
+    })
+}
+
+fn storage_diffs_from_bundle(
+    bundle: BundleState,
+    parent_code_hash: impl Fn(Address, Option<&AccountInfo>) -> Option<H256>,
+) -> BlockStorageDiff {
     let mut new_accounts = Vec::new();
     let mut deleted_accounts = Vec::new();
     let mut storage_diffs = Vec::new();
@@ -768,9 +788,7 @@ pub fn get_storage_diffs_from_bundle<DB: DatabaseRef>(
 
         if let Some(code) = info.code {
             let code_hash = info.code_hash;
-            if let Ok(Some(account)) = pre_db.basic_ref(address)
-                && account.code_hash == code_hash
-            {
+            if parent_code_hash(address, account.original_info.as_ref()) == Some(code_hash) {
                 continue;
             }
             new_codes.push(NewCode {
