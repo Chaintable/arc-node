@@ -455,7 +455,7 @@ fn deletion_block_execution_projection() -> eyre::Result<()> {
 
     let sink = CaptureLog::default();
     let ordinary = plain.batch_executor(db.clone()).execute(&block)?;
-    let captured = live.batch_executor(db).execute(&block)?;
+    let captured = live.executor(db).execute(&block)?;
     slot.accept(
         block.header(),
         block.hash(),

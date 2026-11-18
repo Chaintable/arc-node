@@ -13,6 +13,7 @@ use arc_execution_config::chainspec::ArcChainSpec;
 use pipeline_rs_arc::execution::{LiveCapture, WriterExecutor};
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
 use reth_evm::{
+    execute::{BlockExecutionError, Executor},
     ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
 };
 use reth_primitives_traits::{BlockTy, SealedBlock, SealedHeader};
@@ -122,6 +123,15 @@ impl ConfigureEvm for WriterEvmConfig {
     type NextBlockEnvCtx = <ArcEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
     type BlockExecutorFactory = Self;
     type BlockAssembler = ArcBlockAssembler<ArcChainSpec>;
+
+    fn batch_executor<DB: Database>(
+        &self,
+        db: DB,
+    ) -> impl Executor<DB, Primitives = Self::Primitives, Error = BlockExecutionError> {
+        // The native invalid-block witness hook uses a batch executor to replay
+        // the rejected block. Keep that replay out of the live capture slot.
+        self.inner.batch_executor(db)
+    }
 
     fn block_executor_factory(&self) -> &Self {
         self

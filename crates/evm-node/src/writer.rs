@@ -10,27 +10,26 @@ use arc_evm::ArcEvmConfig;
 use arc_execution_config::chainspec::ArcChainSpec;
 use pipeline_rs_arc::{execution::LiveCapture, CaptureSink};
 use reth_chain_state::ExecutedBlock;
-use reth_chainspec::EthChainSpec;
 use reth_engine_tree::tree::{
     payload_processor::multiproof::StateRootHandle,
     payload_validator::{TreeCtx, ValidationOutcome},
-    BasicEngineValidator, CacheWaitDurations, EngineApiTreeState, EngineValidator, SavedCache,
-    TreeConfig, WaitForCaches,
+    CacheWaitDurations, EngineApiTreeState, EngineValidator, SavedCache, TreeConfig, WaitForCaches,
 };
 use reth_ethereum::{node::EthEngineTypes, Block};
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_node_api::{AddOnsContext, FullNodeComponents, NodeTypes};
 use reth_node_builder::{
-    invalid_block_hook::InvalidBlockHookExt,
-    rpc::{EngineValidatorBuilder, PayloadValidatorBuilder},
+    components::{Components, NodeComponents},
+    rpc::{BasicEngineValidatorBuilder, EngineValidatorBuilder},
+    NodeAdapter,
 };
 use reth_payload_primitives::{InvalidPayloadAttributesError, NewPayloadError};
 use reth_primitives_traits::SealedBlock;
 use reth_provider::HeaderProvider;
 use reth_trie_db::ChangesetCache;
 
-use crate::{node::ArcEngineValidatorBuilder, ArcEngineValidator};
+use crate::node::ArcEngineValidatorBuilder;
 
 mod delivery;
 pub use delivery::start_delivery;
@@ -54,6 +53,16 @@ impl WriterValidatorBuilder {
     }
 }
 
+type WriterComponents<N> = Components<
+    N,
+    <N as FullNodeComponents>::Network,
+    <N as FullNodeComponents>::Pool,
+    WriterEvmConfig,
+    <N as FullNodeComponents>::Consensus,
+>;
+type WriterNode<N> = NodeAdapter<N, WriterComponents<N>>;
+type ArcValidatorBuilder = BasicEngineValidatorBuilder<ArcEngineValidatorBuilder>;
+
 impl<N> EngineValidatorBuilder<N> for WriterValidatorBuilder
 where
     N: FullNodeComponents<
@@ -64,9 +73,10 @@ where
         >,
         Evm = ArcEvmConfig,
     >,
+    WriterComponents<N>: NodeComponents<N, Evm = WriterEvmConfig>,
 {
     type EngineValidator = WriterValidator<
-        BasicEngineValidator<N::Provider, WriterEvmConfig, ArcEngineValidator<ArcChainSpec>>,
+        <ArcValidatorBuilder as EngineValidatorBuilder<WriterNode<N>>>::EngineValidator,
         N::Provider,
     >;
 
@@ -76,25 +86,30 @@ where
         tree_config: TreeConfig,
         changeset_cache: ChangesetCache,
     ) -> eyre::Result<Self::EngineValidator> {
-        let validator = ArcEngineValidatorBuilder::default().build(ctx).await?;
-        let data_dir = ctx
-            .config
-            .datadir
-            .clone()
-            .resolve_datadir(ctx.config.chain.chain());
-        let invalid_block_hook = ctx.create_invalid_block_hook(&data_dir).await?;
+        let node = &ctx.node;
         let capture = LiveCapture::default();
-        let provider = ctx.node.provider().clone();
-        let inner = BasicEngineValidator::new(
-            provider.clone(),
-            Arc::new(ctx.node.consensus().clone()),
-            WriterEvmConfig::live(ctx.node.evm_config().clone(), capture.clone()),
-            validator,
-            tree_config,
-            invalid_block_hook,
-            changeset_cache,
-            ctx.node.task_executor().clone(),
-        );
+        let provider = node.provider().clone();
+        // Use the capture EVM only in the native tree validator builder's context.
+        let writer_ctx = AddOnsContext {
+            node: NodeAdapter {
+                components: Components {
+                    transaction_pool: node.pool().clone(),
+                    evm_config: WriterEvmConfig::live(node.evm_config().clone(), capture.clone()),
+                    consensus: node.consensus().clone(),
+                    network: node.network().clone(),
+                    payload_builder_handle: node.payload_builder_handle().clone(),
+                },
+                task_executor: node.task_executor().clone(),
+                provider: provider.clone(),
+            },
+            config: ctx.config,
+            beacon_engine_handle: ctx.beacon_engine_handle.clone(),
+            engine_events: ctx.engine_events.clone(),
+            jwt_secret: ctx.jwt_secret,
+        };
+        let inner = ArcValidatorBuilder::default()
+            .build_tree_validator(&writer_ctx, tree_config, changeset_cache)
+            .await?;
         Ok(WriterValidator {
             inner,
             provider,
