@@ -633,7 +633,7 @@ fn main() {
                 tx_relays,
                 tx_relay_timeout,
             );
-            let (exit, _shutdown) = if let Some(path) = ext.writer_config {
+            let (exit, rpc) = if let Some(path) = ext.writer_config {
                 let config: DeliveryConfig = serde_json::from_reader(std::fs::File::open(path)?)?;
                 let spec = builder.config().chain.clone();
                 let database = builder
@@ -661,24 +661,20 @@ fn main() {
                     })
                     .launch_with_debug_capabilities()
                     .await?;
-                (
-                    handle.node_exit_future,
-                    handle.node.add_ons_handle.engine_shutdown.clone(),
-                )
+                (handle.node_exit_future, handle.node.add_ons_handle)
             } else {
                 let handle = builder.node(arc).launch_with_debug_capabilities().await?;
-                (
-                    handle.node_exit_future,
-                    handle.node.add_ons_handle.engine_shutdown.clone(),
-                )
+                (handle.node_exit_future, handle.node.add_ons_handle)
             };
 
             spawn_pprof_server(ext.pprof_addr.parse()?, ext.pprof_heap_prof);
 
             #[cfg(unix)]
-            install_sigterm_handler(_shutdown);
+            install_sigterm_handler(rpc.engine_shutdown.clone());
 
-            exit.await
+            let result = exit.await;
+            drop(rpc);
+            result
         },
     ) {
         eprintln!("Error: {err:?}");
