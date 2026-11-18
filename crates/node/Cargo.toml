@@ -36,6 +36,7 @@ alloy-rpc-types-trace.workspace = true
 alloy-sol-types.workspace = true
 arc-evm.workspace = true
 arc-evm-node.workspace = true
+debank-rpc.workspace = true
 arc-execution-config.workspace = true
 arc-execution-txpool.workspace = true
 arc-execution-validation.workspace = true
@@ -90,9 +91,6 @@ tracing-test = "0.2"
 workspace = true
 
 [dev-dependencies.alloy-rpc-types-engine]
-workspace = true
-
-[dev-dependencies.debank-rpc]
 workspace = true
 
 [dev-dependencies.reth-primitives-traits]

@@ -20,8 +20,8 @@ background-tracer / ETL
 
 ## In-process Writer
 
-Pass `--writer-config <file>` and `--arc-rpc-upstream-url <trusted-consensus-url>`
-to `arc-node-execution node` to publish from native Arc execution. Use the same
+Pass `--writer-config <file>` to `arc-node-execution node` to publish from
+native Arc execution. Use the same
 database and spool across restarts. Kafka recovery reads the last `NewBlock`
 message in the configured partition. Run a single publishing owner for that
 partition.
@@ -45,10 +45,11 @@ Example configuration:
 `initialize_empty_topic` defaults to false. Enable it to bootstrap a new stream
 with genesis. S3 uses the AWS SDK configuration and credentials. For an isolated
 S3-compatible service, set `s3_endpoint` in the same file. Keep credentials out
-of source control. Size the spool for the entire historical backfill range pending
-native validation. Historical publication waits for a persisted Finish checkpoint,
-a matching Arc consensus certificate and all required object acknowledgements.
-Realtime publication follows Reth's canonical selection and the same Kafka tail.
+of source control. The Writer captures live blocks during native validation.
+When the next canonical block after the Kafka tail has no capture and is
+finalized, the worker uses the existing `trace_debankBlock` implementation to
+replay it by hash. The node must retain receipts and parent state for that
+range. Both paths use the same spool, object acknowledgements and publisher.
 
 ## Chaintable images
 

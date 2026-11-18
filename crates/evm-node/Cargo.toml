@@ -93,7 +93,3 @@ tag = "v2.2.0"
 [dependencies.pipeline-rs-arc]
 path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer"
 features = ["execution", "delivery"]
-
-
-[dependencies.reth-stages-types]
-workspace = true

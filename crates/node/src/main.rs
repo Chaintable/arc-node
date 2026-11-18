@@ -42,6 +42,7 @@ use arc_execution_config::defaults;
 use arc_execution_config::follow;
 use arc_node_execution::patch_node_command_defaults;
 use clap::{Args, CommandFactory, FromArgMatches, Parser};
+use debank_rpc::DebankTraceBlock;
 use directories::BaseDirs;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum::cli::interface::{Cli as RethCli, Commands};
@@ -634,11 +635,6 @@ fn main() {
             );
             let (exit, _shutdown) = if let Some(path) = ext.writer_config {
                 let config: DeliveryConfig = serde_json::from_reader(std::fs::File::open(path)?)?;
-                let consensus_url = ext
-                    .arc_rpc_upstream_url
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("--writer-config requires --arc-rpc-upstream-url"))?
-                    .parse()?;
                 let spec = builder.config().chain.clone();
                 let database = builder
                     .config()
@@ -649,7 +645,6 @@ fn main() {
                 let source_id = database.canonicalize()?.to_string_lossy().into_owned();
                 let delivery =
                     Delivery::open(&config, spec.chain().id(), spec.genesis_hash(), source_id)?;
-                let arc = arc.with_writer_history(delivery.clone());
                 let handle = builder
                     .with_types::<ArcNode>()
                     .with_components(arc.components_builder())
@@ -658,7 +653,11 @@ fn main() {
                             .with_engine_validator(WriterValidatorBuilder::new(delivery.clone())),
                     )
                     .on_node_started(move |node| {
-                        start_delivery(&node, &spec, delivery, config, consensus_url)
+                        let eth = node.add_ons_handle.rpc_registry.eth_api().clone();
+                        start_delivery(&node, &spec, delivery, config, move |hash| {
+                            let trace = DebankTraceBlock::new(eth.clone());
+                            async move { Ok(trace.capture_by_hash(hash).await?) }
+                        })
                     })
                     .launch_with_debug_capabilities()
                     .await?;

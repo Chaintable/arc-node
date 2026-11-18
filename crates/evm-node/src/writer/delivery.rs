@@ -1,49 +1,41 @@
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{error::Error, future::Future, sync::Arc};
 
 use alloy_consensus::Header;
 use alloy_primitives::B256;
 use arc_execution_config::chainspec::ArcChainSpec;
 use pipeline_rs_arc::{
-    execution::capture_genesis, BlockRef, CaptureSink, CaptureSource, Delivery, DeliveryChain,
-    DeliveryConfig, History, SpoolError,
+    execution::capture_genesis, BlockRef, CaptureSink, CapturedArcBlock, Delivery, DeliveryChain,
+    DeliveryConfig, SpoolError,
 };
-use reqwest::{Client, Url};
 use reth_chainspec::EthChainSpec;
 use reth_node_api::{FullNodeComponents, NodeAddOns, NodeTypes};
 use reth_node_builder::FullNode;
-use reth_provider::{
-    BlockNumReader, CanonStateSubscriptions, DatabaseProviderROFactory, HeaderProvider,
-    StageCheckpointReader,
-};
-use reth_stages_types::StageId;
+use reth_provider::{BlockIdReader, CanonStateSubscriptions, HeaderProvider};
 
-use super::history::{confirmed_range, read_decided_block};
+type ReplayResult = Result<CapturedArcBlock, Box<dyn Error + Send + Sync>>;
 
-pub fn start_delivery<N, A>(
+pub fn start_delivery<N, A, F, R>(
     node: &FullNode<N, A>,
     spec: &ArcChainSpec,
     delivery: Arc<Delivery>,
     config: DeliveryConfig,
-    consensus_url: Url,
+    replay: F,
 ) -> eyre::Result<()>
 where
     N: FullNodeComponents<Types: NodeTypes<ChainSpec = ArcChainSpec>>,
     A: NodeAddOns<N>,
-    N::Provider: HeaderProvider<Header = Header>
-        + DatabaseProviderROFactory<Provider: HeaderProvider<Header = Header> + StageCheckpointReader>,
+    N::Provider: HeaderProvider<Header = Header>,
+    F: Fn(B256) -> R + Send + Sync + 'static,
+    R: Future<Output = ReplayResult> + Send,
 {
     let header = spec.genesis_header();
     let genesis = reference(header, spec.genesis_hash());
     if config.initialize_empty_topic {
-        delivery.seal(
-            capture_genesis(spec.genesis(), header, genesis.hash)?,
-            CaptureSource::LiveAccepted,
-        )?;
+        delivery.seal(capture_genesis(spec.genesis(), header, genesis.hash)?)?;
     }
     let chain = ArcChain {
         provider: node.provider.clone(),
-        consensus_url,
-        client: Client::builder().timeout(Duration::from_secs(10)).build()?,
+        replay,
     };
     let mut canonical_events = node.provider.subscribe_to_canonical_state();
     let wake = delivery.clone();
@@ -66,65 +58,33 @@ where
     Ok(())
 }
 
-struct ArcChain<P> {
+struct ArcChain<P, F> {
     provider: P,
-    client: Client,
-    consensus_url: Url,
+    replay: F,
 }
 
-impl<P> DeliveryChain for ArcChain<P>
+impl<P, F, R> DeliveryChain for ArcChain<P, F>
 where
-    P: BlockNumReader
-        + HeaderProvider<Header = Header>
-        + DatabaseProviderROFactory<Provider: HeaderProvider<Header = Header> + StageCheckpointReader>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    P: BlockIdReader + HeaderProvider<Header = Header>,
+    F: Fn(B256) -> R + Send + Sync,
+    R: Future<Output = ReplayResult> + Send,
 {
-    async fn history(
-        &self,
-        tail: BlockRef,
-        captured_through: u64,
-    ) -> Result<History, Box<dyn Error + Send + Sync>> {
-        let finished = {
-            let view = self.provider.database_provider_ro()?;
-            view.get_stage_checkpoint(StageId::Finish)?
-                .map_or(0, |checkpoint| checkpoint.block_number)
+    fn finalized_height(&self) -> Result<Option<u64>, SpoolError> {
+        let Some(finalized) = self
+            .provider
+            .finalized_block_num_hash()
+            .map_err(projection)?
+        else {
+            return Ok(None);
         };
-        let end = captured_through.min(finished);
-        if end <= tail.block_number {
-            return Ok(History::Pending);
-        }
-        // Use the committed end as the trust anchor, which may be newer than the
-        // last captured block on a short range after resuming the node.
-        let certificate =
-            match read_decided_block(&self.client, &self.consensus_url, Some(finished)).await? {
-                Some(certificate) => certificate,
-                None => {
-                    let Some(certificate) =
-                        read_decided_block(&self.client, &self.consensus_url, None).await?
-                    else {
-                        return Ok(History::Pending);
-                    };
-                    if certificate.height < end {
-                        return Ok(History::Pending);
-                    }
-                    let view = self.provider.database_provider_ro()?;
-                    if view.sealed_header(certificate.height)?.is_none() {
-                        return Ok(History::Pending);
-                    }
-                    certificate
-                }
-            };
-        let provider = self.provider.clone();
-        let confirmed =
-            tokio::task::spawn_blocking(move || confirmed_range(&provider, tail, end, certificate))
-                .await??;
-        Ok(match confirmed {
-            Some(blocks) => History::Ready(blocks),
-            None => History::Pending,
-        })
+        Ok(self
+            .canonical_block(finalized.number)?
+            .filter(|block| block.hash == finalized.hash)
+            .map(|block| block.block_number))
+    }
+
+    fn replay(&self, hash: B256) -> impl Future<Output = ReplayResult> + Send {
+        (self.replay)(hash)
     }
 
     fn canonical_tip(&self) -> Result<BlockRef, SpoolError> {

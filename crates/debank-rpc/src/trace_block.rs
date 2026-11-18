@@ -9,8 +9,8 @@ use alloy_primitives::{Address, Bytes, Log, B256};
 use arc_evm::ArcEvmConfig;
 use jsonrpsee::core::RpcResult;
 use pipeline_rs_arc::execution::{
-    append_traces, block_metadata, debank_transaction_target, genesis_output, new_debank_inspector,
-    project_output, transaction_metadata,
+    append_traces, block_metadata, capture_replayed_block, debank_transaction_target,
+    genesis_output, new_debank_inspector, project_output, transaction_metadata,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::EthPrimitives;
@@ -90,6 +90,16 @@ where
     Eth::Primitives: NodePrimitives<BlockHeader = alloy_consensus::Header>,
     Eth::Provider: ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>,
 {
+    /// Reuse the RPC implementation without an HTTP round trip.
+    pub async fn capture_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<pipeline_rs_arc::CapturedArcBlock, Eth::Error> {
+        let replayed = self.trace_debank_block(BlockId::hash(hash)).await?;
+        capture_replayed_block(replayed)
+            .map_err(|err| EthApiError::EvmCustom(err.to_string()).into())
+    }
+
     /// Build `DebankOutPut` for the given block.
     async fn trace_debank_block(&self, block_id: BlockId) -> Result<DebankOutPut, Eth::Error> {
         let block = self.eth_api.recovered_block(block_id).await?;

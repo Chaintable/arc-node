@@ -12,18 +12,12 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadAttributes};
 use arc_evm::writer::WriterEvmConfig;
 use arc_evm::{ArcEvmConfig, ArcEvmFactory};
-use arc_evm_node::{
-    node::ArcNode,
-    writer::{
-        history::{confirmed_range, DecidedBlock},
-        WriterValidatorBuilder,
-    },
-};
+use arc_evm_node::{node::ArcNode, writer::WriterValidatorBuilder};
 use arc_execution_config::{addresses_denylist::AddressesDenylistConfig, chainspec::MAINNET};
 use debank_rpc::{DebankTraceApiServer, DebankTraceBlock};
 use pipeline_rs_arc::{
     execution::{capture_genesis, LiveCapture},
-    CaptureSink, CaptureSource, CapturedArcBlock, SpoolError,
+    CaptureSink, CapturedArcBlock, SpoolError,
 };
 use reth_chainspec::EthChainSpec;
 use reth_ethereum::{evm::EthEvmConfig, Block};
@@ -37,11 +31,11 @@ use reth_tasks::Runtime;
 use serde_json::{json, Value};
 
 #[derive(Default)]
-struct CaptureLog(Mutex<Vec<(CapturedArcBlock, CaptureSource)>>);
+struct CaptureLog(Mutex<Vec<CapturedArcBlock>>);
 
 impl CaptureSink for CaptureLog {
-    fn seal(&self, block: CapturedArcBlock, source: CaptureSource) -> Result<(), SpoolError> {
-        self.0.lock().unwrap().push((block, source));
+    fn seal(&self, block: CapturedArcBlock) -> Result<(), SpoolError> {
+        self.0.lock().unwrap().push(block);
         Ok(())
     }
 }
@@ -134,13 +128,6 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         )
         .launch_with_debug_capabilities()
         .await?;
-    let certificate = DecidedBlock {
-        height: 1,
-        block_hash: block.hash(),
-    };
-    let kafka_tail = captured_genesis.block;
-    assert!(confirmed_range(&plain.node.provider, kafka_tail, 1, certificate)?.is_none());
-
     let mut invalid = block.sealed_block().clone_block();
     invalid.header.state_root = B256::repeat_byte(0xa5);
     let invalid = SealedBlock::seal_slow(invalid);
@@ -181,10 +168,6 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
     assert_eq!(plain_status, writer_status);
     assert!(writer_status.is_valid(), "{writer_status:?}");
 
-    let parent_root = genesis.state_root();
-    let history = plain_config
-        .clone()
-        .with_history_capture(move |_| Ok(parent_root), sink.clone());
     let state = || {
         plain
             .node
@@ -193,28 +176,23 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
             .map(StateProviderDatabase::new)
     };
     let expected = plain_config.batch_executor(state()?).execute(&block)?;
-    let actual = history.batch_executor(state()?).execute(&block)?;
-    assert_eq!(actual, expected);
+
     let parent_state = plain
         .node
         .provider
         .state_by_block_hash(block.parent_hash())?;
     assert_eq!(
-        parent_state.state_root(parent_state.hashed_post_state(&actual.state))?,
+        parent_state.state_root(parent_state.hashed_post_state(&expected.state))?,
         block.state_root(),
     );
     let records = sink.0.lock().unwrap();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].1, CaptureSource::LiveAccepted);
-    assert_eq!(records[1].1, CaptureSource::HistoryAwaitingMerkle);
-    for (captured, _) in records.iter() {
-        equivalent(captured, &input["writer"])?;
-    }
+    assert_eq!(records.len(), 1);
+    equivalent(&records[0], &input["writer"])?;
     println!(
         "H1 {} gas_used={} receipts={} state_root={}",
         block.hash(),
-        actual.result.gas_used,
-        actual.result.receipts.len(),
+        expected.result.gas_used,
+        expected.result.receipts.len(),
         block.state_root()
     );
     drop(records);
@@ -247,7 +225,7 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         .await?;
     let replayed = serde_json::to_value(replayed)?;
     assert_eq!(replayed["state_diff"], input["writer"]["state_diff"]);
-    assert_eq!(sink.0.lock().unwrap().len(), 2);
+    assert_eq!(sink.0.lock().unwrap().len(), 1);
 
     let attrs = PayloadAttributes {
         timestamp: block.timestamp().checked_add(2).unwrap(),
@@ -274,7 +252,7 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
     )
     .await?
     .ok_or_else(|| eyre::eyre!("missing payload builder result"))??;
-    assert_eq!(sink.0.lock().unwrap().len(), 2);
+    assert_eq!(sink.0.lock().unwrap().len(), 1);
     println!("H1 RPC replay and payload construction emitted no capture");
 
     let block2_payload = ExecutionData::from_block_unchecked(block2.hash(), &block2.clone_block());
@@ -305,15 +283,15 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         .beacon_engine_handle
         .fork_choice_updated(head(block2.hash()), None)
         .await?;
-    let (capture, source) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let capture = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             if let Some(capture) = sink
                 .0
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|(capture, _)| capture.block.hash == block2.hash())
-                .map(|(capture, source)| (capture.clone(), *source))
+                .find(|capture| capture.block.hash == block2.hash())
+                .cloned()
             {
                 break capture;
             }
@@ -321,7 +299,6 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         }
     })
     .await?;
-    assert_eq!(source, CaptureSource::LiveAccepted);
     equivalent(&capture, &input2["writer"])?;
     println!(
         "H2 {} downloaded and captured over loopback P2P",
@@ -332,19 +309,15 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
     archive_config.network.bootnodes = Some(Vec::new());
     archive_config.debug.tip = Some(block2.hash());
     archive_config.debug.max_block = Some(2);
-    let archive_sink = Arc::new(CaptureLog::default());
     let archive = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         NodeBuilder::new(archive_config)
             .testing_node(runtime)
-            .node(
-                ArcNode::with_denylist_config(AddressesDenylistConfig::new(
-                    Default::default(),
-                    Default::default(),
-                    Vec::new(),
-                ))
-                .with_writer_history(archive_sink.clone()),
-            )
+            .node(ArcNode::with_denylist_config(AddressesDenylistConfig::new(
+                Default::default(),
+                Default::default(),
+                Vec::new(),
+            )))
             .launch_with_debug_capabilities(),
     )
     .await??;
@@ -352,62 +325,18 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         peer.id,
         std::net::SocketAddr::from(([127, 0, 0, 1], peer.tcp_port)),
     );
-    let archive_certificate = DecidedBlock {
-        height: 2,
-        block_hash: block2.hash(),
-    };
-    let archive_range = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            if let Some(range) =
-                confirmed_range(&archive.node.provider, kafka_tail, 2, archive_certificate)?
-            {
-                break Ok::<_, eyre::Report>(range);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await??;
-    assert_eq!(
-        archive_range
-            .iter()
-            .map(|block| block.hash)
-            .collect::<Vec<_>>(),
-        [block.hash(), block2.hash()]
-    );
-    {
-        let captures = archive_sink.0.lock().unwrap();
-        assert_eq!(captures.len(), 2);
-        for ((captured, source), expected) in
-            captures.iter().zip([&input["writer"], &input2["writer"]])
-        {
-            assert_eq!(*source, CaptureSource::HistoryAwaitingMerkle);
-            equivalent(captured, expected)?;
-        }
-    }
-    println!("Native historical Execution stage captured H1 and H2 before Finish committed");
-    let shutdown = plain
-        .node
-        .add_ons_handle
-        .engine_shutdown
-        .shutdown()
-        .ok_or_else(|| eyre::eyre!("missing engine shutdown handle"))?;
-    tokio::time::timeout(std::time::Duration::from_secs(10), shutdown).await??;
-    let range = confirmed_range(&plain.node.provider, kafka_tail, 1, certificate)?
-        .ok_or_else(|| eyre::eyre!("H1 should be covered by the persisted checkpoint"))?;
-    assert_eq!(range.len(), 1);
-    assert_eq!(range[0].hash, block.hash());
-    assert_eq!(range[0].parent_hash, kafka_tail.hash);
-    let wrong_certificate = DecidedBlock {
-        height: 1,
-        block_hash: B256::repeat_byte(0x7f),
-    };
-    assert!(confirmed_range(&plain.node.provider, kafka_tail, 1, wrong_certificate).is_err());
-    let wrong_kafka_tail = pipeline_rs_arc::BlockRef {
-        hash: B256::ZERO,
-        ..kafka_tail
-    };
-    assert!(confirmed_range(&plain.node.provider, wrong_kafka_tail, 1, certificate).is_err());
-    println!("Persisted H1 checkpoint opened the range and rejected mismatched certificate and Kafka tail");
+    // The ordinary native pipeline stores the inputs for the RPC fallback.
+    tokio::time::timeout(std::time::Duration::from_secs(30), archive.node_exit_future).await??;
+    let trace = DebankTraceBlock::new(archive.node.add_ons_handle.rpc_registry.eth_api().clone());
+    equivalent(
+        &trace.capture_by_hash(block.hash()).await?,
+        &input["writer"],
+    )?;
+    equivalent(
+        &trace.capture_by_hash(block2.hash()).await?,
+        &input2["writer"],
+    )?;
+    println!("trace_debankBlock replay of native backfill H1/H2 matches the Writer reference");
     Ok(())
 }
 
@@ -524,19 +453,21 @@ fn deletion_block_execution_projection() -> eyre::Result<()> {
     ));
     println!("H20329532 EVM-only warmup emitted no capture");
 
-    let sink = Arc::new(CaptureLog::default());
-    let history = WriterEvmConfig::history(
-        plain.clone(),
-        Arc::new(move |_| Ok(parent_root)),
-        sink.clone(),
-    );
+    let sink = CaptureLog::default();
     let ordinary = plain.batch_executor(db.clone()).execute(&block)?;
-    let captured = history.batch_executor(db).execute(&block)?;
+    let captured = live.batch_executor(db).execute(&block)?;
+    slot.accept(
+        block.header(),
+        block.hash(),
+        parent_root,
+        captured.state.clone(),
+        &sink,
+    )?;
     assert_eq!(captured, ordinary);
     assert_eq!(captured.result.receipts.len(), 1);
     assert_eq!(captured.result.gas_used, block.gas_used());
     let records = sink.0.lock().unwrap();
     assert_eq!(records.len(), 1);
-    equivalent(&records[0].0, &fixture["writer"])?;
+    equivalent(&records[0], &fixture["writer"])?;
     Ok(())
 }

@@ -1,51 +1,34 @@
 use std::{fmt, sync::Arc};
 
 use crate::{assembler::ArcBlockAssembler, executor::ArcBlockExecutor, ArcEvmConfig};
-use alloy_consensus::{BlockHeader, Header};
+use alloy_consensus::Header;
 use alloy_evm::{
     block::{state::StateDB, BlockExecutorFactory},
     eth::{EthBlockExecutionCtx, EthEvmContext},
     precompiles::PrecompilesMap,
-    Database, Evm, EvmEnv, EvmFactory,
+    Database, EvmEnv, EvmFactory,
 };
-use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
 use arc_execution_config::chainspec::ArcChainSpec;
-use pipeline_rs_arc::{
-    execution::{seal_history, LiveCapture, WriterExecutor},
-    CaptureSink, SpoolError,
-};
+use pipeline_rs_arc::execution::{LiveCapture, WriterExecutor};
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
 use reth_evm::{
-    BlockExecutorForEvm, ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator,
-    ExecutionCtxFor,
+    ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
 };
 use reth_primitives_traits::{BlockTy, SealedBlock, SealedHeader};
 use revm::{
     context::{BlockEnv, TxEnv},
     context_interface::result::{EVMError, HaltReason},
-    database::State,
     inspector::{Inspector, NoOpInspector},
     primitives::hardfork::SpecId,
 };
 
 use super::evm::{writer_evm, WriterEvm};
 
-pub(crate) type ParentRoot = Arc<dyn Fn(B256) -> Result<B256, SpoolError> + Send + Sync>;
-
-#[derive(Clone)]
-enum Mode {
-    Live(LiveCapture),
-    History {
-        root: ParentRoot,
-        sink: Arc<dyn CaptureSink>,
-    },
-}
-
 #[derive(Clone)]
 pub struct WriterEvmConfig {
     inner: ArcEvmConfig,
-    mode: Mode,
+    capture: LiveCapture,
 }
 
 impl fmt::Debug for WriterEvmConfig {
@@ -58,17 +41,7 @@ impl fmt::Debug for WriterEvmConfig {
 
 impl WriterEvmConfig {
     pub fn live(inner: ArcEvmConfig, capture: LiveCapture) -> Self {
-        Self {
-            inner,
-            mode: Mode::Live(capture),
-        }
-    }
-
-    pub fn history(inner: ArcEvmConfig, root: ParentRoot, sink: Arc<dyn CaptureSink>) -> Self {
-        Self {
-            inner,
-            mode: Mode::History { root, sink },
-        }
+        Self { inner, capture }
     }
 }
 
@@ -138,9 +111,7 @@ impl BlockExecutorFactory for WriterEvmConfig {
         I: Inspector<EthEvmContext<DB>>,
     {
         let mut executor = WriterExecutor::new(self.inner.create_executor_with_evm(evm, ctx));
-        if let Mode::Live(slot) = &self.mode {
-            executor.set_capture(|_, output| slot.store(output));
-        }
+        executor.set_capture(|output| self.capture.store(output));
         executor
     }
 }
@@ -185,36 +156,6 @@ impl ConfigureEvm for WriterEvmConfig {
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
         self.inner.context_for_next_block(parent, attributes)
-    }
-
-    fn executor_for_block<'a, DB: Database>(
-        &'a self,
-        db: &'a mut State<DB>,
-        block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> Result<BlockExecutorForEvm<'a, Self, DB>, Self::Error> {
-        let evm = self.evm_for_block(db, block.header())?;
-        let ctx = self.context_for_block(block)?;
-        let mut executor = ConfigureEvm::create_executor(self, evm, ctx);
-        if let Mode::History { root, sink } = &self.mode {
-            executor.set_capture(move |evm, output| {
-                let result = seal_history(
-                    block.header(),
-                    block.hash(),
-                    evm.db().transition_state.as_ref(),
-                    output,
-                    || root(block.parent_hash()),
-                    sink.as_ref(),
-                );
-                if let Err(err) = result {
-                    panic!(
-                        "Arc Writer history capture failed at {} {}: {err}",
-                        block.number(),
-                        block.hash()
-                    );
-                }
-            });
-        }
-        Ok(executor)
     }
 }
 
