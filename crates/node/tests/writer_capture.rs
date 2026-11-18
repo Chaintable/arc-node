@@ -13,7 +13,10 @@ use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadAttributes};
 use arc_evm::{ArcEvmConfig, ArcEvmFactory};
 use arc_evm_node::{
     node::ArcNode,
-    writer::{launcher::WriterNodeLauncher, WriterValidatorBuilder},
+    writer::{
+        history::{confirmed_range, DecidedBlock},
+        WriterValidatorBuilder,
+    },
 };
 use arc_execution_config::{addresses_denylist::AddressesDenylistConfig, chainspec::MAINNET};
 use debank_rpc::writer::{capture_genesis, LiveCapture, WriterEvmConfig};
@@ -23,7 +26,7 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum::{evm::EthEvmConfig, Block};
 use reth_evm::{execute::Executor, ConfigureEvm, Evm};
 use reth_network::{Peers, PeersInfo};
-use reth_node_builder::{DebugNodeLauncher, Node, NodeBuilder, NodeConfig};
+use reth_node_builder::{Node, NodeBuilder, NodeConfig};
 use reth_primitives_traits::{AlloyBlockHeader, RecoveredBlock, SealedBlock};
 use reth_provider::StateProviderFactory;
 use reth_revm::database::StateProviderDatabase;
@@ -119,23 +122,21 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         Vec::new(),
     ));
     let writer = NodeBuilder::new(config)
-        .testing_node(runtime.clone())
+        .testing_node(runtime)
         .with_types::<ArcNode>()
         .with_components(arc.components_builder())
         .with_add_ons(
             arc.add_ons()
                 .with_engine_validator(WriterValidatorBuilder::new(sink.clone())),
-        );
-    let (history_changed, _history_progress) = tokio::sync::watch::channel(());
-    let launcher = WriterNodeLauncher::new(
-        runtime,
-        writer.config().datadir(),
-        writer.config().engine.tree_config(),
-        sink.clone(),
-        "capture-test".to_string(),
-        history_changed,
-    );
-    let writer = writer.launch_with(DebugNodeLauncher::new(launcher)).await?;
+        )
+        .launch_with_debug_capabilities()
+        .await?;
+    let certificate = DecidedBlock {
+        height: 1,
+        block_hash: block.hash(),
+    };
+    let kafka_tail = captured_genesis.block;
+    assert!(confirmed_range(&plain.node.provider, kafka_tail, 1, certificate)?.is_none());
 
     let mut invalid = block.sealed_block().clone_block();
     invalid.header.state_root = B256::repeat_byte(0xa5);
@@ -325,6 +326,29 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         "H2 {} downloaded and captured over loopback P2P",
         block2.hash()
     );
+    let shutdown = plain
+        .node
+        .add_ons_handle
+        .engine_shutdown
+        .shutdown()
+        .ok_or_else(|| eyre::eyre!("missing engine shutdown handle"))?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), shutdown).await??;
+    let range = confirmed_range(&plain.node.provider, kafka_tail, 1, certificate)?
+        .ok_or_else(|| eyre::eyre!("H1 should be covered by the persisted checkpoint"))?;
+    assert_eq!(range.len(), 1);
+    assert_eq!(range[0].hash, block.hash());
+    assert_eq!(range[0].parent_hash, kafka_tail.hash);
+    let wrong_certificate = DecidedBlock {
+        height: 1,
+        block_hash: B256::repeat_byte(0x7f),
+    };
+    assert!(confirmed_range(&plain.node.provider, kafka_tail, 1, wrong_certificate).is_err());
+    let wrong_kafka_tail = pipeline_rs_arc::BlockRef {
+        hash: B256::ZERO,
+        ..kafka_tail
+    };
+    assert!(confirmed_range(&plain.node.provider, wrong_kafka_tail, 1, certificate).is_err());
+    println!("Persisted H1 checkpoint opened the range and rejected mismatched certificate and Kafka tail");
     Ok(())
 }
 

@@ -33,7 +33,6 @@ async-trait.workspace = true
 backon.workspace = true
 debank-rpc.workspace = true
 eyre.workspace = true
-futures.workspace = true
 jsonrpsee.workspace = true
 metrics.workspace = true
 reqwest.workspace = true
@@ -94,42 +93,6 @@ tag = "v2.2.0"
 [dependencies.pipeline-rs-arc]
 path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer"
 
-[dependencies.reth-stages]
-git = "https://github.com/paradigmxyz/reth"
-tag = "v2.2.0"
 
-[dependencies.reth-consensus]
+[dependencies.reth-stages-types]
 workspace = true
-
-[dependencies.reth-downloaders]
-git = "https://github.com/paradigmxyz/reth"
-tag = "v2.2.0"
-
-[dependencies.reth-engine-util]
-git = "https://github.com/paradigmxyz/reth"
-tag = "v2.2.0"
-
-[dependencies.reth-exex]
-git = "https://github.com/paradigmxyz/reth"
-tag = "v2.2.0"
-
-[dependencies.reth-network-api]
-git = "https://github.com/paradigmxyz/reth"
-tag = "v2.2.0"
-
-[dependencies.reth-node-events]
-git = "https://github.com/paradigmxyz/reth"
-tag = "v2.2.0"
-
-[dependencies.reth-node-core]
-workspace = true
-
-[dependencies.reth-tasks]
-workspace = true
-
-[dependencies.reth-tokio-util]
-git = "https://github.com/paradigmxyz/reth"
-tag = "v2.2.0"
-
-[dependencies.tokio-stream]
-version = "0.1.18"

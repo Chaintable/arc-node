@@ -33,8 +33,6 @@ use reth_trie_db::ChangesetCache;
 use crate::{node::ArcEngineValidatorBuilder, ArcEngineValidator};
 
 pub mod history;
-pub mod launcher;
-pub mod merkle;
 
 #[derive(Clone)]
 pub struct WriterValidatorBuilder {
