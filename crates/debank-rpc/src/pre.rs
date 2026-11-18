@@ -13,7 +13,9 @@ use reth_rpc_eth_types::{EthApiError, StateCacheDb};
 use revm::{context::result::ResultAndState, DatabaseCommit};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
-use crate::event_inspector::{record_subcall_trace_completion, ArcEventInspector};
+use pipeline_rs_arc::execution::ArcEventInspector;
+
+use crate::event_inspector::record_subcall_trace_completion;
 use crate::types::{PreError, PreErrorCode, PreResult};
 
 /// `pre` namespace API implementation.

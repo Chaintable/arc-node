@@ -8,7 +8,7 @@ use crate::types::{MultiCallErrorCode, SingleCallResult};
 ///
 /// `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE` — industry-standard placeholder
 /// for native tokens, originated from Kyber Network.
-pub const NATIVE_TOKEN_ADDRESS: Address = Address::new([0xee; 20]);
+pub use pipeline_rs_arc::execution::debank::NATIVE_TOKEN_ADDRESS;
 
 /// Handles ERC-20 method calls to the native token sentinel address (`0xeeee...eeee`).
 ///

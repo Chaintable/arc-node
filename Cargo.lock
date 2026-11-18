@@ -4518,7 +4518,6 @@ dependencies = [
  "alloy-genesis",
  "alloy-network",
  "alloy-primitives",
- "alloy-rlp",
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-rpc-types-trace",
@@ -4528,7 +4527,6 @@ dependencies = [
  "async-trait",
  "futures",
  "jsonrpsee",
- "md-5",
  "pipeline-rs-arc",
  "reth-chainspec",
  "reth-ethereum",
@@ -4543,7 +4541,6 @@ dependencies = [
  "revm-inspectors",
  "serde",
  "serde_json",
- "sha1",
 ]
 
 [[package]]
@@ -8885,12 +8882,20 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 name = "pipeline-rs-arc"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-evm",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-rpc-types-eth",
  "flate2",
+ "md-5",
+ "revm",
+ "revm-inspectors",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",

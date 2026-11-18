@@ -106,6 +106,7 @@ workspace = true
 
 [dev-dependencies.pipeline-rs-arc]
 path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer"
+features = ["execution"]
 
 [dev-dependencies.reth-revm]
 workspace = true

@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{fmt, sync::Arc};
 
 use alloy_consensus::{BlockHeader, Header};
 use alloy_evm::{
@@ -15,7 +11,10 @@ use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
 use arc_evm::{assembler::ArcBlockAssembler, executor::ArcBlockExecutor, ArcEvmConfig};
 use arc_execution_config::chainspec::ArcChainSpec;
-use pipeline_rs_arc::{CaptureSink, CaptureSource, CapturedArcBlock, SpoolError};
+use pipeline_rs_arc::{
+    execution::{seal_history, LiveCapture, WriterExecutor},
+    CaptureSink, SpoolError,
+};
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
 use reth_evm::{
     BlockExecutorForEvm, ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator,
@@ -25,62 +24,12 @@ use reth_primitives_traits::{BlockTy, SealedBlock, SealedHeader};
 use revm::{
     context::{BlockEnv, TxEnv},
     context_interface::result::{EVMError, HaltReason},
-    database::{states::bundle_state::BundleRetention, BundleState, State},
+    database::State,
     inspector::{Inspector, NoOpInspector},
     primitives::hardfork::SpecId,
 };
 
-use super::{
-    capture_block,
-    evm::WriterEvm,
-    executor::{FinishCapture, WriterExecutor},
-};
-use crate::debank_trace::BlockFile;
-
-// One slot per engine validator, used by its serial validate_payload/validate_block calls.
-#[derive(Clone, Default)]
-pub struct LiveCapture {
-    pending: Arc<Mutex<Option<Result<BlockFile, String>>>>,
-}
-
-impl LiveCapture {
-    pub fn discard(&self) {
-        self.pending
-            .lock()
-            .expect("live Writer lock poisoned")
-            .take();
-    }
-
-    pub fn accept(
-        &self,
-        block: &SealedBlock<BlockTy<EthPrimitives>>,
-        parent_state_root: B256,
-        bundle: BundleState,
-    ) -> Result<CapturedArcBlock, SpoolError> {
-        let output = self
-            .pending
-            .lock()
-            .expect("live Writer lock poisoned")
-            .take()
-            .ok_or_else(|| {
-                SpoolError::Projection(format!("missing live output for {:?}", block.hash()))
-            })?
-            .map_err(SpoolError::Projection)?;
-        capture_block(block, parent_state_root, bundle, output)
-    }
-
-    fn store(&self, output: Result<BlockFile, String>) {
-        let replaced = self
-            .pending
-            .lock()
-            .expect("live Writer lock poisoned")
-            .replace(output);
-        assert!(
-            replaced.is_none(),
-            "live Writer captured more than one block"
-        );
-    }
-}
+use super::evm::{writer_evm, WriterEvm};
 
 type ParentRoot = Arc<dyn Fn(B256) -> Result<B256, SpoolError> + Send + Sync>;
 
@@ -141,7 +90,7 @@ impl EvmFactory for WriterEvmConfig {
     type Precompiles = PrecompilesMap;
 
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
-        WriterEvm::new(
+        writer_evm(
             ConfigureEvm::evm_factory(&self.inner),
             db,
             input,
@@ -156,7 +105,7 @@ impl EvmFactory for WriterEvmConfig {
         input: EvmEnv,
         inspector: I,
     ) -> Self::Evm<DB, I> {
-        WriterEvm::new(
+        writer_evm(
             ConfigureEvm::evm_factory(&self.inner),
             db,
             input,
@@ -188,16 +137,9 @@ impl BlockExecutorFactory for WriterEvmConfig {
         DB: StateDB,
         I: Inspector<EthEvmContext<DB>>,
     {
-        let mut executor = WriterExecutor {
-            inner: self.inner.create_executor_with_evm(evm, ctx),
-            capture: None,
-            projection: BlockFile::default(),
-            capture_error: None,
-            pending: None,
-            log_index: RefCell::new(0),
-        };
+        let mut executor = WriterExecutor::new(self.inner.create_executor_with_evm(evm, ctx));
         if let Mode::Live(slot) = &self.mode {
-            executor.capture = Some(Box::new(|_, output| slot.store(output)));
+            executor.set_capture(|_, output| slot.store(output));
         }
         executor
     }
@@ -254,36 +196,23 @@ impl ConfigureEvm for WriterEvmConfig {
         let ctx = self.context_for_block(block)?;
         let mut executor = ConfigureEvm::create_executor(self, evm, ctx);
         if let Mode::History { root, sink } = &self.mode {
-            let capture: FinishCapture<'a, WriterEvm<&'a mut State<DB>, NoOpInspector>> =
-                Box::new(move |evm, output| {
-                    let mut bundle = BundleState::default();
-                    let transitions = evm
-                        .db()
-                        .transition_state
-                        .as_ref()
-                        .expect("historical Arc Writer requires bundle updates");
-                    bundle.apply_transitions_and_create_reverts(
-                        transitions.clone(),
-                        BundleRetention::PlainState,
+            executor.set_capture(move |evm, output| {
+                let result = seal_history(
+                    block.header(),
+                    block.hash(),
+                    evm.db().transition_state.as_ref(),
+                    output,
+                    || root(block.parent_hash()),
+                    sink.as_ref(),
+                );
+                if let Err(err) = result {
+                    panic!(
+                        "Arc Writer history capture failed at {} {}: {err}",
+                        block.number(),
+                        block.hash()
                     );
-                    let identity = block.hash();
-                    let result = output
-                        .map_err(SpoolError::Projection)
-                        .and_then(|output| {
-                            root(block.parent_hash())
-                                .and_then(|parent| capture_block(block, parent, bundle, output))
-                        })
-                        .and_then(|capture| {
-                            sink.seal(capture, CaptureSource::HistoryAwaitingMerkle)
-                        });
-                    if let Err(err) = result {
-                        panic!(
-                            "Arc Writer history capture failed at {} {identity}: {err}",
-                            block.number()
-                        );
-                    }
-                });
-            executor.capture = Some(capture);
+                }
+            });
         }
         Ok(executor)
     }

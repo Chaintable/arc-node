@@ -7,8 +7,8 @@ use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
 use arc_evm::ArcEvmConfig;
 use arc_execution_config::chainspec::ArcChainSpec;
-use debank_rpc::writer::{LiveCapture, WriterEvmConfig};
-use pipeline_rs_arc::{CaptureSink, CaptureSource};
+use debank_rpc::writer::WriterEvmConfig;
+use pipeline_rs_arc::{execution::LiveCapture, CaptureSink};
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::EthChainSpec;
 use reth_engine_tree::tree::{
@@ -127,14 +127,13 @@ impl<V, P: HeaderProvider<Header = Header>> WriterValidator<V, P> {
                         .unwrap_or_else(|| panic!("missing Arc Writer parent of {}", block.hash()))
                         .state_root
                 });
-                let result = self
-                    .capture
-                    .accept(
-                        block,
-                        parent_state_root,
-                        executed.execution_outcome().state.clone(),
-                    )
-                    .and_then(|capture| self.sink.seal(capture, CaptureSource::LiveAccepted));
+                let result = self.capture.accept(
+                    block.header(),
+                    block.hash(),
+                    parent_state_root,
+                    executed.execution_outcome().state.clone(),
+                    self.sink.as_ref(),
+                );
                 if let Err(err) = result {
                     panic!(
                         "Arc Writer live capture failed at {} {}: {err}",

@@ -3,12 +3,15 @@
 //! Replays all transactions in a block, collecting DeBank-format traces, events,
 //! and state diffs for consumption by background-tracer → S3/Kafka → leafage-evm.
 
-use alloy_consensus::{BlockHeader, Transaction};
+use alloy_consensus::BlockHeader;
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, Log, B256};
-use alloy_rpc_types_eth::Header;
 use arc_evm::ArcEvmConfig;
 use jsonrpsee::core::RpcResult;
+use pipeline_rs_arc::execution::{
+    append_traces, block_metadata, debank_transaction_target, genesis_output, new_debank_inspector,
+    project_output, transaction_metadata,
+};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{block::TxResult, execute::BlockExecutor, ConfigureEvm, Evm};
@@ -22,11 +25,10 @@ use reth_rpc_eth_api::{
     EthApiTypes, RpcNodeCore,
 };
 use reth_rpc_eth_types::{cache::db::StateProviderTraitObjWrapper, EthApiError};
-use revm::{bytecode::opcode::OpCode, database::states::bundle_state::BundleRetention};
-use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
+use revm::database::states::bundle_state::BundleRetention;
 
 use crate::debank_trace::*;
-use crate::event_inspector::{record_subcall_trace_completion, ArcEventInspector};
+use crate::event_inspector::record_subcall_trace_completion;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TxExecutionOutcome {
@@ -48,15 +50,6 @@ impl TxExecutionOutcome {
             logs: result.logs().to_vec(),
         }
     }
-}
-
-pub(crate) fn new_debank_inspector() -> (TracingInspector, ArcEventInspector) {
-    let mut config = TracingInspectorConfig::default_parity()
-        .set_steps(true)
-        .set_record_logs(true)
-        .set_exclude_precompile_calls(false);
-    config.record_opcodes_filter = Some(OpcodeFilter::new().enabled(OpCode::SSTORE));
-    (TracingInspector::new(config), ArcEventInspector::default())
 }
 
 fn receipt_logs<T: serde::Serialize>(receipt: &T) -> Result<Vec<Log>, EthApiError> {
@@ -104,7 +97,7 @@ where
             return Err(EthApiError::HeaderNotFound(block_id).into());
         };
 
-        let (debank_block, debank_header) = block_metadata(block.sealed_block());
+        let (debank_block, debank_header) = block_metadata(block.header(), block.hash());
 
         // Genesis block: synthetic txs from chain spec.
         if block.number() == 0 {
@@ -143,22 +136,16 @@ where
             // Arc has only standard tx types (no AA tx); use trait accessors
             // directly. Tempo-only fields (`calls`, `fee_token`, `signature`, ...)
             // stay at their `None`/default values for schema compatibility.
-            let dtx = DebankTransaction {
-                id: receipt.transaction_hash().to_string(),
-                from: receipt.from(),
-                to: debank_transaction_target(receipt.to(), receipt.contract_address()),
-                gas_limit: tx.gas_limit(),
-                gas_price: receipt.effective_gas_price(),
-                gas_used: receipt.gas_used(),
-                status: receipt.status(),
-                gas_fee_cap: tx.max_fee_per_gas(),
-                gas_tip_cap: tx.max_priority_fee_per_gas().unwrap_or_default(),
-                input: tx.input().clone(),
-                nonce: tx.nonce(),
-                transaction_index: receipt.transaction_index().unwrap_or(0),
-                value: tx.value(),
-                ..Default::default()
-            };
+            let mut dtx = transaction_metadata(
+                tx,
+                receipt.transaction_hash(),
+                receipt.from(),
+                receipt.effective_gas_price(),
+                receipt.transaction_index().unwrap_or(0),
+            );
+            dtx.to = debank_transaction_target(receipt.to(), receipt.contract_address());
+            dtx.gas_used = receipt.gas_used();
+            dtx.status = receipt.status();
 
             debank_txs.push(dtx);
         }
@@ -190,7 +177,6 @@ where
         // The genesis path was handled above; all other blocks (including
         // empty ones) take the replay path unconditionally so trace output
         // stays consistent with trace_transaction.
-        let block_state_root = block.state_root();
         let parent_state_root = parent_block.state_root();
 
         // Collect tx hashes before move
@@ -360,139 +346,26 @@ where
         // Arc has no Tempo AA wrapper transactions, so a receipt/root mismatch
         // indicates an inspector regression and must fail instead of moving traces
         // between success and error buckets.
-        for (idx, (trace, error_trace, event, error_event)) in traces_result.into_iter().enumerate()
-        {
+        for (idx, traced) in traces_result.into_iter().enumerate() {
             let tx_success = tx_statuses.get(idx).copied().ok_or_else(|| {
                 EthApiError::EvmCustom(format!(
                     "missing receipt status for transaction {idx} in block {block_number}"
                 ))
             })?;
-            validate_transaction_classification(
-                tx_success,
-                &trace,
-                &error_trace,
-                &event,
-                &error_event,
-            )
-            .map_err(|error| {
+            append_traces(&mut block_file, tx_success, traced).map_err(|error| {
                 EthApiError::EvmCustom(format!(
                     "invalid trace classification for transaction {idx} in block {}: {error}",
                     block_number
                 ))
             })?;
-            block_file.traces.extend(trace);
-            block_file.error_traces.extend(error_trace);
-            block_file.events.extend(event);
-            block_file.error_events.extend(error_event);
         }
 
         let mut state_diff = state_diff;
-        state_diff.hash = block_state_root;
         state_diff.parent_hash = parent_state_root;
         block_file.storage_contracts = change_addresses;
 
-        let validation_hash = block_file.validation().validation_hash;
-        Ok(DebankOutPut {
-            block_file,
-            header: debank_header,
-            state_diff: alloy_rlp::encode(state_diff).into(),
-            validation_hash,
-        })
+        Ok(project_output(block_file, debank_header, state_diff))
     }
-}
-
-pub(crate) fn block_metadata(
-    block: &reth_primitives_traits::SealedBlock<reth_primitives_traits::BlockTy<EthPrimitives>>,
-) -> (DebankBlock, Header) {
-    (
-        DebankBlock {
-            id: block.hash(),
-            height: block.number(),
-            parent_id: block.parent_hash(),
-            base_fee_per_gas: block.base_fee_per_gas(),
-            miner: block.beneficiary(),
-            gas_limit: block.gas_limit(),
-            gas_used: block.gas_used(),
-            timestamp: block.timestamp(),
-            process_start_timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0),
-        },
-        Header {
-            inner: block.header().clone(),
-            hash: block.hash(),
-            total_difficulty: None,
-            size: None,
-        },
-    )
-}
-
-pub(crate) fn genesis_output(
-    genesis: &alloy_genesis::Genesis,
-    block: DebankBlock,
-    header: Header,
-) -> DebankOutPut {
-    let mut state_diff: BlockStorageDiff = genesis.into();
-    state_diff.hash = header.state_root;
-    let (transactions, traces) = build_genesis_txs_and_traces(genesis);
-    let block_file = BlockFile {
-        block,
-        transactions,
-        traces,
-        storage_contracts: get_storage_contracts_from_genesis(genesis),
-        ..Default::default()
-    };
-    let validation_hash = block_file.validation().validation_hash;
-    DebankOutPut {
-        block_file,
-        header,
-        state_diff: alloy_rlp::encode(state_diff).into(),
-        validation_hash,
-    }
-}
-
-pub(crate) fn validate_transaction_classification(
-    tx_success: bool,
-    traces: &[DebankTrace],
-    error_traces: &[DebankTrace],
-    events: &[DebankEvent],
-    error_events: &[DebankEvent],
-) -> Result<(), &'static str> {
-    if traces.iter().any(|trace| !trace.error.is_empty()) {
-        return Err("successful trace has an error");
-    }
-    if error_traces.iter().any(|trace| trace.error.is_empty()) {
-        return Err("error trace has no error");
-    }
-    if error_events.iter().any(|event| event.idx != 0) {
-        return Err("error event has a non-zero index");
-    }
-
-    let success_roots = traces
-        .iter()
-        .filter(|trace| trace.parent_trace_id.is_empty())
-        .count();
-    let error_roots = error_traces
-        .iter()
-        .filter(|trace| trace.parent_trace_id.is_empty())
-        .count();
-    if tx_success {
-        if success_roots != 1 || error_roots != 0 {
-            return Err("successful receipt does not have exactly one successful root trace");
-        }
-    } else if success_roots != 0 || error_roots != 1 || !traces.is_empty() || !events.is_empty() {
-        return Err("failed receipt has successful traces or events");
-    }
-
-    Ok(())
-}
-
-pub(crate) fn debank_transaction_target(
-    recipient: Option<alloy_primitives::Address>,
-    contract_address: Option<alloy_primitives::Address>,
-) -> alloy_primitives::Address {
-    recipient.or(contract_address).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +405,7 @@ impl<Eth> std::fmt::Debug for DebankTraceBlock<Eth> {
 mod tests {
     use super::*;
     use alloy_primitives::{Address, TxKind, U256};
+    use pipeline_rs_arc::execution::validate_transaction_classification;
     use revm::{
         context::TxEnv,
         database::{EmptyDB, InMemoryDB},

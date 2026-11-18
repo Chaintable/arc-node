@@ -19,9 +19,12 @@ use arc_evm_node::{
     },
 };
 use arc_execution_config::{addresses_denylist::AddressesDenylistConfig, chainspec::MAINNET};
-use debank_rpc::writer::{capture_genesis, LiveCapture, WriterEvmConfig};
+use debank_rpc::writer::WriterEvmConfig;
 use debank_rpc::{DebankTraceApiServer, DebankTraceBlock};
-use pipeline_rs_arc::{CaptureSink, CaptureSource, CapturedArcBlock, SpoolError};
+use pipeline_rs_arc::{
+    execution::{capture_genesis, LiveCapture},
+    CaptureSink, CaptureSource, CapturedArcBlock, SpoolError,
+};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum::{evm::EthEvmConfig, Block};
 use reth_evm::{execute::Executor, ConfigureEvm, Evm};
@@ -91,7 +94,7 @@ async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
         header: spec.genesis_header().clone(),
         body: Default::default(),
     });
-    let captured_genesis = capture_genesis(spec.genesis(), &genesis)?;
+    let captured_genesis = capture_genesis(spec.genesis(), genesis.header(), genesis.hash())?;
     equivalent(&captured_genesis, &genesis_input["writer"])?;
     assert_eq!(captured_genesis.validation.txs_count, 273);
     assert_eq!(captured_genesis.validation.traces_count, 273);
@@ -454,7 +457,13 @@ fn deletion_block_execution_projection() -> eyre::Result<()> {
         .ok_or_else(|| eyre::eyre!("missing transaction"))?;
     probe.transact(live.tx_env(tx))?;
     assert!(matches!(
-        slot.accept(block.sealed_block(), parent_root, Default::default()),
+        slot.accept(
+            block.header(),
+            block.hash(),
+            parent_root,
+            Default::default(),
+            &CaptureLog::default()
+        ),
         Err(SpoolError::Projection(_))
     ));
     println!("H20329532 EVM-only warmup emitted no capture");
