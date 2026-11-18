@@ -9,18 +9,20 @@ use std::{
 
 use alloy_primitives::{Bytes, B256};
 use alloy_rlp::Decodable;
-use alloy_rpc_types_engine::ExecutionData;
+use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadAttributes};
 use arc_evm::{ArcEvmConfig, ArcEvmFactory};
 use arc_evm_node::{
     node::ArcNode,
     writer::{launcher::WriterNodeLauncher, WriterValidatorBuilder},
 };
 use arc_execution_config::{addresses_denylist::AddressesDenylistConfig, chainspec::MAINNET};
-use debank_rpc::writer::{capture_genesis, WriterEvmConfig};
+use debank_rpc::writer::{capture_genesis, LiveCapture, WriterEvmConfig};
+use debank_rpc::{DebankTraceApiServer, DebankTraceBlock};
 use pipeline_rs_arc::{CaptureSink, CaptureSource, CapturedArcBlock, SpoolError};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum::{evm::EthEvmConfig, Block};
-use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm::{execute::Executor, ConfigureEvm, Evm};
+use reth_network::{Peers, PeersInfo};
 use reth_node_builder::{DebugNodeLauncher, Node, NodeBuilder, NodeConfig};
 use reth_primitives_traits::{AlloyBlockHeader, RecoveredBlock, SealedBlock};
 use reth_provider::StateProviderFactory;
@@ -67,8 +69,8 @@ fn equivalent(capture: &CapturedArcBlock, reference: &Value) -> eyre::Result<()>
 }
 
 #[tokio::test]
-#[ignore = "requires ARC_WRITER_FIXTURES with frozen Writer 830ad37 blocks 0 and 1"]
-async fn real_mainnet_genesis_and_block_one() -> eyre::Result<()> {
+#[ignore = "requires ARC_WRITER_FIXTURES with frozen Writer 830ad37 blocks 0, 1 and 2"]
+async fn real_mainnet_genesis_live_and_historical() -> eyre::Result<()> {
     let genesis_input = fixture(0)?;
     let input = fixture(1)?;
     let raw: Bytes = serde_json::from_value(input["raw_block"].clone())?;
@@ -150,7 +152,7 @@ async fn real_mainnet_genesis_and_block_one() -> eyre::Result<()> {
         .beacon_engine_handle
         .new_payload(invalid_payload)
         .await?;
-    assert!(!plain_rejected.is_valid());
+    assert!(plain_rejected.is_invalid());
     assert_eq!(plain_rejected, writer_rejected);
     assert!(sink.0.lock().unwrap().is_empty());
 
@@ -212,6 +214,116 @@ async fn real_mainnet_genesis_and_block_one() -> eyre::Result<()> {
         actual.result.gas_used,
         actual.result.receipts.len(),
         block.state_root()
+    );
+    drop(records);
+
+    let input2 = fixture(2)?;
+    let raw2: Bytes = serde_json::from_value(input2["raw_block"].clone())?;
+    let block2 = SealedBlock::seal_slow(Block::decode(&mut raw2.as_ref())?);
+    assert_eq!(
+        block2.hash(),
+        serde_json::from_value::<B256>(input2["block"]["hash"].clone())?
+    );
+    let head = |hash| ForkchoiceState {
+        head_block_hash: hash,
+        safe_block_hash: genesis.hash(),
+        finalized_block_hash: genesis.hash(),
+    };
+    plain
+        .node
+        .beacon_engine_handle
+        .fork_choice_updated(head(block.hash()), None)
+        .await?;
+    writer
+        .node
+        .beacon_engine_handle
+        .fork_choice_updated(head(block.hash()), None)
+        .await?;
+    let rpc = DebankTraceBlock::new(writer.node.add_ons_handle.rpc_registry.eth_api().clone());
+    let replayed = rpc
+        .trace_debank_block(alloy_eips::BlockId::hash(block.hash()))
+        .await?;
+    let replayed = serde_json::to_value(replayed)?;
+    assert_eq!(replayed["state_diff"], input["writer"]["state_diff"]);
+    assert_eq!(sink.0.lock().unwrap().len(), 2);
+
+    let attrs = PayloadAttributes {
+        timestamp: block.timestamp().checked_add(2).unwrap(),
+        prev_randao: B256::ZERO,
+        suggested_fee_recipient: Default::default(),
+        withdrawals: Some(Vec::new()),
+        parent_beacon_block_root: Some(B256::ZERO),
+        slot_number: None,
+    };
+    let built = writer
+        .node
+        .beacon_engine_handle
+        .fork_choice_updated(head(block.hash()), Some(attrs))
+        .await?;
+    let payload_id = built
+        .payload_id
+        .ok_or_else(|| eyre::eyre!("missing payload builder job"))?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        writer
+            .node
+            .payload_builder_handle
+            .resolve_kind(payload_id, reth_payload_builder::PayloadKind::Earliest),
+    )
+    .await?
+    .ok_or_else(|| eyre::eyre!("missing payload builder result"))??;
+    assert_eq!(sink.0.lock().unwrap().len(), 2);
+    println!("H1 RPC replay and payload construction emitted no capture");
+
+    let block2_payload = ExecutionData::from_block_unchecked(block2.hash(), &block2.clone_block());
+    assert!(plain
+        .node
+        .beacon_engine_handle
+        .new_payload(block2_payload)
+        .await?
+        .is_valid());
+    plain
+        .node
+        .beacon_engine_handle
+        .fork_choice_updated(head(block2.hash()), None)
+        .await?;
+    let peer = plain.node.network.local_node_record();
+    writer.node.network.add_peer(
+        peer.id,
+        std::net::SocketAddr::from(([127, 0, 0, 1], peer.tcp_port)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while writer.node.network.num_connected_peers() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+    writer
+        .node
+        .beacon_engine_handle
+        .fork_choice_updated(head(block2.hash()), None)
+        .await?;
+    let (capture, source) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(capture) = sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(capture, _)| capture.block.hash == block2.hash())
+                .map(|(capture, source)| (capture.clone(), *source))
+            {
+                break capture;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+    assert_eq!(source, CaptureSource::LiveAccepted);
+    equivalent(&capture, &input2["writer"])?;
+    println!(
+        "H2 {} downloaded and captured over loopback P2P",
+        block2.hash()
     );
     Ok(())
 }
@@ -307,6 +419,22 @@ fn deletion_block_execution_projection() -> eyre::Result<()> {
         spec.clone(),
         ArcEvmFactory::new(spec),
     ));
+    // The pinned Reth prewarm path creates an EVM and runs the transaction
+    // directly, without creating a block executor or accepting a payload.
+    let slot = LiveCapture::default();
+    let live = WriterEvmConfig::live(plain.clone(), slot.clone());
+    let mut probe = live.evm_for_block(db.clone(), block.header())?;
+    let tx = block
+        .transactions_recovered()
+        .next()
+        .ok_or_else(|| eyre::eyre!("missing transaction"))?;
+    probe.transact(live.tx_env(tx))?;
+    assert!(matches!(
+        slot.accept(block.sealed_block(), parent_root, Default::default()),
+        Err(SpoolError::Projection(_))
+    ));
+    println!("H20329532 EVM-only warmup emitted no capture");
+
     let sink = Arc::new(CaptureLog::default());
     let history = WriterEvmConfig::history(
         plain.clone(),

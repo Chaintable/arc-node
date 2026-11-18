@@ -118,3 +118,12 @@ workspace = true
 
 [dev-dependencies.thiserror]
 workspace = true
+
+[dev-dependencies.reth-network]
+workspace = true
+
+[dev-dependencies.alloy-eips]
+workspace = true
+
+[dev-dependencies.reth-payload-builder]
+workspace = true

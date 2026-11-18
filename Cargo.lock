@@ -1967,6 +1967,7 @@ dependencies = [
 name = "arc-node-execution"
 version = "0.0.1"
 dependencies = [
+ "alloy-eips 2.0.4",
  "alloy-evm",
  "alloy-genesis",
  "alloy-primitives",
@@ -1995,10 +1996,12 @@ dependencies = [
  "reth-e2e-test-utils",
  "reth-ethereum",
  "reth-evm",
+ "reth-network",
  "reth-node-builder",
  "reth-node-core",
  "reth-node-ethereum",
  "reth-node-metrics",
+ "reth-payload-builder",
  "reth-primitives-traits",
  "reth-provider",
  "reth-prune-types",
