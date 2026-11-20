@@ -54,7 +54,7 @@ futures = { workspace = true }
 serde_json = { workspace = true }
 
 # DeBank trace projection
-pipeline-rs-arc = { path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer", features = ["execution"] }
+pipeline-rs-arc = { workspace = true, features = ["execution"] }
 
 [dev-dependencies]
 alloy-genesis.workspace = true

@@ -85,6 +85,7 @@ arc-snapshots = { version = "0.0.1", path = "crates/snapshots" }
 arc-test-framework = { version = "0.0.1", path = "crates/test/framework" }
 arc-test-integration = { version = "0.0.1", path = "crates/test/integration" }
 arc-version = { version = "0.0.1", path = "crates/version" }
+pipeline-rs-arc = { path = "crates/pipeline-rs-arc" }
 
 # async
 async-trait = "0.1.68"

@@ -91,5 +91,5 @@ git = "https://github.com/paradigmxyz/reth"
 tag = "v2.2.0"
 
 [dependencies.pipeline-rs-arc]
-path = "../../../../pipeline-rs-arc.worktrees/feat-arc-writer"
+workspace = true
 features = ["execution", "delivery"]
